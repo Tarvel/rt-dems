@@ -1,0 +1,9 @@
+# Smart Room Energy Management System — Python dependencies
+django>=4.2,<5.0
+djangorestframework>=3.14,<4.0
+django-filter>=23.0
+paho-mqtt>=2.0,<3.0
+
+# RPi.GPIO — install ONLY on Raspberry Pi (will fail on x86 dev machines)
+# Uncomment the line below when deploying to the Pi:
+# RPi.GPIO>=0.7.1

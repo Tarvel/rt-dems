@@ -1,0 +1,34 @@
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*.ntvs*
+*.njsproj
+*.sln
+*.suo
+
+# Antigravity/Gemini
+.gemini/
+brain/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

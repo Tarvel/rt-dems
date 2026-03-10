@@ -1,0 +1,5 @@
+Analyzing energy_management_system...                           
+
+  error - Expected to find ')' - lib\main.dart:101:10 - expected_token
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:280:49 - deprecated_member_use
+

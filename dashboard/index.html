@@ -254,6 +254,54 @@
             <span id="r3Dot" class="dot dot-grey" style="width:10px;height:10px;"></span> P3
           </div>
         </div>
+
+        <div class="mt-5 grid grid-cols-2 gap-3">
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Measured Load</p>
+            <p><span id="measuredPowerW" class="text-lg font-bold text-white">--</span> <span class="text-xs text-slate-400">W</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Predicted Load</p>
+            <p><span id="predictedPowerW" class="text-lg font-bold text-white">--</span> <span class="text-xs text-slate-400">W</span></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── 4. ENVIRONMENT TELEMETRY ─────────────────────────────── -->
+      <div class="glass p-6 animate-fadeUp stagger-4 md:col-span-2 xl:col-span-3" id="cardEnvironment">
+        <div class="flex items-center gap-2 mb-5">
+          <div class="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center">
+            <i class="fa-solid fa-chart-line text-cyan-400 text-sm"></i>
+          </div>
+          <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Environmental Telemetry</h2>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Humidity</p>
+            <p><span id="humidityValue" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">%</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Light</p>
+            <p><span id="luxValue" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">lux</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Voltage</p>
+            <p><span id="voltageValue" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">V</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Current</p>
+            <p><span id="currentValue" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">A</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Occupancy</p>
+            <p><span id="occupancyValue" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">state</span></p>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] p-3">
+            <p class="text-[11px] uppercase tracking-wide text-slate-500">Battery</p>
+            <p><span id="batteryMini" class="text-xl font-bold text-white">--</span> <span class="text-xs text-slate-400">%</span></p>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -283,11 +331,13 @@
        ════════════════════════════════════════════════════════════════ -->
   <script>
     // ── Configuration ────────────────────────────────────────────────
-    const MQTT_HOST    = '127.0.0.1';
+    const MQTT_HOST    = window.location.hostname || '127.0.0.1';
     const MQTT_PORT    = 9001;                   // WebSocket port
     const CLIENT_ID    = 'dashboard-' + Math.random().toString(16).slice(2, 8);
 
     const TOPIC_SENSORS = 'room/sensors';
+    const TOPIC_AVERAGED= 'room/data/averaged';
+    const TOPIC_ML      = 'room/ml/predictions';
     const TOPIC_MODE    = 'room/relays/state';
 
     // ── DOM References ───────────────────────────────────────────────
@@ -312,7 +362,16 @@
       cardRoom:   $id('cardRoom'),
       cardBattery:$id('cardBattery'),
       cardMode:   $id('cardMode'),
+      cardEnvironment:$id('cardEnvironment'),
       activityLog:$id('activityLog'),
+      humidityValue:$id('humidityValue'),
+      luxValue:$id('luxValue'),
+      voltageValue:$id('voltageValue'),
+      currentValue:$id('currentValue'),
+      occupancyValue:$id('occupancyValue'),
+      batteryMini:$id('batteryMini'),
+      measuredPowerW:$id('measuredPowerW'),
+      predictedPowerW:$id('predictedPowerW'),
     };
 
     // ── Helper: flash a card on update ───────────────────────────────
@@ -349,9 +408,16 @@
 
     // ── Update: Sensor Data ──────────────────────────────────────────
     function updateSensors(data) {
+      const tempRaw = data.temperature !== undefined
+        ? data.temperature
+        : data.temperature_c;
+      const batteryRaw = data.battery_level !== undefined
+        ? data.battery_level
+        : data.battery;
+
       // Temperature
-      if (data.temperature !== undefined) {
-        const temp = parseFloat(data.temperature);
+      if (tempRaw !== undefined) {
+        const temp = parseFloat(tempRaw);
         dom.tempValue.textContent = temp.toFixed(1);
         // Color: red if > 28°C, sky otherwise
         dom.tempValue.className = temp > 28
@@ -371,17 +437,20 @@
           dom.occDot.className  = 'dot dot-green';
           dom.occText.textContent = 'Room Occupied';
           dom.occText.className   = 'text-sm font-medium text-emerald-400';
+          dom.occupancyValue.textContent = 'Occupied';
         } else {
           dom.occDot.className  = 'dot dot-grey';
           dom.occText.textContent = 'Room Empty';
           dom.occText.className   = 'text-sm font-medium text-slate-400';
+          dom.occupancyValue.textContent = 'Empty';
         }
       }
 
       // Battery
-      if (data.battery_level !== undefined) {
-        const batt = parseFloat(data.battery_level);
+      if (batteryRaw !== undefined) {
+        const batt = parseFloat(batteryRaw);
         dom.battValue.textContent = batt.toFixed(1);
+        dom.batteryMini.textContent = batt.toFixed(1);
         dom.battBar.style.width = Math.min(100, Math.max(0, batt)) + '%';
 
         let barColor, labelText;
@@ -401,9 +470,48 @@
           + (batt <= 20 ? 'text-red-400' : 'text-slate-500');
       }
 
+      if (data.humidity !== undefined) {
+        dom.humidityValue.textContent = parseFloat(data.humidity).toFixed(1);
+      }
+      if (data.lux !== undefined) {
+        dom.luxValue.textContent = parseFloat(data.lux).toFixed(1);
+      }
+      if (data.voltage !== undefined) {
+        dom.voltageValue.textContent = parseFloat(data.voltage).toFixed(1);
+      }
+      if (data.current !== undefined) {
+        dom.currentValue.textContent = parseFloat(data.current).toFixed(2);
+      }
+
+      let measuredPower = data.power_w;
+      if (measuredPower === undefined
+          && data.voltage !== undefined
+          && data.current !== undefined) {
+        measuredPower = parseFloat(data.voltage) * parseFloat(data.current);
+      }
+      if (measuredPower !== undefined) {
+        dom.measuredPowerW.textContent = parseFloat(measuredPower).toFixed(1);
+      }
+
       flashCard(dom.cardRoom);
       flashCard(dom.cardBattery);
-      addLog(`Sensor → Temp: ${data.temperature}°C | Occupancy: ${data.occupancy} | Battery: ${data.battery_level}%`);
+      flashCard(dom.cardEnvironment);
+      addLog(`Sensor → Temp: ${tempRaw}°C | Occupancy: ${data.occupancy} | Battery: ${batteryRaw}%`);
+    }
+
+    function updatePrediction(data) {
+      let predictedW = data.predicted_power_w;
+      if (predictedW === undefined && data.predicted_power_kw !== undefined) {
+        predictedW = parseFloat(data.predicted_power_kw) * 1000.0;
+      }
+      if (predictedW === undefined && data.predicted_energy_range !== undefined) {
+        predictedW = parseFloat(data.predicted_energy_range) * 1000.0;
+      }
+      if (predictedW !== undefined) {
+        dom.predictedPowerW.textContent = parseFloat(predictedW).toFixed(1);
+      }
+      flashCard(dom.cardMode);
+      addLog(`Prediction → ${predictedW !== undefined ? Number(predictedW).toFixed(1) + 'W' : 'n/a'}`);
     }
 
     // ── Update: Mode ─────────────────────────────────────────────────
@@ -510,8 +618,10 @@
         return;
       }
 
-      if (topic === TOPIC_SENSORS) {
+      if (topic === TOPIC_SENSORS || topic === TOPIC_AVERAGED) {
         updateSensors(data);
+      } else if (topic === TOPIC_ML) {
+        updatePrediction(data);
       } else if (topic === TOPIC_MODE) {
         updateMode(data);
       }
@@ -526,8 +636,16 @@
           setConnState('connected');
           addLog('✓ Connected to MQTT broker');
           client.subscribe(TOPIC_SENSORS);
+          client.subscribe(TOPIC_AVERAGED);
+          client.subscribe(TOPIC_ML);
           client.subscribe(TOPIC_MODE);
-          addLog('✓ Subscribed to ' + TOPIC_SENSORS + ', ' + TOPIC_MODE);
+          addLog(
+            '✓ Subscribed to '
+            + TOPIC_SENSORS + ', '
+            + TOPIC_AVERAGED + ', '
+            + TOPIC_ML + ', '
+            + TOPIC_MODE
+          );
         },
         onFailure: function(err) {
           setConnState('disconnected');

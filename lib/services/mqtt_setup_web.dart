@@ -12,7 +12,14 @@ MqttClient createMqttClient(
   if (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://')) {
     wsUrl = 'ws://$wsUrl';
   }
+  if (port != null) {
+    wsUrl = '$wsUrl:$port/mqtt';
+  } else {
+    wsUrl = '$wsUrl/mqtt';
+  }
+  
   final client = MqttBrowserClient(wsUrl, clientIdentifier);
   if (port != null) client.port = port;
+  client.websocketProtocols = MqttClientConstants.protocolsSingleDefault;
   return client;
 }

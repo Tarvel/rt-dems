@@ -47,5 +47,24 @@ void main() {
       expect(data.length, 2);
       expect(data[0]['temperature'], 20.0);
     });
+
+    test('getLatestPrediction returns parsed ML data on 200', () async {
+      final mockClient = MockClient((request) async {
+        return http.Response(
+          json.encode({
+            'mean_prediction_kw': 1.25,
+            'upper_bound_kw': 1.45,
+            'predicted_power_w': 1250.0,
+          }),
+          200,
+        );
+      });
+
+      final api = ApiService(client: mockClient);
+      final data = await api.getLatestPrediction();
+
+      expect(data['mean_prediction_kw'], 1.25);
+      expect(data['upper_bound_kw'], 1.45);
+    });
   });
 }

@@ -1,11 +1,9 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'services/api_service.dart';
 import 'services/mqtt_service.dart';
-import 'services/websocket_service.dart';
 
 void main() {
   runApp(const RtDemsApp());
@@ -115,7 +113,6 @@ class _DashboardShellState extends State<DashboardShell> {
 
   late ApiService _apiService;
   late MqttService _mqttService;
-  late WebSocketService _wsService;
   Timer? _pollingTimer;
 
   List<dynamic> _historyData = [];
@@ -123,9 +120,8 @@ class _DashboardShellState extends State<DashboardShell> {
   @override
   void initState() {
     super.initState();
-    _apiService = ApiService();
-    _mqttService = MqttService(server: 'localhost');
-    _wsService = WebSocketService(url: 'ws://localhost:8765');
+    _apiService = ApiService(baseUrl: 'http://127.0.0.1:8000/api/v1');
+    _mqttService = MqttService(server: '127.0.0.1');
     _initBackend();
     // Poll REST API every 10 seconds as a fallback
     _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
@@ -139,7 +135,6 @@ class _DashboardShellState extends State<DashboardShell> {
   @override
   void dispose() {
     _pollingTimer?.cancel();
-    _wsService.dispose();
     _mqttService.dispose();
     super.dispose();
   }
@@ -162,18 +157,14 @@ class _DashboardShellState extends State<DashboardShell> {
       });
     }
 
-    // Connect via WebSocket (Django Channels) for live updates
-    _wsService.connect();
-    _wsService.dataStream.listen((data) {
+    // Connect to MQTT (uses WebSockets on Web over port 9001 and TCP on Native)
+    await _mqttService.connect();
+    _mqttService.dataStream.listen((data) {
       if (mounted) _updateSensorState(data);
     });
-
-    // Connect to MQTT on native platforms only
-    if (!kIsWeb) {
-      await _mqttService.connect();
-      _mqttService.dataStream.listen(_updateSensorState);
-      _mqttService.relayStream.listen(_updateRelayState);
-    }
+    _mqttService.relayStream.listen((data) {
+      if (mounted) _updateRelayState(data);
+    });
   }
 
   void _updateSensorState(Map<String, dynamic> data) {
@@ -190,32 +181,53 @@ class _DashboardShellState extends State<DashboardShell> {
         _current = (data['current'] as num).toDouble();
       if (data.containsKey('battery_level')) {
         _batteryLevel = (data['battery_level'] as num).toDouble();
-        // Maintain last 3 values
-        _batteryHistory.add(_batteryLevel);
-        if (_batteryHistory.length > 3) _batteryHistory.removeAt(0);
       }
       if (data.containsKey('luminous_intensity'))
         _luminousIntensity = (data['luminous_intensity'] as num).toDouble();
-      if (data.containsKey('predicted_energy_range'))
+        
+      if (data.containsKey('mean_prediction_kw')) {
+        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
+      } else if (data.containsKey('predicted_energy_range')) {
         _predictedEnergy = (data['predicted_energy_range'] as num).toDouble();
-      if (data.containsKey('peak_demand'))
+      }
+
+      if (data.containsKey('upper_bound_kw')) {
+        _peakDemand = (data['upper_bound_kw'] as num).toDouble();
+      } else if (data.containsKey('peak_demand')) {
         _peakDemand = (data['peak_demand'] as num).toDouble();
+      }
     });
   }
 
   void _updatePredictionState(Map<String, dynamic> data) {
     setState(() {
-      if (data.containsKey('predicted_energy_range'))
+      if (data.containsKey('mean_prediction_kw')) {
+        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
+      } else if (data.containsKey('predicted_energy_range')) {
         _predictedEnergy = (data['predicted_energy_range'] as num).toDouble();
-      if (data.containsKey('peak_demand'))
+      }
+
+      if (data.containsKey('upper_bound_kw')) {
+        _peakDemand = (data['upper_bound_kw'] as num).toDouble();
+      } else if (data.containsKey('peak_demand')) {
         _peakDemand = (data['peak_demand'] as num).toDouble();
+      }
     });
   }
 
   void _updateRelayState(Map<String, dynamic> data) {
     setState(() {
       if (data.containsKey('mode')) _currentMode = data['mode'];
-      // Handle other relay fields if needed
+      
+      if (data.containsKey('battery_lag_values')) {
+        try {
+          List<dynamic> rawList = data['battery_lag_values'];
+          // Rule engine sends [T-now, T-1, T-2]. Visualizer expects oldest first: [T-2, T-1, T-now]
+          _batteryHistory = rawList.reversed.map((e) => (e as num).toDouble()).toList();
+        } catch (e) {
+          print('Failed to parse battery_lag_values = $e');
+        }
+      }
     });
   }
 
@@ -1555,14 +1567,16 @@ class _BatteryLagCard extends StatelessWidget {
           const SizedBox(height: 16),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: history.map((val) => _lagItem(context, val)).toList(),
+            children: history.asMap().entries.map((entry) {
+              return _lagItem(context, entry.value, entry.key);
+            }).toList(),
           ),
         ],
       ),
     );
   }
 
-  Widget _lagItem(BuildContext context, double val) {
+  Widget _lagItem(BuildContext context, double val, int index) {
     return Column(
       children: [
         Text(
@@ -1570,7 +1584,7 @@ class _BatteryLagCard extends StatelessWidget {
           style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         Text(
-          't-${history.indexOf(val)}',
+          't-$index',
           style: TextStyle(
             color: Theme.of(context).textTheme.bodySmall?.color,
             fontSize: 10,

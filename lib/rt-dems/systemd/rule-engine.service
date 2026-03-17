@@ -1,0 +1,18 @@
+[Unit]
+Description=Smart Room Rule Engine (GPIO relay controller)
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/PROJECT_CODE/workers
+ExecStart=/home/pi/PROJECT_CODE/venv/bin/python3 /home/pi/PROJECT_CODE/workers/rule_engine.py
+Environment="DB_PATH=/home/pi/PROJECT_CODE/room_backend/db.sqlite3"
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,6 @@ import signal
 import sqlite3
 import sys
 import threading
-import time
 from collections import deque
 from datetime import datetime, timezone
 
@@ -47,7 +46,10 @@ except (ImportError, RuntimeError):
 
         @classmethod
         def setmode(cls, mode):
-            logging.getLogger("rule_engine").info("MockGPIO: setmode(%s)", mode)
+            logging.getLogger("rule_engine").info(
+                "MockGPIO: setmode(%s)",
+                mode,
+            )
 
         @classmethod
         def setwarnings(cls, flag):
@@ -98,8 +100,13 @@ DB_PATH = os.environ.get(
                  "..", "room_backend", "db.sqlite3"),
 )
 
-# Evaluation interval (seconds)
-EVAL_INTERVAL = 5 * 60  # 5 minutes
+# Evaluation interval (seconds) — set to 30*60 for production.
+EVAL_INTERVAL = int(os.environ.get("RULE_EVAL_INTERVAL_SECONDS", 2 * 60))
+
+# Configurable max load thresholds in watts.
+MODE_A_MAX_W = float(os.environ.get("MODE_A_MAX_W", 2400.0))
+MODE_B_MAX_W = float(os.environ.get("MODE_B_MAX_W", 1400.0))
+MODE_C_MAX_W = float(os.environ.get("MODE_C_MAX_W", 800.0))
 
 # Temperature bias threshold
 TEMP_HOT_THRESHOLD = 28.0
@@ -123,11 +130,8 @@ latest_sensor: dict = {}
 # Latest ML prediction
 latest_ml: dict = {}
 
-# Rolling battery window: last 3 readings at 5-min intervals [T-10m, T-5m, T-Now]
+# Rolling battery window: last 3 readings [T-10m, T-5m, T-now].
 battery_window: deque[float] = deque(maxlen=3)
-
-# Occupancy tracking: consecutive zero-occupancy tick count (each tick = 5 min)
-occupancy_zero_streak: int = 0
 
 # Current mode (persists between evaluations for stability lock)
 current_mode: str = "C"  # start in safest mode
@@ -208,7 +212,8 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
         ensure_relay_table(conn)
         conn.execute(
             """
-            INSERT INTO energy_relaystate (timestamp, mode, relay_1, relay_2, relay_3, reason)
+            INSERT INTO energy_relaystate
+                (timestamp, mode, relay_1, relay_2, relay_3, reason)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
@@ -235,106 +240,72 @@ def evaluate_rules() -> tuple[str, str]:
     Uses the shared state variables under state_lock.
     Must be called while holding state_lock.
     """
-    global occupancy_zero_streak, current_mode
+    global current_mode
 
-    temperature = latest_sensor.get("temperature", 25.0)
-    occupancy = latest_sensor.get("occupancy", 0)
+    temperature = latest_sensor.get(
+        "temperature", latest_sensor.get("temperature_c", 25.0)
+    )
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    predicted_energy_range = latest_ml.get("predicted_energy_range", 0.0)
-    peak_demand = latest_ml.get("peak_demand", 0.0)
+    predicted_power_w = latest_ml.get("predicted_power_w")
+    predicted_power_kw = latest_ml.get("predicted_power_kw")
+    if predicted_power_w is None:
+        if predicted_power_kw is not None:
+            predicted_power_w = float(predicted_power_kw) * 1000.0
+        else:
+            # Backward compatibility with legacy kW field.
+            predicted_power_w = (
+                float(latest_ml.get("predicted_energy_range", 0.0)) * 1000.0
+            )
 
-    # ── Phase 1: Master Overrides ──────────────────────────────────────────
-    # Track occupancy streak (each call = one 5-min tick)
-    if occupancy == 0:
-        occupancy_zero_streak += 1
-    else:
-        occupancy_zero_streak = 0
-
-    # 5 consecutive minutes of 0 → since we evaluate every 5 min,
-    # streak >= 1 means at least 5 minutes of zero occupancy.
-    if occupancy_zero_streak >= 1:
-        return "C", (
-            f"Phase 1 — Occupancy Override: room empty for "
-            f"{occupancy_zero_streak * 5} consecutive minutes → Mode C"
-        )
-
-    # ── Phase 2: Battery Stability Lock (3-reading sliding window) ─────────
+    # Phase 1: Battery Stability Lock (3-reading sliding window)
     # We need at least 3 readings to evaluate the drop
     if len(battery_window) >= 3:
         drop = battery_window[0] - battery_window[-1]  # T-10m minus T-Now
         if drop <= 2.0:
             return current_mode, (
-                f"Phase 2 — Stability Lock: battery drop {drop:.1f}% "
+                f"Phase 1 — Stability Lock: battery drop {drop:.1f}% "
                 f"(≤2%) over 3 readings → maintaining Mode {current_mode}"
             )
-        battery_draining_fast = True
-    else:
-        # Not enough history — assume battery is not draining fast
-        drop = 0.0
-        battery_draining_fast = False
 
-    # ── Phase 3: Temperature Bias & Standard Flow ──────────────────────────
-
-    # Step 5: Temperature bias
+    # Phase 2: Temperature bias
     if temperature > TEMP_HOT_THRESHOLD and battery_level > 40.0:
         return "B", (
-            f"Phase 3 — Temperature Bias: {temperature}°C > {TEMP_HOT_THRESHOLD}°C "
+            f"Phase 2 — Temperature Bias: "
+            f"{temperature}°C > {TEMP_HOT_THRESHOLD}°C "
             f"and battery {battery_level}% > 40% → Mode B (fans allowed)"
         )
 
-    # Step 6: predicted_energy_range >= peak_demand
-    if predicted_energy_range >= peak_demand:
-        if battery_level >= 80.0:
-            if not battery_draining_fast:
-                return "A", (
-                    f"Phase 3.6a — Energy ≥ Peak, battery {battery_level}% ≥ 80% "
-                    f"and stable → Mode A"
-                )
-            else:
-                return "B", (
-                    f"Phase 3.6b — Energy ≥ Peak, battery {battery_level}% ≥ 80% "
-                    f"but draining fast (drop={drop:.1f}%) → Mode B"
-                )
-        elif battery_level >= 50.0:
-            return "B", (
-                f"Phase 3.6c — Energy ≥ Peak, battery {battery_level}% "
-                f"(50-79%) → Mode B"
-            )
-        else:
-            return "C", (
-                f"Phase 3.6d — Energy ≥ Peak, battery {battery_level}% "
-                f"< 50% → Mode C"
-            )
-
-    # Step 7: predicted_energy_range < peak_demand
-    if battery_level >= 60.0:
-        return "A", (
-            f"Phase 3.7a — Energy < Peak, battery {battery_level}% ≥ 60% → Mode A"
-        )
-
-    # Step 7 fallback: battery < 60% → route back to Step 6 strict logic
-    if battery_level >= 80.0:
-        if not battery_draining_fast:
-            return "A", (
-                f"Phase 3.7b→6a — Energy < Peak, battery < 60% "
-                f"(re-eval: {battery_level}% ≥ 80%, stable) → Mode A"
-            )
-        else:
-            return "B", (
-                f"Phase 3.7b→6b — Energy < Peak, battery < 60% "
-                f"(re-eval: {battery_level}% ≥ 80%, draining) → Mode B"
-            )
-    elif battery_level >= 50.0:
-        return "B", (
-            f"Phase 3.7b→6c — Energy < Peak, battery < 60% "
-            f"(re-eval: {battery_level}% 50-79%) → Mode B"
-        )
-    else:
+    # Phase 3: Wattage-based mode selection.
+    if battery_level < 50.0:
         return "C", (
-            f"Phase 3.7b→6d — Energy < Peak, battery {battery_level}% "
-            f"< 50% → Mode C"
+            f"Phase 3 — Low battery guard: {battery_level:.1f}% < 50% → Mode C"
         )
+
+    if predicted_power_w <= MODE_C_MAX_W:
+        return "C", (
+            f"Phase 3 — Predicted load "
+            f"{predicted_power_w:.1f}W <= MODE_C_MAX_W "
+            f"{MODE_C_MAX_W:.1f}W → Mode C"
+        )
+    if predicted_power_w <= MODE_B_MAX_W:
+        return "B", (
+            f"Phase 3 — Predicted load "
+            f"{predicted_power_w:.1f}W <= MODE_B_MAX_W "
+            f"{MODE_B_MAX_W:.1f}W → Mode B"
+        )
+    if predicted_power_w <= MODE_A_MAX_W:
+        return "A", (
+            f"Phase 3 — Predicted load "
+            f"{predicted_power_w:.1f}W <= MODE_A_MAX_W "
+            f"{MODE_A_MAX_W:.1f}W → Mode A"
+        )
+
+    return "A", (
+        f"Phase 3 — Predicted load "
+        f"{predicted_power_w:.1f}W exceeds MODE_A_MAX_W "
+        f"{MODE_A_MAX_W:.1f}W → Mode A (max-capacity fallback)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +339,12 @@ def run_evaluation(client: mqtt.Client) -> None:
         current_mode = new_mode
 
     change_str = "MODE CHANGED" if mode_changed else "mode unchanged"
-    log.info("Evaluation result: Mode %s (%s) — %s", new_mode, change_str, reason)
+    log.info(
+        "Evaluation result: Mode %s (%s) — %s",
+        new_mode,
+        change_str,
+        reason,
+    )
 
     # Log decision to database
     log_decision(new_mode, r1, r2, r3, reason)
@@ -414,6 +390,8 @@ def on_message(client, userdata, msg):
 
     with state_lock:
         if msg.topic == TOPIC_SENSORS:
+            if "temperature" not in payload and "temperature_c" in payload:
+                payload["temperature"] = payload["temperature_c"]
             latest_sensor.update(payload)
             log.debug("Updated latest sensor data")
         elif msg.topic == TOPIC_ML:
@@ -423,7 +401,10 @@ def on_message(client, userdata, msg):
 
 def on_disconnect(client, userdata, rc, properties=None):
     if rc != 0:
-        log.warning("Unexpected MQTT disconnect (rc=%d). Will auto-reconnect.", rc)
+        log.warning(
+            "Unexpected MQTT disconnect (rc=%d). Will auto-reconnect.",
+            rc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +423,12 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
 
     log.info("Starting Rule Engine (eval every %ds)", EVAL_INTERVAL)
+    log.info(
+        "Mode watt limits: A<=%.1fW, B<=%.1fW, C<=%.1fW",
+        MODE_A_MAX_W,
+        MODE_B_MAX_W,
+        MODE_C_MAX_W,
+    )
     log.info("Database: %s", os.path.abspath(DB_PATH))
     log.info("Running on Raspberry Pi: %s", ON_PI)
 
@@ -475,7 +462,11 @@ def main() -> None:
         sys.exit(1)
 
     # Start evaluation thread
-    eval_thread = threading.Thread(target=evaluation_loop, args=(client,), daemon=True)
+    eval_thread = threading.Thread(
+        target=evaluation_loop,
+        args=(client,),
+        daemon=True,
+    )
     eval_thread.start()
 
     # Blocking MQTT loop
@@ -487,7 +478,13 @@ def main() -> None:
     # Clean up
     log.info("Shutting down relays (Mode C for safety) …")
     apply_mode("C")
-    log_decision("C", True, False, False, "Shutdown — forced Mode C for safety")
+    log_decision(
+        "C",
+        True,
+        False,
+        False,
+        "Shutdown — forced Mode C for safety",
+    )
     GPIO.cleanup()
     client.loop_stop()
     client.disconnect()

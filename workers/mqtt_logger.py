@@ -243,6 +243,8 @@ def on_message(client, userdata, msg):
 
     with buffer_lock:
         if msg.topic == TOPIC_SENSORS:
+            if "temperature" not in payload and "temperature_c" in payload:
+                payload["temperature"] = payload["temperature_c"]
             required = {
                 "temperature", "humidity", "occupancy",
                 "voltage", "current", "battery_level",

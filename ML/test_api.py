@@ -11,9 +11,6 @@ mock_payload = {
     "humidity": 60.0,
     "lux": 450.0,
     "occupancy": 1,
-    "voltage": 220.0,
-    "current": 6.2,
-    "battery_level": 78.0,
     "power_w": 1364.0,
     "lag_1h": 1.10,
     "lag_2h": 1.05,
@@ -33,13 +30,13 @@ try:
         print("\n[+] SUCCESS! HYBRIDIZED MMODEL response:")
 
         # Parse the JSON response
-        ai_answer = response.json()
-        print(json.dumps(ai_answer, indent=4))
+        model_answer = response.json()
+        print(json.dumps(model_answer, indent=4))
 
         print(
             f"\nPredicted power for rule logic: "
-            f"{ai_answer['predicted_power_kw']} kW "
-            f"({ai_answer['predicted_power_w']} W)."
+            f"{model_answer['predicted_power_kw']} kW "
+            f"({model_answer['predicted_power_w']} W)."
         )
     else:
         print(

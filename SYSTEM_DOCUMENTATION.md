@@ -26,7 +26,8 @@ The system manages hostel room loads by combining:
 3. Logger subscribes to both topics, buffers and writes 5-minute averages to SQLite.
 4. Rule engine subscribes to both topics, evaluates mode, updates GPIO, logs decisions.
 5. Logger publishes `room/data/averaged`; rule engine publishes `room/relays/state`.
-6. Django serves persisted historical data through `/api/v1/*` endpoints.
+6. Dashboard subscribes to `room/sensors`, `room/data/averaged`, `room/ml/predictions`, and `room/relays/state`.
+7. Django serves persisted historical data through `/api/v1/*` endpoints.
 
 ## 4. ML Service Details
 
@@ -111,7 +112,13 @@ Published by logger every flush interval with averaged sensor values and predict
 
 Published by rule engine after each evaluation with mode, relay states, reason, and timestamp.
 
-## 8. Database and Concurrency
+## 8. Dashboard Realtime Notes
+
+1. The dashboard is realtime via MQTT (not polling REST).
+2. The battery lag widget shows only the most recent 3 battery values.
+3. That battery lag view is computed in the dashboard from `room/sensors` stream as `T-now`, `T-1`, `T-2`.
+
+## 9. Database and Concurrency
 
 SQLite WAL mode is used so readers and writers can coexist across:
 
@@ -125,7 +132,7 @@ Primary tables:
 2. `energy_mlprediction`
 3. `energy_relaystate`
 
-## 9. API Surface
+## 10. API Surface
 
 Base path: `/api/v1/`
 
@@ -138,7 +145,7 @@ Base path: `/api/v1/`
 
 All are read-only GET endpoints.
 
-## 10. GPIO and Deployment Notes
+## 11. GPIO and Deployment Notes
 
 Default BCM pins:
 

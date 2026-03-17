@@ -224,6 +224,24 @@
           <div id="battBar" class="battery-bar bg-emerald-500" style="width:0%"></div>
         </div>
         <p id="battLabel" class="text-xs text-slate-500 mt-2 text-center font-medium">Waiting for data…</p>
+
+        <div class="mt-4 rounded-lg bg-white/[0.03] p-3">
+          <p class="text-[11px] uppercase tracking-wide text-slate-500 mb-2">Battery Lag (Most Recent 3)</p>
+          <div id="batteryLagList" class="grid grid-cols-3 gap-2 text-center">
+            <div class="rounded-md bg-white/[0.04] p-2">
+              <p class="text-[10px] text-slate-500">T-now</p>
+              <p id="battLag0" class="text-sm font-semibold text-white">--</p>
+            </div>
+            <div class="rounded-md bg-white/[0.04] p-2">
+              <p class="text-[10px] text-slate-500">T-1</p>
+              <p id="battLag1" class="text-sm font-semibold text-white">--</p>
+            </div>
+            <div class="rounded-md bg-white/[0.04] p-2">
+              <p class="text-[10px] text-slate-500">T-2</p>
+              <p id="battLag2" class="text-sm font-semibold text-white">--</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- ─── 3. ACTIVE LOAD LEVEL ────────────────────────────────── -->
@@ -372,7 +390,12 @@
       batteryMini:$id('batteryMini'),
       measuredPowerW:$id('measuredPowerW'),
       predictedPowerW:$id('predictedPowerW'),
+      battLag0:$id('battLag0'),
+      battLag1:$id('battLag1'),
+      battLag2:$id('battLag2'),
     };
+
+    const batteryLagWindow = [];
 
     // ── Helper: flash a card on update ───────────────────────────────
     function flashCard(el) {
@@ -407,7 +430,19 @@
     setInterval(tickClock, 1000);
 
     // ── Update: Sensor Data ──────────────────────────────────────────
-    function updateSensors(data) {
+    function updateBatteryLagWindow(lagValues) {
+      batteryLagWindow.length = 0;
+      for (const value of lagValues.slice(0, 3)) {
+        batteryLagWindow.push(value);
+      }
+      const lagCells = [dom.battLag0, dom.battLag1, dom.battLag2];
+      lagCells.forEach((cell, idx) => {
+        const value = batteryLagWindow[idx];
+        cell.textContent = value === undefined ? '--' : `${value.toFixed(1)}%`;
+      });
+    }
+
+    function updateSensors(data, topic) {
       const tempRaw = data.temperature !== undefined
         ? data.temperature
         : data.temperature_c;
@@ -568,6 +603,13 @@
         dots[i].style.height = '10px';
       });
 
+      if (Array.isArray(data.battery_lag_values)) {
+        const lagValues = data.battery_lag_values
+          .map((v) => Number(v))
+          .filter((v) => Number.isFinite(v));
+        updateBatteryLagWindow(lagValues);
+      }
+
       flashCard(dom.cardMode);
       addLog(`Mode → ${mode} (${cfg.label})`);
     }
@@ -619,7 +661,7 @@
       }
 
       if (topic === TOPIC_SENSORS || topic === TOPIC_AVERAGED) {
-        updateSensors(data);
+        updateSensors(data, topic);
       } else if (topic === TOPIC_ML) {
         updatePrediction(data);
       } else if (topic === TOPIC_MODE) {

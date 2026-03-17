@@ -100,8 +100,30 @@ DB_PATH = os.environ.get(
                  "..", "room_backend", "db.sqlite3"),
 )
 
-# Evaluation interval (seconds) — set to 30*60 for production.
-EVAL_INTERVAL = int(os.environ.get("RULE_EVAL_INTERVAL_SECONDS", 2 * 60))
+# Evaluation interval in seconds.
+# Production recommendation: 300 (5 minutes)
+# Testing recommendation: 30 or 60
+EVAL_INTERVAL = int(os.environ.get("RULE_EVAL_INTERVAL_SECONDS", 90))
+
+# Number of readings used for battery stability lock.
+# With 3 readings and 300s interval, lock span is 10 minutes
+# (T-10m, T-5m, T-now).
+BATTERY_STABILITY_READINGS = int(
+    os.environ.get("BATTERY_STABILITY_READINGS", 3)
+)
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+BATTERY_STABILITY_SPAN_SECONDS = max(
+    0,
+    (BATTERY_STABILITY_READINGS - 1) * EVAL_INTERVAL,
+)
 
 # Configurable max load thresholds in watts.
 MODE_A_MAX_W = float(os.environ.get("MODE_A_MAX_W", 2400.0))
@@ -130,8 +152,8 @@ latest_sensor: dict = {}
 # Latest ML prediction
 latest_ml: dict = {}
 
-# Rolling battery window: last 3 readings [T-10m, T-5m, T-now].
-battery_window: deque[float] = deque(maxlen=3)
+# Rolling battery window used by stability lock.
+battery_window: deque[float] = deque(maxlen=BATTERY_STABILITY_READINGS)
 
 # Current mode (persists between evaluations for stability lock)
 current_mode: str = "C"  # start in safest mode
@@ -258,14 +280,15 @@ def evaluate_rules() -> tuple[str, str]:
                 float(latest_ml.get("predicted_energy_range", 0.0)) * 1000.0
             )
 
-    # Phase 1: Battery Stability Lock (3-reading sliding window)
-    # We need at least 3 readings to evaluate the drop
-    if len(battery_window) >= 3:
-        drop = battery_window[0] - battery_window[-1]  # T-10m minus T-Now
-        if drop <= 2.0:
+    # Phase 1: Battery Stability Lock
+    if len(battery_window) >= BATTERY_STABILITY_READINGS:
+        drop = battery_window[0] - battery_window[-1]
+        if drop <= 1.0:
             return current_mode, (
                 f"Phase 1 — Stability Lock: battery drop {drop:.1f}% "
-                f"(≤2%) over 3 readings → maintaining Mode {current_mode}"
+                f"(≤1%) over {BATTERY_STABILITY_READINGS} readings "
+                f"({_format_duration(BATTERY_STABILITY_SPAN_SECONDS)}) "
+                f"→ maintaining Mode {current_mode}"
             )
 
     # Phase 2: Temperature bias
@@ -324,7 +347,8 @@ def run_evaluation(client: mqtt.Client) -> None:
         battery_level = latest_sensor.get("battery_level", 100.0)
         battery_window.append(battery_level)
         log.info(
-            "Battery window (last 3): %s",
+            "Battery window (last %d): %s",
+            BATTERY_STABILITY_READINGS,
             [round(b, 1) for b in battery_window],
         )
 
@@ -355,6 +379,10 @@ def run_evaluation(client: mqtt.Client) -> None:
         "relay_1": r1,
         "relay_2": r2,
         "relay_3": r3,
+        "battery_lag_values": [
+            round(v, 1) for v in reversed(list(battery_window))
+        ],
+        "battery_lag_interval_seconds": EVAL_INTERVAL,
         "reason": reason,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -422,7 +450,21 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    log.info("Starting Rule Engine (eval every %ds)", EVAL_INTERVAL)
+    log.info("Starting Rule Engine")
+    log.info(
+        "Evaluation interval: %ds (%s)",
+        EVAL_INTERVAL,
+        _format_duration(EVAL_INTERVAL),
+    )
+    log.info(
+        "Battery stability window: %d readings (%s span)",
+        BATTERY_STABILITY_READINGS,
+        _format_duration(BATTERY_STABILITY_SPAN_SECONDS),
+    )
+    log.info(
+        "Set RULE_EVAL_INTERVAL_SECONDS=300 for production; "
+        "30 or 60 for testing"
+    )
     log.info(
         "Mode watt limits: A<=%.1fW, B<=%.1fW, C<=%.1fW",
         MODE_A_MAX_W,

@@ -11,7 +11,7 @@ QoS: `1`
 | Topic | Publisher | Subscribers | Description |
 |---|---|---|---|
 | `room/sensors` | Hardware or simulator | ML service, logger, rule engine, dashboard | Raw telemetry stream |
-| `room/ml/predictions` | ML service | logger, rule engine, dashboard (optional) | Model predictions |
+| `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
 | `room/data/averaged` | logger | dashboard | 5-minute averaged values |
 | `room/relays/state` | rule engine | dashboard | Current mode and relay states |
 
@@ -89,10 +89,14 @@ Published every logger flush cycle:
   "relay_1": true,
   "relay_2": true,
   "relay_3": false,
+  "battery_lag_values": [77.3, 77.9, 78.4],
+  "battery_lag_interval_seconds": 60,
   "reason": "Phase 3 - Predicted load 1220.0W <= MODE_B_MAX_W 1400.0W -> Mode B",
   "timestamp": "2026-03-17T12:00:00+00:00"
 }
 ```
+
+`battery_lag_values` is ordered as `[T-now, T-1, T-2]` and updates at rule evaluation cadence.
 
 ## 6. Rule Threshold Contract (Watts)
 
@@ -114,3 +118,20 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 4. `GET /predictions/latest/`
 5. `GET /relays/`
 6. `GET /relays/current/`
+
+## 8. Dashboard Realtime Contract
+
+The dashboard (`dashboard/index.html`) is MQTT-driven for realtime values.
+
+### 8.1 Topics consumed by dashboard
+
+1. `room/sensors` (primary realtime telemetry)
+2. `room/data/averaged` (5-minute context values)
+3. `room/ml/predictions` (predicted load in kW/W)
+4. `room/relays/state` (current mode and relay states)
+
+### 8.2 Battery lag display behavior
+
+1. The dashboard battery-lag display reads `battery_lag_values` from `room/relays/state`.
+2. This makes lag updates follow `RULE_EVAL_INTERVAL_SECONDS` (rule-engine cadence).
+3. The values are visualized as `T-now`, `T-1`, and `T-2` and are not fetched from REST API.

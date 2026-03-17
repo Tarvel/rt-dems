@@ -17,7 +17,7 @@ Before running the project, ensure you have the following installed:
 
 ## Getting Started
 
-### 1. Backend Setup (Mosquitto & Python)
+### 1. Backend Setup (Mosquitto & API)
 Navigate to the backend directory and start the services:
 ```bash
 # Start Mosquitto (Windows example)
@@ -25,42 +25,48 @@ cd lib/rt-dems
 mosquitto -c systemd/mosquitto.conf -v
 
 # Initialize Python Virtual Environment
-cd lib/rt-dems/room_backend
+# (Run this once)
 python -m venv venv
-..\venv\Scripts\activate
+.\venv\Scripts\activate
 pip install -r requirements.txt
 
-# Start Daphne (Interface Server)
-python -m daphne -b 127.0.0.1 -p 8000 room_backend.asgi:application
+# Start Django API Server
+cd room_backend
+python manage.py migrate
+python manage.py runserver 0.0.0.0:8000
 ```
 
-### 2. Workers & Simulation
-Start the background workers in separate terminals:
+### 2. Workers & ML Services
+Start the following in separate terminals (activate venv in each):
 ```bash
-# MQTT Logger
+# MQTT Logger (Averages data for DB)
 python lib/rt-dems/workers/mqtt_logger.py
 
-# Rule Engine
+# Rule Engine (ML-driven relay control)
 python lib/rt-dems/workers/rule_engine.py
 
-# Data Simulator
+# ML Inference Service (FastAPI)
+cd lib/rt-dems/ML
+python app.py
+
+# Data Simulator (For testing)
 python lib/rt-dems/simulation/data_simulator.py
 ```
 
 ### 3. Frontend Setup (Flutter)
-Run the following commands from the project root:
+Run the following from the project root:
 ```bash
-# Fetch dependencies
-flutter pub get
-
-# Run the application
-flutter run
+flutter run -d chrome  # For Web
+# or
+flutter run           # For Desktop/Mobile
 ```
 
 ## Project Structure
-- `lib/main.dart`: Core dashboard UI and logic.
-- `lib/rt-dems/`: Backend services, simulation, and workers.
-- `lib/rt-dems/room_backend/`: Django/Daphne server for data orchestration.
+- `lib/main.dart`: Core dashboard UI and MQTT/API integration.
+- `lib/rt-dems/`: Backend microservices.
+- `lib/rt-dems/ML/`: ML model and inference wrapper.
+- `lib/rt-dems/room_backend/`: Django API server.
+- `lib/rt-dems/workers/`: Rule engine and database logger.
 
 ## License
 MIT License - Developed for Advanced Energy Management Systems.

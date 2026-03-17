@@ -27,7 +27,7 @@ This document explains **everything** about how the system works, piece by piece
 
 ### What problem does this solve?
 
-University hostels waste a lot of energy. Lights stay on in empty rooms. Air conditioners run when nobody is there. Heavy electrical appliances run even when the battery system is almost dead. This system solves that by automatically controlling which electrical devices are allowed to be powered on, based on real-time data from sensors.
+University hostels waste a lot of energy. Lights stay on in empty rooms. Air conditioners run when nobody is there. Heavy electrical appliances run even when the battery system is almost dead. This system solves that by automatically controlling which electrical devices are allowed to be energized, based on real-time data from sensors.
 
 ### What does the system do in one sentence?
 
@@ -40,7 +40,7 @@ This is a group project split between three teams:
 | Team                     | Responsibility                                                                     | What they give us                             | What they take from us               |
 | ------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------- | ------------------------------------ |
 | **Hardware (Group A)**   | Physical sensors (temperature, humidity, motion, voltage, current, battery)        | Sensor data published to MQTT                 | Nothing — they just publish          |
-| **ML Team<br>(Group B)** | Machine learning model that predicts energy usage                                  | Predictions published to MQTT                 | Sensor data from MQTT                |
+| **ML Team<br>(Group B)** | Machine learning model that predicts energy usage                                  | Predictions published to MQTT                 | Nothing — they just publish          |
 | **Us<br>(Group C)**      | The Raspberry Pi server, database, MQTT broker, API endpoints, relay control logic | REST API endpoints, MQTT topics for live data | We receive sensor + ML data via MQTT |
 
 ### What the Raspberry Pi does (our responsibility)
@@ -72,7 +72,7 @@ We have 3 relays, each connected to a different GPIO pin on the Pi:
 |-------|---------------|----------------|-----------------|
 | Relay 1 | Pin 17 | Priority 1 (Critical) | Essential loads — lights, emergency systems |
 | Relay 2 | Pin 27 | Priority 2 (Medium) | Comfort loads — fans, ventilation |
-| Relay 3 | Pin 22 | Priority 3 (Luxury) | Heavy loads — AC, heaters, high-power appliances |
+| Relay 3 | Pin 22 | Priority 3 (Luxury) | Heavy loads — AC, heaters, high-energy appliances |
 
 ### How relays work with GPIO
 
@@ -86,7 +86,7 @@ We have 3 relays, each connected to a different GPIO pin on the Pi:
 |------|------|:-------:|:-------:|:-------:|---------|
 | **A** | Peak Demand | ON | ON | ON | Everything runs. Battery is healthy, energy supply is good. |
 | **B** | Average Load | ON | ON | OFF | Fans and lights work, but heavy appliances like AC are cut off. |
-| **C** | Baseline Load | ON | OFF | OFF | Survival mode. Only the most critical devices stay powered. |
+| **C** | Baseline Load | ON | OFF | OFF | Survival mode. Only the most critical devices stay energized. |
 
 ---
 
@@ -144,31 +144,23 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **Why it exists:** The hardware team publishes sensor data very frequently (every few seconds). If we wrote every single reading to the database, it would fill up the SD card and slow everything down. By averaging over 5 minutes, we store useful summarized data without wasting storage.
 
-### 3.5 ML/app.py (FastAPI & MQTT ML Service)
-
-**What it is:** A standalone FastAPI and MQTT service created by the ML team.
-
-**What it does:** It subscribes to the `room/sensors` MQTT topic, extracts the live data, and runs it through a hybridized machine learning model (combining a quantized TFLite neural network and a LightGBM model). It then publishes the prediction back to the `room/ml/predictions` MQTT topic. It also exposes a `/predict` HTTP endpoint.
-
-**Why it exists:** The ML models need to run constantly to predict power usage based on live sensors. By packaging this as a standalone MQTT-driven service, the ML team can independently manage their complex libraries (like TensorFlow, LightGBM, scikit-learn) without bloating the rule engine process.
-
-### 3.6 rule_engine.py (Background Worker)
+### 3.5 rule_engine.py (Background Worker)
 
 **What it is:** Another standalone Python script that runs in the background forever.
 
-**What it does:** Every evaluation interval (e.g., 2 minutes or 30 minutes), it pulls the latest sensor data and ML predictions from its internal cache (which is updated live via MQTT), runs them through a set of logic rules, decides which mode (A, B, or C) to use, and physically switches the GPIO relays.
+**What it does:** Every 5 minutes, it looks at the latest sensor data and ML predictions, runs them through a set of rules (the 3-phase decision hierarchy), decides which mode (A, B, or C) to use, and physically switches the GPIO relays.
 
 **Why it exists:** This is the core intelligence of the system. Without it, the sensors just collect data but nothing happens. The rule engine is what turns data into action.
 
-### 3.7 data_simulator.py (Testing Tool)
+### 3.6 data_simulator.py (Testing Tool)
 
-**What it is:** A Python script that generates fake sensor data.
+**What it is:** A Python script that generates fake sensor and ML data.
 
-**What it does:** It publishes realistic-looking sensor readings to MQTT every 5 seconds. This lets us test the entire pipeline without needing the actual hardware sensors.
+**What it does:** It publishes realistic-looking sensor readings and ML predictions to MQTT every 5 seconds. This lets us test the entire pipeline without needing the actual hardware sensors or the ML model.
 
-**Why it exists:** During development and testing, you do not have the hardware team's sensors connected. The simulator stands in for them.
+**Why it exists:** During development and testing, you do not have the hardware team's sensors or the ML team's model running. The simulator stands in for both.
 
-### 3.8 dashboard/index.html (Browser Dashboard)
+### 3.7 dashboard/index.html (Browser Dashboard)
 
 **What it is:** A single HTML file with CSS and JavaScript embedded.
 
@@ -185,24 +177,24 @@ This is the most important section. Here is the complete journey of data through
 ```
 STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto delivers
                                                                        │
-                           ┌───────────────────────────────────────────┴────────────────────────┐
-                           │                                           │                        │
-                           ▼                                           ▼                        ▼
-                    STEP 4a: Logger                            STEP 4b: ML Service      STEP 4c: Rule Engine
-                    receives & buffers                         (ML/app.py) evaluates     receives & stores latest
-                           │                                   & publishes prediction           │
-                           │ (every 5 min)                             │                        │ (every X min)
-                           ▼                                           ▼                        ▼
-                    STEP 5a: Computes average                  STEP 5b: Mosquitto       STEP 5c: Evaluates rules
-                    and writes to SQLite                       delivers prediction      and switches GPIO relays
-                           │                                           │                        │
-                           ▼                                           ▼                        ▼
-                    STEP 6a: Republishes averaged              STEP 6b: Rule Engine &   STEP 6c: Publishes relay
-                    data to MQTT for dashboard                 Logger store prediction  state to MQTT for dashboard
-                           │                                                            │
-                           ▼                                                            ▼
-                    STEP 7: Django serves                                       STEP 7: Dashboard shows
-                    historical data via API                                     live data in browser
+                           ┌───────────────────────────────────────────┤
+                           │                                           │
+                           ▼                                           ▼
+                    STEP 4a: Logger                            STEP 4b: Rule Engine
+                    receives & buffers                         receives & stores latest
+                           │                                           │
+                           │ (every 5 min)                             │ (every 5 min)
+                           ▼                                           ▼
+                    STEP 5a: Computes average               STEP 5b: Evaluates rules
+                    and writes to SQLite                    and switches GPIO relays
+                           │                                           │
+                           ▼                                           ▼
+                    STEP 6a: Republishes averaged           STEP 6b: Publishes relay
+                    data to MQTT for dashboard              state to MQTT for dashboard
+                           │                                           │
+                           ▼                                           ▼
+                    STEP 7: Django serves                   STEP 7: Dashboard shows
+                    historical data via API                 live data in browser
 ```
 
 ### Detailed walkthrough:
@@ -211,38 +203,33 @@ STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto
 The hardware team's sensors physically measure the room's temperature, humidity, whether someone is present (occupancy), the mains voltage, the current draw, and the battery percentage.
 
 **Step 2: Hardware team publishes to MQTT.**
-Their microcontroller (like an ESP32 or Arduino) packages the readings into a JSON message and publishes it to the MQTT topic `room/sensors`.
+Their microcontroller (like an ESP32 or Arduino) packages the readings into a JSON message and publishes it to the MQTT topic `room/sensors`. Similarly, the ML team publishes energy predictions to `room/ml/predictions`.
 
 **Step 3: Mosquitto delivers.**
-The Mosquitto broker on the Pi receives the message and immediately forwards it to every client that has subscribed to that topic. In our case, four subscribers get the sensor data:
+The Mosquitto broker on the Pi receives the message and immediately forwards it to every client that has subscribed to that topic. In our case, three subscribers get the sensor data:
 - `mqtt_logger.py` (for storing)
-- `ML/app.py` (for predicting)
 - `rule_engine.py` (for decision making)
 - `dashboard/index.html` (for live display)
 
 **Step 4a: The Logger receives and buffers.**
 When `mqtt_logger.py` receives a sensor message, it does NOT write it to the database immediately. Instead, it adds it to an in-memory list (a Python list). This list acts as a buffer.
 
-**Step 4b: ML Service evaluates and publishes.**
-When `ML/app.py` receives a sensor message, it passes the data into the Hybrid ML models (TFLite GRU + LightGBM). It instantly publishes the predicted energy bounds back to the `room/ml/predictions` topic.
-
-**Step 4c: The Rule Engine receives and stores the latest.**
-When `rule_engine.py` receives a sensor message, it overwrites its `latest_sensor` dictionary with the new values. When the ML prediction arrives moments later, it overwrites `latest_ml`. It always keeps only the most recent data.
+**Step 4b: The Rule Engine receives and stores the latest.**
+When `rule_engine.py` receives a sensor message, it overwrites its `latest_sensor` dictionary with the new values. It always keeps only the most recent reading.
 
 **Step 5a: Logger computes averages (every 5 minutes).**
 A background timer fires every 5 minutes. When it fires, the logger:
-1. Takes all the sensor readings collected in the buffer.
+1. Takes all the readings collected in the buffer (could be 60+ readings if sensors publish every 5 seconds).
 2. Computes the arithmetic average of each field (temperature, humidity, voltage, current, battery).
-3. For occupancy, it uses majority vote — if more than half the readings say "occupied", the average is 1.
+3. For occupancy, it uses majority vote — if more than half the readings say "occupied", the average is 1, otherwise 0.
 4. Writes one single row to the `energy_sensorlog` table in SQLite.
-5. Takes the latest received ML prediction and writes one row to `energy_mlprediction`.
-6. Clears the buffers and starts collecting again.
+5. Clears the buffer and starts collecting again.
 
-**Step 5c: Rule Engine evaluates rules (every configurable interval).**
-A background timer fires based on `RULE_EVAL_INTERVAL_SECONDS` (e.g., 2 minutes for testing, 30 minutes for production). When it fires, the rule engine:
-1. Reads the latest sensor values and ML predicted watts.
+**Step 5b: Rule Engine evaluates rules (every 5 minutes).**
+A background timer fires every 5 minutes. When it fires, the rule engine:
+1. Reads the latest sensor values and ML predictions.
 2. Pushes the current battery reading into a rolling window of 3 readings.
-3. Runs the 2-phase rule hierarchy (battery stability lock → power cap decision).
+3. Runs the 3-phase rule hierarchy (occupancy override → battery stability lock → temperature bias + standard flow).
 4. Determines the correct mode (A, B, or C).
 5. Sends HIGH or LOW signals to the 3 GPIO pins to physically switch the relays.
 6. Writes the decision (mode, relay states, reason) to the `energy_relaystate` table.
@@ -250,7 +237,7 @@ A background timer fires based on `RULE_EVAL_INTERVAL_SECONDS` (e.g., 2 minutes 
 **Step 6a: Logger republishes averaged data.**
 After writing to the database, the logger also publishes the averaged data to the MQTT topic `room/data/averaged`. This lets the dashboard show the averaged values too.
 
-**Step 6c: Rule Engine publishes relay state.**
+**Step 6b: Rule Engine publishes relay state.**
 After switching the relays, the rule engine publishes the current mode and relay states to `room/relays/state`. The dashboard subscribes to this topic so it can show the user which mode is active.
 
 **Step 7: Data is available two ways.**
@@ -294,8 +281,8 @@ A topic is like an address. Here are all the topics in our system:
 
 | Topic | Who publishes | Who subscribes | What data | How often |
 |-------|--------------|----------------|-----------|-----------|
-| `room/sensors` | Hardware team | Logger, ML Service, Rule Engine, Dashboard | Temperature, humidity, occupancy, voltage, current, battery | Every few seconds |
-| `room/ml/predictions` | ML team (`ML/app.py`) | Logger, Rule Engine | Predicted power in watts and kW | When sensor data arrives |
+| `room/sensors` | Hardware team | Logger, Rule Engine, Dashboard | Temperature, humidity, occupancy, voltage, current, battery | Every few seconds |
+| `room/ml/predictions` | ML team | Logger, Rule Engine | Predicted energy range, peak demand | When model runs |
 | `room/data/averaged` | Logger | Dashboard | 5-minute averaged sensor data | Every 5 minutes |
 | `room/relays/state` | Rule Engine | Dashboard | Current mode (A/B/C), relay states, reason | Every 5 minutes |
 
@@ -325,14 +312,8 @@ Every MQTT message in our system carries a JSON payload. JSON is a text format t
 **ML payload** (published by ML team to `room/ml/predictions`):
 ```json
 {
-  "mean_prediction_kw": 1.224,
-  "upper_bound_kw": 1.374,
-  "predicted_power_kw": 1.374,
-  "predicted_power_w": 1374.0,
-  "predicted_energy_range": 1.374,
-  "peak_demand": 2.4,
-  "timestamp": "2026-03-17T11:55:00+00:00",
-  "source": "fastapi-local-model"
+    "predicted_energy_range": 2800.0,
+    "peak_demand": 2500.0
 }
 ```
 
@@ -586,34 +567,43 @@ If battery is draining fast (>2% drop) → Continue to Phase 3
 
 This phase has three sub-rules evaluated in order:
 
-##### Step 5: Power Cap Decision
+##### Step 5: Temperature Bias
 
-**The question:** How much power is the room predicted to use, and does it exceed our strictly defined modes?
+**The question:** Is the room too hot?
 
-We define three maximum capacity limits (configurable via environment variables):
-- `MODE_A_MAX_WATTAGE` (e.g., 2400W)
-- `MODE_B_MAX_WATTAGE` (e.g., 1400W)
-- `MODE_C_MAX_WATTAGE` (e.g., 800W)
+**The rule:** If temperature is **above 28°C** AND battery is **above 40%**, force **Mode B**.
 
-The rule engine compares the predicted energy (`predicted_power_w` from the ML model) against these thresholds:
+**Why:** Mode B keeps fans running (relay 2 is ON). If the room is hot, we want fans to work even if we might otherwise go to Mode C. But only if the battery can handle it (above 40%).
 
-| Predicted Power (Watts) | Result |
-|-------------------------|--------|
-| ≤ `MODE_C_MAX_WATTAGE` | **Mode C** — Predicted load is tiny, save energy. |
-| ≤ `MODE_B_MAX_WATTAGE` | **Mode B** — Moderate load predicted, run essential and comfort devices. |
-| ≤ `MODE_A_MAX_WATTAGE` | **Mode A** — High load predicted, allow all non-critical devices to run if battery permits. |
-| > `MODE_A_MAX_WATTAGE` | **Mode C** — Predicted load exceeds our absolute maximum capacity. Force survival mode to prevent tripping breakers or draining the battery instantly. |
+```
+If temp > 28°C AND battery > 40% → Mode B (done)
+```
 
-##### Step 6: Battery & Temperature Safety Checks
+##### Step 6: Energy ≥ Peak Demand (we have enough energy)
 
-Even if the power limit dictates a mode (like Mode A), we must ensure the battery can handle it.
+**The question:** Is the predicted energy available enough to meet peak demand?
 
-1. **Low Battery Override:** If the battery is dropping below strict thresholds, we downgrade the mode regardless of the power prediction.
-    - If `battery < 20%`: Force **Mode C**.
-    - If `battery < 50%` and current mode is A: Downgrade to **Mode B**.
+If `predicted_energy_range >= peak_demand`, we have enough energy. Now it depends on battery level:
 
-2. **Temperature Comfort Override:** If the room is hot, we try to ensure fans stay on.
-    - If `mode == "C"` AND `temperature > 28°C` AND `battery > 40%`: Upgrade to **Mode B** so fans can run.
+| Battery Level | Battery Draining? | Result |
+|--------------|-------------------|--------|
+| ≥ 80% | No (stable) | **Mode A** — Full energy, everything on |
+| ≥ 80% | Yes (dropping fast) | **Mode B** — Have battery but it's draining, be careful |
+| 50% – 79% | Any | **Mode B** — Moderate battery, run fans but not heavy loads |
+| Below 50% | Any | **Mode C** — Battery too low, survival mode |
+
+##### Step 7: Energy < Peak Demand (energy is tight)
+
+**The question:** Is the predicted energy NOT enough for peak demand?
+
+If `predicted_energy_range < peak_demand`, energy is tight.
+
+| Battery Level | Result |
+|--------------|--------|
+| ≥ 60% | **Mode A** — We have enough battery to compensate for the energy shortfall |
+| < 60% | Re-apply Step 6 logic — battery is too low to compensate, use the strict rules above |
+
+**Why this re-routing exists:** When energy supply is low but battery is high (≥60%), we can run at full energy by drawing from the battery. But if both energy supply is low AND battery is low, we cannot take that risk, so we fall back to the conservative Step 6 rules.
 
 ### How GPIO is controlled
 
@@ -644,31 +634,45 @@ START EVALUATION
     │
     ├── Push battery reading into sliding window [T-10m, T-5m, T-Now]
     │
-    ╔══ PHASE 1: STABILITY LOCK ══════╗
+    ╔══ PHASE 1: OCCUPANCY OVERRIDE ══╗
+    ║ Is the room empty for ≥5 min?   ║
+    ╚════════╤════════════════════════╝
+         YES │                     NO
+             ▼                      │
+        → MODE C (done)             │
+                                    ▼
+    ╔══ PHASE 2: STABILITY LOCK ══════╗
     ║ Battery drop ≤2% over 3 reads? ║
     ╚════════╤════════════════════════╝
          YES │                     NO
              ▼                      │
     → KEEP CURRENT MODE (done)      │
                                     ▼
-    ╔══ PHASE 2: POWER CAPACITY ══════╗
-    ║ Compare predicted_power_w with: ║
-    ║ MODE_A / MODE_B / MODE_C caps   ║
+    ╔══ PHASE 3: TEMP BIAS ═══════════╗
+    ║ Temp >28°C AND battery >40%?   ║
     ╚════════╤════════════════════════╝
-             │
-             ▼
-      (Initial Mode Chosen based on limit)
-             │
-             ▼
-    ╔══ PHASE 3: SAFETY OVERRIDES ════╗
-    ║ 1. battery < 20%? → Force Mode C║
-    ║ 2. battery < 50%? → Force Mode B║
-    ║ 3. temp > 28°C & battery > 40%? ║
-    ║    (If Mode C, raise to Mode B) ║
-    ╚════════╤════════════════════════╝
-             │
-             ▼
-    → APPLY FINAL MODE (done)
+         YES │                     NO
+             ▼                      │
+        → MODE B (done)             │
+                                    ▼
+    ╔══ ENERGY vs PEAK DEMAND ════════╗
+    ║ predicted_energy ≥ peak_demand? ║
+    ╚════════╤════════════╤══════════╝
+         YES │            NO │
+             ▼               ▼
+      ┌──────────┐    Battery ≥60%?
+      │ Battery  │      YES → MODE A
+      │  ≥80%    │      NO  → Re-apply
+      │ stable?  │            left rules
+      │ Y→MODE A │
+      │ N→MODE B │
+      ├──────────┤
+      │ 50%-79%  │
+      │ → MODE B │
+      ├──────────┤
+      │  <50%    │
+      │ → MODE C │
+      └──────────┘
 ```
 
 ---
@@ -815,7 +819,7 @@ It generates fake but realistic sensor and ML data and publishes it to the MQTT 
 
 **Temperature:** Starts at 26°C and drifts randomly by ±0.3°C each tick (stays between 20°C and 35°C). This creates realistic smooth temperature changes.
 
-**Battery:** Starts at 85% and slowly drains by 0.05–0.4% per tick. There is a 5% chance each tick of a "recharge event" that bumps the battery up by 5–15%. This simulates a solar panel or power supply recharging.
+**Battery:** Starts at 85% and slowly drains by 0.05–0.4% per tick. There is a 5% chance each tick of a "recharge event" that bumps the battery up by 5–15%. This simulates a solar panel or energy supply recharging.
 
 **Occupancy:** Mostly 1 (occupied). There is a 15% chance of starting an "empty streak" lasting 1–4 ticks where occupancy stays at 0.
 
@@ -936,17 +940,17 @@ Five minutes is a standard interval in energy monitoring systems. It is frequent
 
 If sensors publish every 5 seconds, that is 12 readings per minute, 720 per hour, 17,280 per day. Storing every single reading would fill SD card storage quickly and make API queries slow. By averaging every 5 minutes, we store just 288 rows per day — a 60x reduction — while keeping the important trends.
 
-### "Why a rule engine and not pure ML for relay control?"
+### "Why a rule engine and not ML for relay control?"
 
-The ML team provides watt predictions, but the **actual relay control uses deterministic caps** (if predicted watts <= MAX_WATTAGE, do X). This is intentional:
-- Rules are predictable and explainable (you can always say "the system restricted the load because predictions hit 2500W").
+The ML team provides predictions, but the **actual relay control uses deterministic rules** (if/then logic). This is intentional:
+- Rules are predictable and explainable (you can always say "the system did X because of Y").
 - Rules are auditable (every decision is logged with a reason).
-- Safely managing physical relays requires rigid caps that cannot randomly drift due to ML hallucinations.
-- The ML predictions are used as an **input feature** to the rules, not as the decision-maker itself. This is a common pattern called "ML-informed rule-based control."
+- Rules are fast (no model inference latency).
+- The ML predictions are used as an **input** to the rules, not as the decision-maker itself. This is a common pattern called "ML-informed rule-based control."
 
-### "What happens if the Raspberry Pi loses power?"
+### "What happens if the Raspberry Pi loses energy?"
 
-- GPIO pins default to LOW when the Pi powers off → all relays turn OFF → all connected devices turn OFF.
+- GPIO pins default to LOW when the Pi shuts down → all relays turn OFF → all connected devices turn OFF.
 - When the Pi boots back up, systemd automatically starts all services.
 - The rule engine defaults to Mode C (safest mode) on startup.
 - The database file is safe because WAL mode handles crash recovery automatically.
@@ -965,7 +969,7 @@ This system is a complete **IoT edge computing** solution that:
 
 1. **Collects** real-time data from sensors via MQTT
 2. **Stores** 5-minute averaged historical data in SQLite
-3. **Decides** which electrical devices to power using a 3-phase rule hierarchy
+3. **Decides** which electrical devices to energize using a 3-phase rule hierarchy
 4. **Controls** physical relays via GPIO pins
 5. **Serves** historical data via a REST API
 6. **Displays** live data in a browser dashboard

@@ -37,13 +37,13 @@ Django API reads SQLite history at /api/v1/*
 
 ## Unit Convention
 
-1. Rule engine logic is watt-based (`W`).
-2. ML payload includes both:
-   - `predicted_power_w` (primary for rule logic)
-   - `predicted_power_kw`
+1. Rule engine logic is energy-based (kWh).
+2. ML payload includes:
+      - `predicted_energy_kwh` (primary for rule logic)
+      - `predicted_energy_kw`
 3. Compatibility fields are still included:
-   - `predicted_energy_range`
-   - `peak_demand`
+      - `predicted_energy_range`
+      - `peak_demand`
 
 ## Quick Start
 

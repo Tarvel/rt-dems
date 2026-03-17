@@ -278,11 +278,11 @@
         <div class="mt-6 grid grid-cols-2 gap-3 text-center">
           <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
             <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Measured Load</p>
-            <p><span id="measuredPowerW" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">W</span></p>
+            <p><span id="measuredEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kWh</span></p>
           </div>
           <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
             <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Predicted Load</p>
-            <p><span id="predictedPowerW" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">W</span></p>
+            <p><span id="predictedEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kWh</span></p>
           </div>
         </div>
       </div>
@@ -360,6 +360,10 @@
     const TOPIC_ML      = 'room/ml/predictions';
     const TOPIC_MODE    = 'room/relays/state';
 
+    // Energy conversions
+    const SENSOR_INTERVAL_MINUTES = 1;
+    const DECISION_INTERVAL_MINUTES = 3;
+
     // ── DOM References ───────────────────────────────────────────────
     const $id = (id) => document.getElementById(id);
 
@@ -390,8 +394,8 @@
       currentValue:$id('currentValue'),
       occupancyValue:$id('occupancyValue'),
       batteryMini:$id('batteryMini'),
-      measuredPowerW:$id('measuredPowerW'),
-      predictedPowerW:$id('predictedPowerW'),
+      measuredEnergyKwh:$id('measuredEnergyKwh'),
+      predictedEnergyKwh:$id('predictedEnergyKwh'),
       battLag0:$id('battLag0'),
       battLag1:$id('battLag1'),
       battLag2:$id('battLag2'),
@@ -520,14 +524,15 @@
         dom.currentValue.textContent = parseFloat(data.current).toFixed(2);
       }
 
-      let measuredPower = data.power_w;
-      if (measuredPower === undefined
+      let measuredEnergy = data.energy_kwh;
+      if (measuredEnergy === undefined
           && data.voltage !== undefined
           && data.current !== undefined) {
-        measuredPower = parseFloat(data.voltage) * parseFloat(data.current);
+        const loadKw = (parseFloat(data.voltage) * parseFloat(data.current)) / 1000.0;
+        measuredEnergy = loadKw * (SENSOR_INTERVAL_MINUTES / 60.0);
       }
-      if (measuredPower !== undefined) {
-        dom.measuredPowerW.textContent = parseFloat(measuredPower).toFixed(1);
+      if (measuredEnergy !== undefined) {
+        dom.measuredEnergyKwh.textContent = parseFloat(measuredEnergy).toFixed(4);
       }
 
       flashCard(dom.cardRoom);
@@ -537,25 +542,25 @@
     }
 
     function updatePrediction(data) {
-      let predictedW = data.predicted_power_w;
-      if (predictedW === undefined && data.predicted_power_kw !== undefined) {
-        predictedW = parseFloat(data.predicted_power_kw) * 1000.0;
+      let predictedEnergy = data.predicted_energy_kwh;
+      if (predictedEnergy === undefined && data.predicted_energy_kw !== undefined) {
+        predictedEnergy = parseFloat(data.predicted_energy_kw) * (DECISION_INTERVAL_MINUTES / 60.0);
       }
-      if (predictedW === undefined && data.predicted_energy_range !== undefined) {
-        predictedW = parseFloat(data.predicted_energy_range) * 1000.0;
+      if (predictedEnergy === undefined && data.predicted_energy_range !== undefined) {
+        predictedEnergy = parseFloat(data.predicted_energy_range);
       }
-      if (predictedW !== undefined) {
-        dom.predictedPowerW.textContent = parseFloat(predictedW).toFixed(1);
+      if (predictedEnergy !== undefined) {
+        dom.predictedEnergyKwh.textContent = parseFloat(predictedEnergy).toFixed(4);
       }
       flashCard(dom.cardMode);
-      addLog(`Prediction → ${predictedW !== undefined ? Number(predictedW).toFixed(1) + 'W' : 'n/a'}`);
+      addLog(`Prediction → ${predictedEnergy !== undefined ? Number(predictedEnergy).toFixed(4) + 'kWh' : 'n/a'}`);
     }
 
     // ── Update: Mode ─────────────────────────────────────────────────
     const MODE_CONFIG = {
       A: {
         label: 'Peak Demand',
-        desc:  'All Relays ON — full power delivery',
+        desc:  'All Relays ON — full energy delivery',
         badge: 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm',
         icon:  'fa-solid fa-bolt',
         relays: [true, true, true],

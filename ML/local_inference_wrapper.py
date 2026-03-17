@@ -152,6 +152,6 @@ class LocalEdgeForecaster:
         upper_bound_kw = mean_kw + self.uncertainty_margin_kw
 
         return {
-            "mean_prediction_kw": round(mean_kw, 3),
-            "upper_bound_kw": round(upper_bound_kw, 3),
+            "predicted_energy_kw": round(mean_kw, 3),
+            "upper_bound_energy_kw": round(upper_bound_kw, 3),
         }

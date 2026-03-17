@@ -227,8 +227,8 @@ sudo journalctl -u rule-engine -f
    - Check terminal output for missing model/scaler files.
 
 4. Rule mode seems wrong
-   - Validate watt thresholds (`MODE_A_MAX_W`, `MODE_B_MAX_W`, `MODE_C_MAX_W`).
-   - Confirm prediction payload contains `predicted_power_w` or compatible fallback fields.
+   - Validate energy thresholds (`MODE_A_MAX_KWH`, `MODE_B_MAX_KWH`, `MODE_C_MAX_KWH`).
+   - Confirm prediction payload contains `predicted_energy_kwh` or compatible fallback fields.
 
 5. Database locked errors
    - Confirm WAL mode:

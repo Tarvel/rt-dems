@@ -1,85 +1,106 @@
-# Smart Room Energy Management System — Backend
+# Smart Room Energy Management System - Backend
 
-Edge-server backend running on a Raspberry Pi 4 for a university hostel energy management project.
+Edge backend for Raspberry Pi that:
+
+1. Receives room telemetry over MQTT.
+2. Runs ML predictions using `ML/local_inference_wrapper.py`.
+3. Applies relay control rules in watts.
+4. Persists history in SQLite (WAL mode).
+5. Serves historical data through Django REST APIs.
 
 ## Architecture
 
 ```
-Hardware Sensors ──► MQTT (Mosquitto) ──► mqtt_logger.py ──► SQLite (WAL)
-ML Predictions  ──► MQTT (Mosquitto) ──► rule_engine.py ──► GPIO Relays
-                                                └──► SQLite (audit log)
-Django REST API ◄── SQLite ──► Frontend (GET endpoints)
-Frontend        ◄── MQTT ──── Live relay state & averaged data
+Sensor Publisher (ESP or simulator) -> room/sensors
+                                     |
+                                     v
+                               Mosquitto broker
+                                     |
+      .------------------------------+-------------------------------.
+      |                              |                               |
+      v                              v                               v
+workers/mqtt_logger.py          ML/app.py                      workers/rule_engine.py
+(buffer + 5-min avg -> DB)      (model inference + MQTT pub)   (watt-rule decisions + GPIO)
+      |                              |                               |
+      v                              v                               v
+ room/data/averaged            room/ml/predictions             room/relays/state
+
+Django API reads SQLite history at /api/v1/*
 ```
 
-## Quick Start (on Raspberry Pi)
+## ML Service Behavior
+
+`ML/app.py` now uses `LocalEdgeForecaster` from `ML/local_inference_wrapper.py`.
+
+1. On MQTT input, it infers prediction and publishes to `room/ml/predictions`.
+2. On HTTP `POST /predict`, it returns normal JSON and also publishes to MQTT.
+
+## Unit Convention
+
+1. Rule engine logic is watt-based (`W`).
+2. ML payload includes both:
+   - `predicted_power_w` (primary for rule logic)
+   - `predicted_power_kw`
+3. Compatibility fields are still included:
+   - `predicted_energy_range`
+   - `peak_demand`
+
+## Quick Start
 
 ```bash
-# 1. Clone and enter the project directory
 cd PROJECT_CODE
-
-# 2. Create a virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# 3. Install dependencies
 pip install -r requirements.txt
-# On the Pi, also: pip install RPi.GPIO
 
-# 4. Run Django migrations
 cd room_backend
-python manage.py makemigrations
 python manage.py migrate
-python manage.py createsuperuser  # optional
+cd ..
 
-# 5. Start Django dev server (for API)
-python manage.py runserver 0.0.0.0:8000
+# Terminal 1
+mosquitto -c systemd/mosquitto.conf -v
 
-# 6. In separate terminals, start the workers:
-cd ../workers
-python mqtt_logger.py
-python rule_engine.py
+# Terminal 2
+cd room_backend && python manage.py runserver 0.0.0.0:8000
+
+# Terminal 3
+python workers/mqtt_logger.py
+
+# Terminal 4
+python workers/rule_engine.py
+
+# Terminal 5
+cd ML && python app.py
+
+# Terminal 6
+python simulation/data_simulator.py
+
+# Optional HTTP test
+cd ML && python test_api.py
 ```
 
-## Deploy as systemd Services
+## Key Runtime Configuration
+
+Rule engine environment variables:
+
+1. `RULE_EVAL_INTERVAL_SECONDS` default `120` (test)
+2. `MODE_A_MAX_W` default `2400`
+3. `MODE_B_MAX_W` default `1400`
+4. `MODE_C_MAX_W` default `800`
+
+Production interval example:
 
 ```bash
-# Copy service files
-sudo cp systemd/mqtt-logger.service /etc/systemd/system/
-sudo cp systemd/rule-engine.service /etc/systemd/system/
-
-# Copy Mosquitto config
-sudo cp systemd/mosquitto.conf /etc/mosquitto/conf.d/room.conf
-
-# Reload and start
-sudo systemctl daemon-reload
-sudo systemctl enable --now mosquitto mqtt-logger rule-engine
-```
-
-## Verify SQLite WAL Mode
-
-```bash
-sqlite3 room_backend/db.sqlite3 "PRAGMA journal_mode;"
-# Expected output: wal
+export RULE_EVAL_INTERVAL_SECONDS=1800
 ```
 
 ## API Endpoints
 
-See [integration_contract.md](integration_contract.md) for full details.
+See `integration_contract.md`.
 
-| Endpoint                       | Description                  |
-|--------------------------------|------------------------------|
-| `GET /api/v1/sensors/`         | Paginated sensor logs        |
-| `GET /api/v1/sensors/latest/`  | Latest sensor reading        |
-| `GET /api/v1/predictions/`     | ML prediction history        |
-| `GET /api/v1/relays/current/`  | Current relay state          |
-
-## GPIO Pin Mapping (BCM)
-
-| Relay     | GPIO Pin | Priority |
-|-----------|----------|----------|
-| Relay 1   | 17       | P1       |
-| Relay 2   | 27       | P2       |
-| Relay 3   | 22       | P3       |
-
-Configurable via environment variables: `RELAY_PIN_1`, `RELAY_PIN_2`, `RELAY_PIN_3`.
+1. `GET /api/v1/sensors/`
+2. `GET /api/v1/sensors/latest/`
+3. `GET /api/v1/predictions/`
+4. `GET /api/v1/predictions/latest/`
+5. `GET /api/v1/relays/`
+6. `GET /api/v1/relays/current/`

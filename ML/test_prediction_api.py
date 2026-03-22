@@ -174,8 +174,6 @@ def run_prediction(live_window: pd.DataFrame) -> dict:
             "energy_kw": float(current_hour_data['Energy_kW']),
         },
         "predictions": {
-            "base_gru_kwh": round(gru_raw, 4),
-            "lgbm_correction_kwh": round(residual_correction, 4),
             "hybrid_final_kwh": round(hybrid_final_kwh, 4),
             "safety_lower_bound": round(lower_bound, 4),
             "safety_upper_bound": round(upper_bound, 4)
@@ -198,8 +196,8 @@ def build_mqtt_payload(result: dict) -> dict:
     """
     pred = result["predictions"]
     return {
-        "predicted_energy_kw": pred["hybrid_final_kwh"],
-        "upper_bound_energy_kw": pred["safety_upper_bound"],
+        "predicted_energy_kwh": pred["hybrid_final_kwh"],
+        "upper_bound_energy_kwh": pred["safety_upper_bound"],
         "predicted_energy_range": pred["safety_upper_bound"],
         "peak_demand": PEAK_DEMAND_KW,
         "timestamp": datetime.now(timezone.utc).isoformat(),

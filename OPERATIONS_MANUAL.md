@@ -1,10 +1,6 @@
 # Smart Room Energy Management System - Operations Manual
 
-This manual is for the current working system where:
-
-1. The ML service in `ML/app.py` uses `local_inference_wrapper.py`.
-2. The ML service both serves HTTP (`/predict`) and participates in MQTT.
-3. Rule decisions are watt-based.
+This manual covers how to set up and run the system.
 
 ## 1. Prerequisites
 
@@ -22,6 +18,14 @@ cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
+
+ML service has its own dependencies:
+
+```bash
+cd ML
+pip install -r requirements.txt
+cd ..
 ```
 
 On Raspberry Pi only:
@@ -51,14 +55,14 @@ At runtime, these processes should be active:
 2. Django API server
 3. MQTT logger worker
 4. Rule engine worker
-5. FastAPI ML service
+5. FastAPI ML service (`ML/test_prediction_api.py`)
 6. Data simulator (or real hardware publisher)
 
 ## 4. Startup Order
 
-Use separate terminals.
+Use separate terminals. Start Mosquitto first. The ML service will retry the MQTT connection automatically if the broker is not ready yet, but starting Mosquitto first avoids unnecessary retry messages.
 
-Important: For realtime dashboard values, the simulator (or hardware publisher) must be running continuously.
+For realtime dashboard values, the simulator (or hardware publisher) must be running continuously.
 
 ### Terminal 1 - MQTT broker
 
@@ -92,26 +96,26 @@ source venv/bin/activate
 python workers/rule_engine.py
 ```
 
-### Terminal 5 - FastAPI ML service (required)
+### Terminal 5 - FastAPI ML service
 
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
 source venv/bin/activate
 cd ML
-python app.py
+python test_prediction_api.py
 ```
 
-Health check (new terminal):
+The ML service runs on port `5000`. It connects to the MQTT broker automatically. If the broker is not running yet, it retries every 5 seconds in the background until connected.
+
+Health check:
 
 ```bash
-curl -s http://127.0.0.1:5000/
+curl -s http://127.0.0.1:5000/docs
 ```
-
-Expected response should confirm the FastAPI service is running.
 
 ### Terminal 6 - Simulator (or hardware publisher)
 
-This step is required for realtime updates when hardware is not connected.
+This step is needed for realtime updates when hardware is not connected.
 
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
@@ -119,7 +123,7 @@ source venv/bin/activate
 python simulation/data_simulator.py
 ```
 
-Keep this terminal running. If it stops, new sensor values will stop.
+Keep this terminal running. If it stops, sensor values stop and ML predictions stop.
 
 ### Terminal 7 - Open dashboard in browser (optional)
 
@@ -129,26 +133,44 @@ Open this file in your browser:
 file:///home/tai/Downloads/PEOJECT%20RESEARCH%20REFERENCES/PROJECT_CODE/dashboard/index.html
 ```
 
-### Optional Terminal 8 - HTTP sanity test
+## 5. Manual ML Testing
+
+For supervisor demonstrations, two tools let you manually type sensor values and see what the model predicts.
+
+### Option A: CLI test (test.py)
 
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE/ML
 source ../venv/bin/activate
-python test_api.py
+python test.py
 ```
 
-## 5. What to Expect When Running
+In interactive mode, type values for temperature, humidity, lux, occupancy, and energy. Press Enter to use defaults. The script sends them to `POST /predict` and shows the model output.
 
-1. Simulator publishes sensor payloads to `room/sensors`.
-2. ML service subscribes to `room/sensors`, runs model inference, publishes to `room/ml/predictions`.
-3. Logger stores rolling 5-minute averages in SQLite.
-4. Rule engine evaluates every configured interval and publishes `room/relays/state`.
-5. API endpoints expose persisted history.
-6. FastAPI HTTP endpoint on port `5000` stays available for direct `/predict` testing.
+Other modes:
 
-## 6. Configuration
+```bash
+python test.py --auto 10    # Auto-step through 10 CSV rows
+```
 
-### 6.1 Rule engine environment variables
+### Option B: Browser test (test_dashboard.html)
+
+Open `http://127.0.0.1:5000` in your browser (the ML service serves the page). Fill in the 5 input fields and click Predict to see the model output.
+
+Both test tools use HTTP only and do not connect to MQTT.
+
+## 6. What to Expect When Running
+
+1. Simulator publishes sensor payloads to `room/sensors` every 5 seconds.
+2. ML service receives sensor data via MQTT, runs the GRU + LightGBM model, and publishes predictions to `room/ml/predictions`.
+3. Logger buffers sensor and prediction data and writes 5-minute averages to SQLite.
+4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state`.
+5. Django API serves historical data at `/api/v1/*`.
+6. Dashboard shows live data from MQTT in the browser.
+
+## 7. Configuration
+
+### 7.1 Rule engine environment variables
 
 ```bash
 export RULE_EVAL_INTERVAL_SECONDS=120
@@ -163,22 +185,22 @@ Production interval example:
 export RULE_EVAL_INTERVAL_SECONDS=1800
 ```
 
-### 6.2 Broker and topic defaults
+### 7.2 Broker and topic defaults
 
 1. MQTT broker: `localhost`
 2. MQTT port: `1883`
 3. Sensor topic: `room/sensors`
 4. Prediction topic: `room/ml/predictions`
 
-## 7. Verification Commands
+## 8. Verification Commands
 
-### 7.1 Subscribe to all MQTT messages
+### 8.1 Subscribe to all MQTT messages
 
 ```bash
 mosquitto_sub -t "room/#" -v
 ```
 
-### 7.2 Check database data
+### 8.2 Check database data
 
 ```bash
 sqlite3 room_backend/db.sqlite3 "SELECT id,timestamp,temperature,humidity,battery_level FROM energy_sensorlog ORDER BY id DESC LIMIT 5;"
@@ -186,16 +208,23 @@ sqlite3 room_backend/db.sqlite3 "SELECT id,timestamp,predicted_energy_range,peak
 sqlite3 room_backend/db.sqlite3 "SELECT id,timestamp,mode,relay_1,relay_2,relay_3 FROM energy_relaystate ORDER BY id DESC LIMIT 5;"
 ```
 
-### 7.3 Check HTTP endpoints
+### 8.3 Check HTTP endpoints
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/sensors/latest/
 curl -s http://127.0.0.1:8000/api/v1/predictions/latest/
 curl -s http://127.0.0.1:8000/api/v1/relays/current/
-curl -s http://127.0.0.1:5000/predict -X POST -H "Content-Type: application/json" -d '{"timestamp":"2026-03-17 14:00:00","temperature_c":32.5,"humidity":60.0,"lux":450.0,"occupancy":1,"lag_1h":1.1,"lag_2h":1.05,"lag_3h":0.95,"lag_24h":1.2}'
 ```
 
-## 8. systemd Deployment
+### 8.4 Test ML prediction manually
+
+```bash
+curl -s http://127.0.0.1:5000/predict -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"temperature_c":32.5,"humidity":60.0,"lux":450.0,"occupancy":1,"energy_kw":1.5}'
+```
+
+## 9. systemd Deployment
 
 ```bash
 sudo cp systemd/mqtt-logger.service /etc/systemd/system/
@@ -212,23 +241,23 @@ sudo journalctl -u mqtt-logger -f
 sudo journalctl -u rule-engine -f
 ```
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 1. MQTT disconnected
-   - Ensure broker is running with `systemd/mosquitto.conf`.
-   - Ensure port `1883` is available.
+   - Make sure the broker is running with `systemd/mosquitto.conf`.
+   - Make sure port `1883` is available.
 
-2. No predictions arriving in `room/ml/predictions`
-   - Ensure `ML/app.py` is running.
-   - Ensure model files in `ML/` are present.
+2. No predictions in `room/ml/predictions`
+   - Make sure `ML/test_prediction_api.py` is running.
+   - Make sure the data simulator is running (the ML service needs sensor messages on `room/sensors` to trigger predictions).
+   - Check the ML terminal for errors.
 
-3. `/predict` fails
-   - Ensure `ML/app.py` started without model load errors.
-   - Check terminal output for missing model/scaler files.
+3. ML `POST /predict` fails
+   - Make sure `ML/test_prediction_api.py` started without errors.
+   - Check that the model files are present in `ML/` (`.tflite`, `.joblib`, `.csv`).
 
-4. Rule mode seems wrong
-   - Validate energy thresholds (`MODE_A_MAX_KWH`, `MODE_B_MAX_KWH`, `MODE_C_MAX_KWH`).
-   - Confirm prediction payload contains `predicted_energy_kwh` or compatible fallback fields.
+4. Port 5000 or 8000 already in use
+   - Kill old processes: `lsof -i :5000` or `lsof -i :8000` to find them.
 
 5. Database locked errors
    - Confirm WAL mode:
@@ -236,16 +265,16 @@ sudo journalctl -u rule-engine -f
      sqlite3 room_backend/db.sqlite3 "PRAGMA journal_mode;"
      ```
 
-## 10. Quick Checklist
+## 11. Quick Checklist
 
 ```text
 1. Start Mosquitto
 2. Start Django
 3. Start mqtt_logger
 4. Start rule_engine
-5. Start FastAPI ML service (`ML/app.py`)
+5. Start ML service (ML/test_prediction_api.py)
 6. Start simulator (or hardware publisher) and keep it running
-7. Open dashboard (`dashboard/index.html`) in browser
+7. Open dashboard (dashboard/index.html) in browser
 8. Verify live MQTT traffic with: mosquitto_sub -t "room/#" -v
 9. Verify dashboard/API responses
 ```
@@ -253,7 +282,7 @@ sudo journalctl -u rule-engine -f
 Shutdown order:
 
 1. Stop simulator/publishers
-2. Stop ML app
+2. Stop ML service
 3. Stop workers
 4. Stop Django
 5. Stop Mosquitto

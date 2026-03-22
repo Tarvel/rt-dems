@@ -3,8 +3,8 @@
 Edge backend for Raspberry Pi that:
 
 1. Receives room telemetry over MQTT.
-2. Runs ML predictions using `ML/local_inference_wrapper.py`.
-3. Applies relay control rules in watts.
+2. Runs ML predictions using `ML/test_prediction_api.py` (GRU + LightGBM hybrid model).
+3. Applies relay control rules based on energy predictions and battery state.
 4. Persists history in SQLite (WAL mode).
 5. Serves historical data through Django REST APIs.
 
@@ -16,34 +16,38 @@ Sensor Publisher (ESP or simulator) -> room/sensors
                                      v
                                Mosquitto broker
                                      |
-      .------------------------------+-------------------------------.
-      |                              |                               |
-      v                              v                               v
-workers/mqtt_logger.py          ML/app.py                      workers/rule_engine.py
-(buffer + 5-min avg -> DB)      (model inference + MQTT pub)   (watt-rule decisions + GPIO)
-      |                              |                               |
-      v                              v                               v
+       .-----------------------------+-------------------------------.
+       |                             |                               |
+       v                             v                               v
+workers/mqtt_logger.py         ML/test_prediction_api.py       workers/rule_engine.py
+(buffer + 5-min avg -> DB)     (GRU+LightGBM + MQTT bridge)   (rule decisions + GPIO)
+       |                             |                               |
+       v                             v                               v
  room/data/averaged            room/ml/predictions             room/relays/state
 
 Django API reads SQLite history at /api/v1/*
 ```
 
-## ML Service Behavior
+## ML Service (`ML/test_prediction_api.py`)
 
-`ML/app.py` now uses `LocalEdgeForecaster` from `ML/local_inference_wrapper.py`.
+Uses a hybrid GRU (TFLite) + LightGBM model for energy prediction.
 
-1. On MQTT input, it infers prediction and publishes to `room/ml/predictions`.
-2. On HTTP `POST /predict`, it returns normal JSON and also publishes to MQTT.
+### Dual Protocol
 
-## Unit Convention
+1. **MQTT (primary):** Subscribes to `room/sensors`. When a sensor message arrives, it runs the prediction pipeline and publishes results to `room/ml/predictions`. If the broker is not available at startup, it retries every 5 seconds in the background until connected.
+2. **HTTP (testing only):** Two endpoints for manual testing:
+   - `POST /predict` — accepts sensor values as JSON, returns prediction.
+   - `GET /predict_next` — steps through the CSV dataset.
+   - `GET /` — serves the test dashboard page.
 
-1. Rule engine logic is energy-based (kWh).
-2. ML payload includes:
-      - `predicted_energy_kwh` (primary for rule logic)
-      - `predicted_energy_kw`
-3. Compatibility fields are still included:
-      - `predicted_energy_range`
-      - `peak_demand`
+### Manual Testing Tools
+
+For supervisor demonstrations, two tools let you manually input sensor values and compare the model output against expected calculations:
+
+1. **`ML/test.py`** — Interactive CLI. Type sensor values, see predictions.
+2. **`ML/test_dashboard.html`** — Browser page served at `http://127.0.0.1:5000`. Input form with 5 sensor fields and output display.
+
+Both tools are HTTP-only and do not connect to MQTT.
 
 ## Quick Start
 
@@ -57,26 +61,29 @@ cd room_backend
 python manage.py migrate
 cd ..
 
-# Terminal 1
+# Terminal 1 — MQTT broker
 mosquitto -c systemd/mosquitto.conf -v
 
-# Terminal 2
+# Terminal 2 — Django API
 cd room_backend && python manage.py runserver 0.0.0.0:8000
 
-# Terminal 3
+# Terminal 3 — MQTT logger
 python workers/mqtt_logger.py
 
-# Terminal 4
+# Terminal 4 — Rule engine
 python workers/rule_engine.py
 
-# Terminal 5
-cd ML && python app.py
+# Terminal 5 — ML service
+cd ML && python test_prediction_api.py
 
-# Terminal 6
+# Terminal 6 — Data simulator
 python simulation/data_simulator.py
 
-# Optional HTTP test
-cd ML && python test_api.py
+# Optional — Manual ML test (CLI)
+cd ML && python test.py
+
+# Optional — Manual ML test (browser)
+# Open http://127.0.0.1:5000 in your browser
 ```
 
 ## Key Runtime Configuration

@@ -40,7 +40,7 @@ This is a group project split between three teams:
 | Team                     | Responsibility                                                                     | What they give us                             | What they take from us               |
 | ------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------- | ------------------------------------ |
 | **Hardware (Group A)**   | Physical sensors (temperature, humidity, motion, voltage, current, battery)        | Sensor data published to MQTT                 | Nothing — they just publish          |
-| **ML Team<br>(Group B)** | Machine learning model that predicts energy usage                                  | Predictions published to MQTT                 | Nothing — they just publish          |
+| **ML Team<br>(Group B)** | Machine learning model that predicts energy usage                                  | Predictions published to MQTT via `ML/test_prediction_api.py` | Nothing — they just publish          |
 | **Us<br>(Group C)**      | The Raspberry Pi server, database, MQTT broker, API endpoints, relay control logic | REST API endpoints, MQTT topics for live data | We receive sensor + ML data via MQTT |
 
 ### What the Raspberry Pi does (our responsibility)
@@ -152,19 +152,49 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **Why it exists:** This is the core intelligence of the system. Without it, the sensors just collect data but nothing happens. The rule engine is what turns data into action.
 
-### 3.6 data_simulator.py (Testing Tool)
+### 3.6 ML Prediction Service (FastAPI)
 
-**What it is:** A Python script that generates fake sensor and ML data.
+**File:** `ML/test_prediction_api.py`
 
-**What it does:** It publishes realistic-looking sensor readings and ML predictions to MQTT every 5 seconds. This lets us test the entire pipeline without needing the actual hardware sensors or the ML model.
+**What it is:** A FastAPI server that runs the hybrid GRU + LightGBM machine learning model.
 
-**Why it exists:** During development and testing, you do not have the hardware team's sensors or the ML team's model running. The simulator stands in for both.
+**What it does:** It uses two protocols:
 
-### 3.7 dashboard/index.html (Browser Dashboard)
+1. **MQTT (primary workflow):** When it starts, it connects to the Mosquitto broker and subscribes to `room/sensors`. Every time a sensor message arrives, it runs the full prediction pipeline (GRU neural network + LightGBM correction) and publishes the result to `room/ml/predictions`. This is how the rule engine and dashboard get predictions during normal operation.
+
+2. **HTTP (testing only):** It provides `POST /predict` and `GET /predict_next` endpoints so that the team can manually input sensor values and compare the model output against expected calculations. This is used during supervisor demonstrations via `test.py` (CLI) or `test_dashboard.html` (browser).
+
+**Why the dual protocol:** MQTT is the right choice for the main data flow because it is event-driven — every sensor reading automatically triggers a prediction. HTTP is added separately for manual testing only, so the team can type specific inputs and verify the model behaves correctly.
+
+**MQTT retry:** If the MQTT broker is not running when the ML service starts, it retries the connection every 5 seconds in the background. This means you can start Mosquitto and the ML service in any order.
+
+**Port:** The ML service runs on port `5000`.
+
+### 3.7 data_simulator.py (Testing Tool)
+
+**What it is:** A Python script that generates fake sensor data.
+
+**What it does:** It reads from a CSV file of realistic sensor readings and publishes them to `room/sensors` via MQTT every 5 seconds. This triggers the ML service to produce predictions, which in turn triggers the rule engine and dashboard updates.
+
+**Why it exists:** During development and testing, you do not have the hardware team's sensors connected. The simulator stands in for the real hardware.
+
+### 3.8 Manual ML Test Tools
+
+**Files:** `ML/test.py` (CLI) and `ML/test_dashboard.html` (browser)
+
+**What they are:** Two tools for manually testing the ML model's predictions via HTTP. They do not use MQTT.
+
+**What they do:**
+- `test.py` — An interactive CLI where you type sensor values (temperature, humidity, lux, occupancy, energy) and see the model's prediction.
+- `test_dashboard.html` — A web page served by the ML service at `http://127.0.0.1:5000`. It has input fields for each sensor value and shows the prediction output.
+
+**Why they exist:** For supervisor demonstrations. The team can manually input specific values and compare the model output against their own manual calculations to verify the model works correctly.
+
+### 3.9 dashboard/index.html (Browser Dashboard)
 
 **What it is:** A single HTML file with CSS and JavaScript embedded.
 
-**What it does:** Opens in any web browser and connects directly to the MQTT broker via WebSockets. It displays live sensor data, battery level, and the current relay mode in real time — no page refresh needed.
+**What it does:** Opens in any web browser and connects directly to the MQTT broker via WebSockets. It displays live sensor data, battery level, predicted load, and the current relay mode in real time — no page refresh needed.
 
 **Why it exists:** It gives a visual way to monitor the system. It also proves that the MQTT data flow works end-to-end.
 
@@ -281,8 +311,8 @@ A topic is like an address. Here are all the topics in our system:
 
 | Topic | Who publishes | Who subscribes | What data | How often |
 |-------|--------------|----------------|-----------|-----------|
-| `room/sensors` | Hardware team | Logger, Rule Engine, Dashboard | Temperature, humidity, occupancy, voltage, current, battery | Every few seconds |
-| `room/ml/predictions` | ML team | Logger, Rule Engine | Predicted energy range, peak demand | When model runs |
+| `room/sensors` | Hardware team (or simulator) | ML service, Logger, Rule Engine, Dashboard | Temperature, humidity, occupancy, voltage, current, battery | Every few seconds |
+| `room/ml/predictions` | ML service (`test_prediction_api.py`) | Logger, Rule Engine, Dashboard | Predicted energy (kW), upper bound, peak demand | Each time a sensor message arrives |
 | `room/data/averaged` | Logger | Dashboard | 5-minute averaged sensor data | Every 5 minutes |
 | `room/relays/state` | Rule Engine | Dashboard | Current mode (A/B/C), relay states, reason | Every 5 minutes |
 
@@ -309,11 +339,15 @@ Every MQTT message in our system carries a JSON payload. JSON is a text format t
 }
 ```
 
-**ML payload** (published by ML team to `room/ml/predictions`):
+**ML payload** (published by `test_prediction_api.py` to `room/ml/predictions`):
 ```json
 {
-    "predicted_energy_range": 2800.0,
-    "peak_demand": 2500.0
+    "predicted_energy_kw": 1.224,
+    "upper_bound_energy_kw": 1.374,
+    "predicted_energy_range": 1.374,
+    "peak_demand": 2.4,
+    "timestamp": "2026-03-22T10:55:00+00:00",
+    "source": "fastapi-local-model"
 }
 ```
 
@@ -813,17 +847,11 @@ For example, when a sensor message arrives with `temperature: 30.5`:
 
 ### What it does
 
-It generates fake but realistic sensor and ML data and publishes it to the MQTT broker. It stands in for the hardware sensors and ML model during development.
+It reads from a CSV file of realistic sensor readings and publishes them to the MQTT broker every 5 seconds. It stands in for the hardware sensors during development. The ML service handles predictions separately — when it receives the simulator's sensor data via MQTT, it automatically runs the model and publishes predictions.
 
-### How the data is generated
+### How it works
 
-**Temperature:** Starts at 26°C and drifts randomly by ±0.3°C each tick (stays between 20°C and 35°C). This creates realistic smooth temperature changes.
-
-**Battery:** Starts at 85% and slowly drains by 0.05–0.4% per tick. There is a 5% chance each tick of a "recharge event" that bumps the battery up by 5–15%. This simulates a solar panel or energy supply recharging.
-
-**Occupancy:** Mostly 1 (occupied). There is a 15% chance of starting an "empty streak" lasting 1–4 ticks where occupancy stays at 0.
-
-**ML Predictions:** Random values between 1500–3500 kWh against a fixed peak demand of 2500 kWh. This creates scenarios where energy is sometimes above and sometimes below peak demand, triggering different rule engine paths.
+The simulator reads rows from `abs_smart_grid_dataset_40k.csv` one at a time and publishes each row as a sensor payload to `room/sensors`. The data includes temperature, humidity, luminous intensity, occupancy, voltage, current, energy, and battery level.
 
 ### Why publish every 5 seconds?
 

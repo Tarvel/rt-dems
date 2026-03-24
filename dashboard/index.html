@@ -277,12 +277,12 @@
 
         <div class="mt-6 grid grid-cols-2 gap-3 text-center">
           <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
-            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Measured Load</p>
-            <p><span id="measuredEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kWh</span></p>
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Actual Load</p>
+            <p><span id="measuredEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kW</span></p>
           </div>
           <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
             <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Predicted Load</p>
-            <p><span id="predictedEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kWh</span></p>
+            <p><span id="predictedEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kW</span></p>
           </div>
         </div>
       </div>
@@ -524,15 +524,11 @@
         dom.currentValue.textContent = parseFloat(data.current).toFixed(2);
       }
 
-      let measuredEnergy = data.energy_kwh;
-      if (measuredEnergy === undefined
-          && data.voltage !== undefined
-          && data.current !== undefined) {
-        const loadKw = (parseFloat(data.voltage) * parseFloat(data.current)) / 1000.0;
-        measuredEnergy = loadKw * (SENSOR_INTERVAL_MINUTES / 60.0);
-      }
-      if (measuredEnergy !== undefined) {
-        dom.measuredEnergyKwh.textContent = parseFloat(measuredEnergy).toFixed(4);
+      // Actual load from CSV Energy_kW (sent by simulator for display only)
+      let actualLoad = data.energy_kw;
+      if (actualLoad === undefined) actualLoad = data.energy_kwh;
+      if (actualLoad !== undefined) {
+        dom.measuredEnergyKwh.textContent = parseFloat(actualLoad).toFixed(4);
       }
 
       flashCard(dom.cardRoom);
@@ -542,18 +538,16 @@
     }
 
     function updatePrediction(data) {
-      let predictedEnergy = data.predicted_energy_kwh;
-      if (predictedEnergy === undefined && data.predicted_energy_kw !== undefined) {
-        predictedEnergy = parseFloat(data.predicted_energy_kw) * (DECISION_INTERVAL_MINUTES / 60.0);
-      }
-      if (predictedEnergy === undefined && data.predicted_energy_range !== undefined) {
-        predictedEnergy = parseFloat(data.predicted_energy_range);
-      }
+      // Show predicted_energy_kw directly in kW (hybrid_final from ML model)
+      // for side-by-side comparison with the actual load.
+      let predictedEnergy = data.predicted_energy_kw;
+      if (predictedEnergy === undefined) predictedEnergy = data.predicted_energy_kwh;
+      if (predictedEnergy === undefined) predictedEnergy = data.predicted_energy_range;
       if (predictedEnergy !== undefined) {
         dom.predictedEnergyKwh.textContent = parseFloat(predictedEnergy).toFixed(4);
       }
       flashCard(dom.cardMode);
-      addLog(`Prediction → ${predictedEnergy !== undefined ? Number(predictedEnergy).toFixed(4) + 'kWh' : 'n/a'}`);
+      addLog(`Prediction → ${predictedEnergy !== undefined ? Number(predictedEnergy).toFixed(4) + ' kW' : 'n/a'}`);
     }
 
     // ── Update: Mode ─────────────────────────────────────────────────
@@ -582,6 +576,18 @@
     };
 
     function updateMode(data) {
+      // 1. Handle lightweight battery lag updates first
+      if (data.type === 'battery_lag_update') {
+        const lagValues = [
+          data.battery_t_now !== null ? data.battery_t_now : undefined,
+          data.battery_t1 !== null ? data.battery_t1 : undefined,
+          data.battery_t2 !== null ? data.battery_t2 : undefined
+        ];
+        updateBatteryLagWindow(lagValues);
+        return; // Don't process mode changes
+      }
+
+      // 2. Handle full mode changes
       const mode = (data.mode || data.current_mode || '').toUpperCase();
       const cfg = MODE_CONFIG[mode];
 
@@ -610,12 +616,12 @@
         dots[i].style.height = '10px';
       });
 
-      if (Array.isArray(data.battery_lag_values)) {
-        const lagValues = data.battery_lag_values
-          .map((v) => Number(v))
-          .filter((v) => Number.isFinite(v));
-        updateBatteryLagWindow(lagValues);
-      }
+      const lagValues = [
+        data.battery_t_now !== null ? data.battery_t_now : undefined,
+        data.battery_t1 !== null ? data.battery_t1 : undefined,
+        data.battery_t2 !== null ? data.battery_t2 : undefined
+      ];
+      updateBatteryLagWindow(lagValues);
 
       flashCard(dom.cardMode);
       addLog(`Mode → ${mode} (${cfg.label})`);

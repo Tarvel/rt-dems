@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ML Prediction Tester</title>
-  <meta name="description" content="Manual input test dashboard for the Smart Grid Hybrid ML prediction API" />
+  <title>ML Prediction Tester — CSV Playback</title>
+  <meta name="description" content="CSV playback test dashboard — actual vs predicted energy comparison" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
@@ -19,7 +19,7 @@
       padding: 2rem 1rem;
     }
 
-    .container { max-width: 900px; margin: 0 auto; }
+    .container { max-width: 960px; margin: 0 auto; }
 
     h1 {
       font-size: 1.65rem; font-weight: 800; color: #1e293b;
@@ -53,29 +53,6 @@
       font-size: 0.65rem;
     }
 
-    .input-grid {
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-      gap: 0.85rem;
-    }
-    .field { display: flex; flex-direction: column; gap: 0.3rem; }
-    .field label {
-      font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.04em; color: #94a3b8;
-    }
-    .field input, .field select {
-      padding: 0.55rem 0.75rem; border-radius: 0.5rem;
-      border: 1.5px solid #e2e8f0; background: #f8fafc;
-      font-family: inherit; font-size: 0.9rem; font-weight: 600;
-      color: #1e293b; outline: none; transition: border-color 0.2s;
-    }
-    .field input:focus, .field select:focus {
-      border-color: #8b5cf6;
-      box-shadow: 0 0 0 3px rgba(139,92,246,0.12);
-    }
-    .field .unit {
-      font-size: 0.6rem; color: #94a3b8; font-weight: 600; margin-top: -0.15rem;
-    }
-
     .btn {
       display: inline-flex; align-items: center; gap: 0.5rem;
       padding: 0.7rem 1.75rem; border: none; border-radius: 0.65rem;
@@ -91,50 +68,64 @@
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
     .btn-secondary { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
     .btn-secondary:hover { background: #e2e8f0; }
+    .btn-danger { background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; }
+    .btn-danger:hover { background: #fecaca; }
 
-    .actions { display: flex; gap: 0.75rem; margin-top: 1.25rem; flex-wrap: wrap; align-items: center; }
+    .actions { display: flex; gap: 0.75rem; margin-top: 1rem; flex-wrap: wrap; align-items: center; }
 
-    .output-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
-      gap: 0.75rem; margin-top: 1rem;
+    /* Current row display */
+    .row-display {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 0.65rem; margin-bottom: 1rem;
     }
-    .out-cell {
-      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 0.65rem;
-      padding: 0.85rem; text-align: center;
-      box-shadow: inset 0 1px 2px rgba(0,0,0,0.03); transition: transform 0.2s;
+    .row-cell {
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 0.5rem;
+      padding: 0.6rem; text-align: center;
     }
-    .out-cell.highlight {
-      background: linear-gradient(135deg, #f5f3ff, #ede9fe); border-color: #c4b5fd;
-    }
-    .out-cell .label {
-      font-size: 0.58rem; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.04em; color: #94a3b8; margin-bottom: 0.3rem;
-    }
-    .out-cell .value { font-size: 1.3rem; font-weight: 800; color: #1e293b; }
-    .out-cell .unit { font-size: 0.65rem; font-weight: 600; color: #94a3b8; }
-    .out-cell.highlight .value { color: #7c3aed; }
+    .row-cell .label { font-size: 0.55rem; font-weight: 700; text-transform: uppercase; color: #94a3b8; }
+    .row-cell .value { font-size: 1.05rem; font-weight: 800; color: #1e293b; margin-top: 0.15rem; }
+    .row-cell .unit { font-size: 0.55rem; font-weight: 600; color: #94a3b8; }
+    .row-cell.actual { border-color: #bbf7d0; background: #f0fdf4; }
+    .row-cell.actual .value { color: #166534; }
+    .row-cell.predicted { border-color: #c4b5fd; background: #f5f3ff; }
+    .row-cell.predicted .value { color: #7c3aed; }
+    .row-cell.diff .value { font-size: 0.9rem; }
 
-    .log-panel {
-      background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 0.65rem;
-      padding: 0.85rem; max-height: 200px; overflow-y: auto;
-      font-family: 'SF Mono', 'Consolas', monospace; font-size: 0.68rem;
-      color: #475569; line-height: 1.7; margin-top: 0.75rem;
+    /* History table */
+    .history-table {
+      width: 100%; border-collapse: collapse; font-size: 0.72rem;
     }
-    .log-panel p { margin: 0; }
-    .log-panel .t { color: #8b5cf6; font-weight: 600; }
-    .log-panel .ok { color: #059669; }
-    .log-panel .err { color: #dc2626; }
+    .history-table th {
+      text-align: left; padding: 0.5rem 0.75rem;
+      font-size: 0.6rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.04em; color: #94a3b8;
+      border-bottom: 2px solid #e2e8f0;
+    }
+    .history-table td {
+      padding: 0.4rem 0.75rem; border-bottom: 1px solid #f1f5f9;
+      font-weight: 600; color: #334155;
+    }
+    .history-table tr:hover td { background: #f8fafc; }
+    .good { color: #059669; }
+    .ok-diff { color: #d97706; }
+    .bad { color: #dc2626; }
+
+    .status-bar {
+      display: flex; align-items: center; gap: 1rem;
+      font-size: 0.72rem; color: #64748b; font-weight: 600;
+    }
+    .status-bar .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: #94a3b8;
+    }
+    .status-bar .dot.active { background: #22c55e; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
     .empty-state {
-      text-align: center; padding: 2.5rem 1rem;
+      text-align: center; padding: 2rem 1rem;
       color: #94a3b8; font-size: 0.8rem;
     }
     .empty-state i { font-size: 1.8rem; margin-bottom: 0.5rem; display: block; color: #c4b5fd; }
 
-    @media (max-width: 500px) {
-      .input-grid { grid-template-columns: 1fr 1fr; }
-      .output-grid { grid-template-columns: 1fr 1fr; }
-    }
     ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.2); border-radius: 3px; }
   </style>
@@ -149,88 +140,135 @@
         <span class="icon"><i class="fa-solid fa-brain"></i></span>
         ML Prediction Tester
       </h1>
-      <p class="subtitle">Enter sensor values → get hybrid GRU + LightGBM predictions (HTTP only)</p>
+      <p class="subtitle">CSV playback — actual vs predicted energy comparison (HTTP only)</p>
     </div>
 
-    <!-- ═══════ INPUT CARD ═══════ -->
+    <!-- ═══════ MANUAL INPUT CARD ═══════ -->
+    <div class="card">
+      <div class="card-title">
+        <span class="badge" style="background:#fef3c7;color:#d97706;">
+          <i class="fa-solid fa-pen-to-square"></i>
+        </span>
+        Manual Environmental Override (Optional)
+      </div>
+      <p style="font-size:0.75rem; color:#64748b; margin-bottom: 1rem;">
+        Test specific environmental conditions instead of using the next CSV row.
+      </p>
+
+      <div class="row-display" style="grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));">
+        <div style="display:flex; flex-direction:column; gap:0.2rem;">
+          <label style="font-size:0.65rem; font-weight:700; color:#94a3b8; text-transform:uppercase;">Temp (°C)</label>
+          <input type="number" id="manual_temp" placeholder="28.5" style="padding:0.45rem; border:1px solid #e2e8f0; border-radius:6px; font-size:0.85rem;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.2rem;">
+          <label style="font-size:0.65rem; font-weight:700; color:#94a3b8; text-transform:uppercase;">Humidity (%)</label>
+          <input type="number" id="manual_hum" placeholder="60" style="padding:0.45rem; border:1px solid #e2e8f0; border-radius:6px; font-size:0.85rem;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.2rem;">
+          <label style="font-size:0.65rem; font-weight:700; color:#94a3b8; text-transform:uppercase;">Lux (lx)</label>
+          <input type="number" id="manual_lux" placeholder="400" style="padding:0.45rem; border:1px solid #e2e8f0; border-radius:6px; font-size:0.85rem;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:0.2rem;">
+          <label style="font-size:0.65rem; font-weight:700; color:#94a3b8; text-transform:uppercase;">Occupancy</label>
+          <select id="manual_occ" style="padding:0.45rem; border:1px solid #e2e8f0; border-radius:6px; font-size:0.85rem;">
+            <option value="1">1 (Yes)</option>
+            <option value="0">0 (No)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-top:0.5rem;">
+        <button class="btn btn-secondary" onclick="testManual()" style="padding: 0.55rem 1.25rem; font-size:0.8rem; border-color:#d97706; color:#b45309;">
+          <i class="fa-solid fa-bolt"></i> Test Manual Data
+        </button>
+      </div>
+    </div>
+
+    <!-- ═══════ CONTROLS CARD ═══════ -->
     <div class="card">
       <div class="card-title">
         <span class="badge" style="background:#dbeafe;color:#1d4ed8;">
-          <i class="fa-solid fa-sliders"></i>
+          <i class="fa-solid fa-play"></i>
         </span>
-        Sensor Inputs
+        CSV Playback Controls
       </div>
 
-      <div class="input-grid">
-        <div class="field">
-          <label for="temperature_c">Temperature</label>
-          <input type="number" id="temperature_c" value="28.0" step="0.1" />
-          <span class="unit">°C</span>
+      <div class="status-bar">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Ready — click Next Row to start</span>
+        <span style="margin-left:auto;" id="rowCounter">Row 0 / ?</span>
+      </div>
+
+      <!-- Environmental data being fed to model for current row -->
+      <div id="envFeedStrip" style="display:none; margin-top:0.85rem;">
+        <div style="font-size:0.6rem; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:#94a3b8; margin-bottom:0.4rem;">
+          <i class="fa-solid fa-arrow-right" style="margin-right:3px;"></i> Environmental Data Sent to Model
         </div>
-        <div class="field">
-          <label for="humidity">Humidity</label>
-          <input type="number" id="humidity" value="60.0" step="0.1" />
-          <span class="unit">%</span>
-        </div>
-        <div class="field">
-          <label for="lux">Luminous Intensity</label>
-          <input type="number" id="lux" value="400.0" step="1" />
-          <span class="unit">Lux</span>
-        </div>
-        <div class="field">
-          <label for="occupancy">Occupancy</label>
-          <select id="occupancy">
-            <option value="1" selected>1 — Occupied</option>
-            <option value="0">0 — Empty</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="energy_kw">Energy</label>
-          <input type="number" id="energy_kw" value="1.5" step="0.01" />
-          <span class="unit">kW</span>
+        <div class="row-display" style="grid-template-columns: repeat(4, 1fr); gap:0.5rem; margin-bottom:0;">
+          <div class="row-cell" style="padding:0.4rem;">
+            <div class="label">Temp</div>
+            <div class="value" id="envTemp" style="font-size:0.95rem;">--</div>
+            <div class="unit">°C</div>
+          </div>
+          <div class="row-cell" style="padding:0.4rem;">
+            <div class="label">Humidity</div>
+            <div class="value" id="envHum" style="font-size:0.95rem;">--</div>
+            <div class="unit">%</div>
+          </div>
+          <div class="row-cell" style="padding:0.4rem;">
+            <div class="label">Lux</div>
+            <div class="value" id="envLux" style="font-size:0.95rem;">--</div>
+            <div class="unit">lx</div>
+          </div>
+          <div class="row-cell" style="padding:0.4rem;">
+            <div class="label">Occupancy</div>
+            <div class="value" id="envOcc" style="font-size:0.95rem;">--</div>
+            <div class="unit">&nbsp;</div>
+          </div>
         </div>
       </div>
 
       <div class="actions">
-        <button id="btnPredict" class="btn btn-primary" onclick="callPredict()">
-          <i class="fa-solid fa-bolt"></i> Predict
+        <button id="btnNext" class="btn btn-primary" onclick="nextRow()">
+          <i class="fa-solid fa-forward-step"></i> Next Row
         </button>
-        <button class="btn btn-secondary" onclick="callPredictNext()">
-          <i class="fa-solid fa-forward"></i> Auto Next (CSV)
+        <button class="btn btn-danger" onclick="resetPlayback()">
+          <i class="fa-solid fa-rotate-left"></i> Reset
         </button>
-        <span id="reqCounter" style="font-size:0.72rem;color:#64748b;font-weight:600;margin-left:auto;">
-          0 predictions
-        </span>
       </div>
     </div>
 
-    <!-- ═══════ OUTPUT CARD ═══════ -->
+    <!-- ═══════ CURRENT ROW CARD ═══════ -->
     <div class="card">
       <div class="card-title">
         <span class="badge" style="background:#dcfce7;color:#166534;">
-          <i class="fa-solid fa-chart-line"></i>
+          <i class="fa-solid fa-chart-column"></i>
         </span>
-        Prediction Output
+        Current Row — Actual vs Predicted
       </div>
 
-      <div id="outputArea">
+      <div id="currentRowArea">
         <div class="empty-state">
           <i class="fa-solid fa-flask"></i>
-          Enter your sensor values above and click <strong>Predict</strong>
+          Click <strong>Next Row</strong> to start playback
         </div>
       </div>
     </div>
 
-    <!-- ═══════ LOG CARD ═══════ -->
+    <!-- ═══════ HISTORY CARD ═══════ -->
     <div class="card">
       <div class="card-title">
         <span class="badge" style="background:#fce7f3;color:#9d174d;">
           <i class="fa-solid fa-clock-rotate-left"></i>
         </span>
-        Request Log
+        History
       </div>
-      <div id="logPanel" class="log-panel">
-        <p style="color:#94a3b8;font-style:italic;">No requests yet…</p>
+
+      <div id="historyArea" style="max-height:350px;overflow-y:auto;">
+        <div class="empty-state">
+          <i class="fa-solid fa-table"></i>
+          Results will appear here
+        </div>
       </div>
     </div>
 
@@ -238,132 +276,313 @@
 
   <script>
     const API_BASE = 'http://127.0.0.1:5000';
-    let reqCount = 0;
-    let logStarted = false;
+    let csvRows = [];
+    let currentIdx = 0;
+    let autoRunning = false;
+    let autoTimer = null;
+    let historyData = [];
 
-    function addLog(msg, cls) {
-      const el = document.getElementById('logPanel');
-      if (!logStarted) { el.innerHTML = ''; logStarted = true; }
-      const now = new Date().toLocaleTimeString();
-      const p = document.createElement('p');
-      p.innerHTML = `<span class="t">[${now}]</span> <span class="${cls || ''}">${msg}</span>`;
-      el.prepend(p);
-      while (el.children.length > 60) el.removeChild(el.lastChild);
+    // ── Populate the env strip in Controls card ──────────────────
+    function updateEnvStrip(env) {
+      const strip = document.getElementById('envFeedStrip');
+      if (!env) { strip.style.display = 'none'; return; }
+      strip.style.display = 'block';
+      document.getElementById('envTemp').textContent = env.temperature_c?.toFixed(1) ?? '--';
+      document.getElementById('envHum').textContent = env.humidity?.toFixed(1) ?? '--';
+      document.getElementById('envLux').textContent = env.lux?.toFixed(0) ?? '--';
+      document.getElementById('envOcc').textContent = env.occupancy ?? '--';
     }
 
-    function renderOutput(data) {
-      const el = document.getElementById('outputArea');
-      const pred = data.predictions || {};
-      const inp  = data.live_sensors || {};
-      let html = '';
-
-      // Inputs echo
-      if (Object.keys(inp).length) {
-        html += `<div style="font-size:0.65rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:0.5rem;">
-          <i class="fa-solid fa-arrow-right" style="margin-right:4px;"></i> Inputs Used
-        </div><div class="output-grid">`;
-        const map = {temperature_c:['Temp','°C'], humidity:['Humidity','%'], lux:['Lux','lx'], occupancy:['Occupancy',''], energy_kw:['Energy','kW']};
-        for (const [key, [label, unit]] of Object.entries(map)) {
-          if (inp[key] !== undefined) {
-            html += `<div class="out-cell"><div class="label">${label}</div>
-              <div class="value">${typeof inp[key]==='number'?inp[key].toFixed(2):inp[key]}</div>
-              <div class="unit">${unit}</div></div>`;
-          }
+    // ── Load CSV via fetch ──────────────────────────────────────────
+    async function loadCSV() {
+      try {
+        // Fetch the CSV from the API server's static files or a dedicated endpoint.
+        // We'll parse it client-side. The CSV is in the project root.
+        // Since this is a local test, we fetch from the API server.
+        const resp = await fetch(API_BASE + '/csv_data');
+        if (resp.ok) {
+          const text = await resp.text();
+          parseCSV(text);
+          return;
         }
-        html += '</div>';
-      }
+      } catch (e) {}
 
-      // Predictions
-      html += `<div style="font-size:0.65rem;font-weight:700;color:#8b5cf6;text-transform:uppercase;letter-spacing:0.04em;margin:1rem 0 0.5rem;">
-        <i class="fa-solid fa-bolt" style="margin-right:4px;"></i> Model Predictions
-      </div><div class="output-grid">`;
-
-      const items = [
-        ['Hybrid Final', pred.hybrid_final_kwh, 'kW', true],
-        ['Upper Bound',  pred.safety_upper_bound, 'kW', true],
-        ['Lower Bound',  pred.safety_lower_bound, 'kW', false],
-        ['GRU Base',     pred.base_gru_kwh, 'kWh', false],
-        ['LGB Correction', pred.lgbm_correction_kwh, 'kWh', false],
-      ];
-      for (const [label, value, unit, hl] of items) {
-        if (value === undefined || value === null) continue;
-        html += `<div class="out-cell${hl?' highlight':''}">
-          <div class="label">${label}</div>
-          <div class="value">${typeof value==='number'?value.toFixed(4):value}</div>
-          <div class="unit">${unit}</div></div>`;
-      }
-
-      if (data.timestamp) {
-        html += `<div class="out-cell" style="grid-column:1/-1;">
-          <div class="label">Timestamp</div>
-          <div class="value" style="font-size:0.75rem;">${data.timestamp}</div></div>`;
-      }
-      html += '</div>';
-      el.innerHTML = html;
+      // Fallback: prompt user to paste CSV or use API-only mode
+      document.getElementById('statusText').textContent =
+        'CSV endpoint not available — using API /predict_next for sequential data';
+      csvRows = null; // signal to use API-only mode
     }
 
-    function getInputs() {
-      return {
-        temperature_c: parseFloat(document.getElementById('temperature_c').value),
-        humidity:       parseFloat(document.getElementById('humidity').value),
-        lux:            parseFloat(document.getElementById('lux').value),
-        occupancy:      parseInt(document.getElementById('occupancy').value),
-        energy_kw:      parseFloat(document.getElementById('energy_kw').value),
+    function parseCSV(text) {
+      const lines = text.trim().split('\n');
+      const headers = lines[0].split(',').map(h => h.trim());
+      csvRows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const vals = lines[i].split(',');
+        const row = {};
+        headers.forEach((h, j) => { row[h] = vals[j]?.trim() || ''; });
+        csvRows.push(row);
+      }
+      document.getElementById('rowCounter').textContent = `Row 0 / ${csvRows.length}`;
+      document.getElementById('statusText').textContent = `Loaded ${csvRows.length} rows — click Next Row`;
+    }
+
+    // ── Test Manual Input ─────────────────────────────────────────
+    async function testManual() {
+      stopAuto();
+      const temp = document.getElementById('manual_temp').value;
+      const hum = document.getElementById('manual_hum').value;
+      const lux = document.getElementById('manual_lux').value;
+      const occ = document.getElementById('manual_occ').value;
+
+      if (!temp || !hum || !lux) {
+        document.getElementById('statusText').textContent = 'Please fill Temp, Humidity, and Lux for manual test.';
+        return;
+      }
+
+      const envData = {
+        temperature_c: parseFloat(temp),
+        humidity: parseFloat(hum),
+        lux: parseFloat(lux),
+        occupancy: parseInt(occ),
       };
-    }
-
-    async function callPredict() {
-      const btn = document.getElementById('btnPredict');
-      btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running…';
 
       try {
-        const t0 = performance.now();
         const resp = await fetch(API_BASE + '/predict', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(getInputs()),
+          body: JSON.stringify(envData),
         });
-        const ms = (performance.now() - t0).toFixed(0);
-        if (!resp.ok) { addLog(`HTTP ${resp.status}`, 'err'); return; }
+
+        if (!resp.ok) {
+          document.getElementById('statusText').textContent = `HTTP error ${resp.status}`;
+          return;
+        }
+
         const data = await resp.json();
-        reqCount++;
-        document.getElementById('reqCounter').textContent = reqCount + ' predictions';
-        renderOutput(data);
-        addLog(`POST /predict → ${data.predictions?.hybrid_final_kwh?.toFixed(4) ?? '?'} kW (${ms}ms)`, 'ok');
+        const predicted_kw = data.predictions?.hybrid_final_kwh;
+        const timestamp = "Manual Test";
+        
+        // Manual test has no "actual load" to compare against
+        updateEnvStrip(envData);
+        renderCurrentRow(timestamp, envData, undefined, predicted_kw, null, null);
+        
+        historyData.unshift({ row: 'M', timestamp, actual_kw: undefined, predicted_kw, diff: null, pct: null });
+        if (historyData.length > 200) historyData.pop();
+        renderHistory();
+
+        document.getElementById('statusText').textContent = `Manual Test completed → Requested manually`;
       } catch (err) {
-        addLog('Error: ' + err.message, 'err');
+        document.getElementById('statusText').textContent = 'Error: ' + err.message;
+      }
+    }
+
+    // ── Send one row to the ML model ──────────────────────────────
+    async function nextRow() {
+      const btn = document.getElementById('btnNext');
+      btn.disabled = true;
+      document.getElementById('statusText').textContent = 'Sending data to model…';
+
+      try {
+        let actual_kw, predicted_kw, timestamp, envData;
+
+        if (csvRows && csvRows.length > 0) {
+          // CSV loaded — send environmental data from current row
+          if (currentIdx >= csvRows.length) {
+            document.getElementById('statusText').textContent = 'Reached end of CSV';
+            stopAuto();
+            return;
+          }
+
+          const row = csvRows[currentIdx];
+          const luxCol = row['Luminous_Intensity_Lux'] !== undefined
+            ? 'Luminous_Intensity_Lux' : 'Luminous_Intensity';
+
+          envData = {
+            temperature_c: parseFloat(row['Temperature_C']),
+            humidity: parseFloat(row['Humidity_%']),
+            lux: parseFloat(row[luxCol]),
+            occupancy: parseInt(row['Occupancy']),
+          };
+          actual_kw = parseFloat(row['Energy_kW']);
+          timestamp = row['Timestamp'] || `Row ${currentIdx + 1}`;
+
+          // Show env data immediately while waiting for prediction
+          updateEnvStrip(envData);
+          document.getElementById('statusText').textContent =
+            `Row ${currentIdx + 1}: Waiting for ML prediction…`;
+
+          // POST environmental data to /predict
+          const resp = await fetch(API_BASE + '/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(envData),
+          });
+          if (!resp.ok) {
+            document.getElementById('statusText').textContent = `HTTP error ${resp.status} — prediction failed`;
+            return;
+          }
+          const data = await resp.json();
+          predicted_kw = data.predictions?.hybrid_final_kwh;
+
+          // Validate: prediction MUST be a real number
+          if (predicted_kw === undefined || predicted_kw === null || isNaN(predicted_kw)) {
+            document.getElementById('statusText').textContent =
+              `Row ${currentIdx + 1}: ⚠ Model returned no valid prediction`;
+            return;
+          }
+
+        } else {
+          // No CSV — use /predict_next API
+          document.getElementById('statusText').textContent = 'Fetching next prediction…';
+
+          const resp = await fetch(API_BASE + '/predict_next');
+          if (!resp.ok) {
+            document.getElementById('statusText').textContent = `HTTP error ${resp.status}`;
+            return;
+          }
+          const data = await resp.json();
+          if (data.error) {
+            document.getElementById('statusText').textContent = data.error;
+            return;
+          }
+          predicted_kw = data.predictions?.hybrid_final_kwh;
+          actual_kw = data.live_sensors?.energy_kw;
+          timestamp = data.timestamp || `Step ${currentIdx + 1}`;
+          envData = data.live_sensors ? {
+            temperature_c: data.live_sensors.temperature_c,
+            humidity: data.live_sensors.humidity,
+            lux: data.live_sensors.lux,
+            occupancy: data.live_sensors.occupancy,
+          } : null;
+          updateEnvStrip(envData);
+
+          if (predicted_kw === undefined || predicted_kw === null || isNaN(predicted_kw)) {
+            document.getElementById('statusText').textContent =
+              `Step ${currentIdx + 1}: ⚠ Model returned no valid prediction`;
+            return;
+          }
+        }
+
+        // ── Prediction confirmed valid — now display everything ──
+        currentIdx++;
+        const total = csvRows ? csvRows.length : '?';
+        document.getElementById('rowCounter').textContent = `Row ${currentIdx} / ${total}`;
+        document.getElementById('statusDot').className = 'dot active';
+
+        // Calculate diff
+        const diff = predicted_kw !== undefined && actual_kw !== undefined
+          ? predicted_kw - actual_kw : null;
+        const pct = diff !== null && actual_kw !== 0
+          ? (Math.abs(diff) / actual_kw * 100) : null;
+
+        // Update current row display (only after prediction is confirmed)
+        renderCurrentRow(timestamp, envData, actual_kw, predicted_kw, diff, pct);
+
+        // Add to history
+        historyData.unshift({ row: currentIdx, timestamp, actual_kw, predicted_kw, diff, pct });
+        if (historyData.length > 200) historyData.pop();
+        renderHistory();
+
+        document.getElementById('statusText').textContent =
+          `Row ${currentIdx}: Actual ${actual_kw?.toFixed(4)} kW → Predicted ${predicted_kw.toFixed(4)} kW ✓`;
+
+      } catch (err) {
+        document.getElementById('statusText').textContent = 'Error: ' + err.message;
+        stopAuto();
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-bolt"></i> Predict';
       }
     }
 
-    async function callPredictNext() {
-      try {
-        const t0 = performance.now();
-        const resp = await fetch(API_BASE + '/predict_next');
-        const ms = (performance.now() - t0).toFixed(0);
-        if (!resp.ok) { addLog(`HTTP ${resp.status}`, 'err'); return; }
-        const data = await resp.json();
-        if (data.error) { addLog(data.error, 'err'); return; }
-        reqCount++;
-        document.getElementById('reqCounter').textContent = reqCount + ' predictions';
+    // ── Render current row ────────────────────────────────────────
+    function renderCurrentRow(timestamp, env, actual, predicted, diff, pct) {
+      const el = document.getElementById('currentRowArea');
+      const diffClass = diff !== null
+        ? (Math.abs(diff) < 0.5 ? 'good' : Math.abs(diff) < 1.5 ? 'ok-diff' : 'bad')
+        : '';
 
-        // Auto-fill inputs with what the CSV had
-        const inp = data.live_sensors || {};
-        if (inp.temperature_c !== undefined) document.getElementById('temperature_c').value = inp.temperature_c.toFixed(1);
-        if (inp.humidity !== undefined) document.getElementById('humidity').value = inp.humidity.toFixed(1);
-        if (inp.lux !== undefined) document.getElementById('lux').value = inp.lux.toFixed(1);
-        if (inp.occupancy !== undefined) document.getElementById('occupancy').value = inp.occupancy;
-        if (inp.energy_kw !== undefined) document.getElementById('energy_kw').value = inp.energy_kw.toFixed(2);
+      let html = `<div class="row-display">`;
 
-        renderOutput(data);
-        addLog(`GET /predict_next → ${data.predictions?.hybrid_final_kwh?.toFixed(4) ?? '?'} kW (${ms}ms)`, 'ok');
-      } catch (err) {
-        addLog('Error: ' + err.message, 'err');
+      // Environmental inputs
+      if (env) {
+        html += `
+          <div class="row-cell"><div class="label">Temp</div><div class="value">${env.temperature_c?.toFixed(1)}</div><div class="unit">°C</div></div>
+          <div class="row-cell"><div class="label">Humidity</div><div class="value">${env.humidity?.toFixed(1)}</div><div class="unit">%</div></div>
+          <div class="row-cell"><div class="label">Lux</div><div class="value">${env.lux?.toFixed(0)}</div><div class="unit">lx</div></div>
+          <div class="row-cell"><div class="label">Occupancy</div><div class="value">${env.occupancy}</div><div class="unit">&nbsp;</div></div>
+        `;
       }
+
+      // Actual vs Predicted
+      html += `
+        <div class="row-cell actual">
+          <div class="label">Actual Load</div>
+          <div class="value">${actual !== undefined ? actual.toFixed(4) : '--'}</div>
+          <div class="unit">kW</div>
+        </div>
+        <div class="row-cell predicted">
+          <div class="label">Predicted Load</div>
+          <div class="value">${predicted !== undefined ? predicted.toFixed(4) : '--'}</div>
+          <div class="unit">kW</div>
+        </div>
+        <div class="row-cell diff">
+          <div class="label">Difference</div>
+          <div class="value ${diffClass}">${diff !== null ? (diff >= 0 ? '+' : '') + diff.toFixed(4) : '--'}</div>
+          <div class="unit">${pct !== null ? pct.toFixed(1) + '% error' : ''}</div>
+        </div>
+      `;
+
+      html += `</div>`;
+      html += `<div style="font-size:0.65rem;color:#94a3b8;font-weight:600;">Timestamp: ${timestamp}</div>`;
+      el.innerHTML = html;
     }
+
+    // ── Render history table ─────────────────────────────────────
+    function renderHistory() {
+      const el = document.getElementById('historyArea');
+      if (historyData.length === 0) return;
+
+      let html = `<table class="history-table">
+        <thead><tr>
+          <th>Row</th><th>Timestamp</th><th>Actual (kW)</th>
+          <th>Predicted (kW)</th><th>Diff (kW)</th><th>Error %</th>
+        </tr></thead><tbody>`;
+
+      for (const h of historyData) {
+        const cls = h.diff !== null
+          ? (Math.abs(h.diff) < 0.5 ? 'good' : Math.abs(h.diff) < 1.5 ? 'ok-diff' : 'bad')
+          : '';
+        html += `<tr>
+          <td>${h.row}</td>
+          <td>${h.timestamp}</td>
+          <td>${h.actual_kw?.toFixed(4) ?? '--'}</td>
+          <td>${h.predicted_kw?.toFixed(4) ?? '--'}</td>
+          <td class="${cls}">${h.diff !== null ? (h.diff >= 0 ? '+' : '') + h.diff.toFixed(4) : '--'}</td>
+          <td class="${cls}">${h.pct !== null ? h.pct.toFixed(1) + '%' : '--'}</td>
+        </tr>`;
+      }
+
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    }
+
+    function resetPlayback() {
+      currentIdx = 0;
+      historyData = [];
+      const total = csvRows ? csvRows.length : '?';
+      document.getElementById('rowCounter').textContent = `Row 0 / ${total}`;
+      document.getElementById('statusText').textContent = 'Reset — click Next Row';
+      document.getElementById('statusDot').className = 'dot';
+      document.getElementById('envFeedStrip').style.display = 'none';
+      document.getElementById('currentRowArea').innerHTML =
+        '<div class="empty-state"><i class="fa-solid fa-flask"></i>Click <strong>Next Row</strong> to start playback</div>';
+      document.getElementById('historyArea').innerHTML =
+        '<div class="empty-state"><i class="fa-solid fa-table"></i>Results will appear here</div>';
+    }
+
+    // ── Init ─────────────────────────────────────────────────────
+    loadCSV();
   </script>
 </body>
 </html>

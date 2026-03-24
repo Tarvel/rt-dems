@@ -21,7 +21,7 @@ import signal
 import sqlite3
 import sys
 import threading
-from collections import deque
+
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
@@ -100,7 +100,11 @@ DB_PATH = os.environ.get(
                  "..", "room_backend", "db.sqlite3"),
 )
 
-# Decision interval in minutes (testing default is 1 minutes).
+# Decision interval in minutes.
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TESTING DEFAULT: 1 minutes.  Change to 5 for production.       │
+# │  export DECISION_INTERVAL_MINUTES=5                             │
+# └─────────────────────────────────────────────────────────────────┘
 DECISION_INTERVAL_MINUTES = int(
     os.environ.get("DECISION_INTERVAL_MINUTES", 1)
 )
@@ -112,7 +116,11 @@ BATTERY_LAG_INTERVAL_SECONDS = int(
 )
 BATTERY_LAG_READINGS = 3
 
-# Max safe battery drop over the lag window.
+# Max safe battery drop (%) over the lag window.
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  TESTING DEFAULT: 2%.  Change to 10 for production.           │
+# │  export MAX_BATTERY_DROP_PERCENT=10                           │
+# └─────────────────────────────────────────────────────────────────┘
 MAX_BATTERY_DROP_PERCENT = float(
     os.environ.get("MAX_BATTERY_DROP_PERCENT", 2)
 )
@@ -125,15 +133,14 @@ def _format_duration(seconds: int) -> str:
     return f"{seconds}s"
 
 
-# Configurable max energy thresholds in kWh.
+# Peak demand threshold in kW. Condition 1 compares predicted energy
+# against this value.
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  This is the MODE_A ceiling (peak demand load).               │
+# │  export MODE_A_MAX_KWH=2.4                                   │
+# └─────────────────────────────────────────────────────────────────┘
 MODE_A_MAX_KWH = float(
     os.environ.get("MODE_A_MAX_KWH", 2.4)
-)
-MODE_B_MAX_KWH = float(
-    os.environ.get("MODE_B_MAX_KWH", 1.4)
-)
-MODE_C_MAX_KWH = float(
-    os.environ.get("MODE_C_MAX_KWH", 0.8)
 )
 
 # ---------------------------------------------------------------------------
@@ -155,8 +162,14 @@ latest_sensor: dict = {}
 # Latest ML prediction
 latest_ml: dict = {}
 
-# Rolling battery window used by the 30-30-30 lag check.
-battery_lag_window: deque[float] = deque(maxlen=BATTERY_LAG_READINGS)
+# Rolling battery lag: three explicit time slots.
+# T-now  = current reading (updated every 30s)
+# T-1    = reading from 30 seconds ago
+# T-2    = reading from 60 seconds ago
+# None means "no reading yet".
+battery_t_now: float | None = None
+battery_t1:    float | None = None
+battery_t2:    float | None = None
 
 # Current mode (persists between evaluations for stability lock)
 current_mode: str = "C"  # start in safest mode
@@ -260,13 +273,23 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
 # Core Rule Engine
 # ---------------------------------------------------------------------------
 def evaluate_rules() -> tuple[str, str]:
-    """Evaluate the rule hierarchy and return (mode, reason).
+    """Evaluate the decision pipeline and return (mode, reason).
 
-    Uses the shared state variables under state_lock.
-    Must be called while holding state_lock.
+    Decision tree
+    ─────────────
+    Step 1: predicted_energy >= MODE_A_MAX_KWH  (energy is sufficient)
+        ├─ Battery >= 80%  → lag stable? → A / B
+        ├─ Battery >= 50%  → lag stable? → B / C
+        └─ Battery <  50%  → C
+
+    Step 2: predicted_energy <  MODE_A_MAX_KWH  (energy is tight)
+        ├─ Battery >= 80%  → lag floor ok? → A / B
+        ├─ Battery >= 60%  → lag floor ok? → B / C
+        └─ Battery <  60%  → C
     """
     global current_mode
 
+    # ── Gather sensor + ML values ────────────────────────────────
     temperature = latest_sensor.get(
         "temperature", latest_sensor.get("temperature_c", 25.0)
     )
@@ -275,72 +298,123 @@ def evaluate_rules() -> tuple[str, str]:
     occupancy = latest_sensor.get("occupancy")
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    predicted_energy_kwh = latest_ml.get("predicted_energy_kwh")
-    predicted_energy_kw = latest_ml.get("predicted_energy_kw")
-    if predicted_energy_kwh is None:
-        if predicted_energy_kw is not None:
-            predicted_energy_kwh = (
-                float(predicted_energy_kw) * (DECISION_INTERVAL_MINUTES / 60)
-            )
-        elif latest_ml.get("predicted_energy_range") is not None:
-            predicted_energy_kwh = float(latest_ml.get("predicted_energy_range"))
-
-    voltage = latest_sensor.get("voltage")
-    current = latest_sensor.get("current")
-    actual_load_kwh = None
-    if voltage is not None and current is not None:
-        load_kw = (float(voltage) * float(current)) / 1000.0
-        actual_load_kwh = load_kw * (DECISION_INTERVAL_MINUTES / 60)
+    # Resolve predicted energy from whichever key the ML payload has.
+    predicted_energy = latest_ml.get("predicted_energy_kw")
+    if predicted_energy is None:
+        predicted_energy = latest_ml.get("predicted_energy_range")
+    if predicted_energy is None:
+        predicted_energy = latest_ml.get("predicted_energy_kwh")
 
     log.info(
-        "Env snapshot (bypassed): temp=%.1fC, humidity=%s, lux=%s, occupancy=%s",
+        "Env snapshot: temp=%.1f°C, humidity=%s, lux=%s, "
+        "occupancy=%s, battery=%.1f%%",
         float(temperature),
         "n/a" if humidity is None else f"{humidity}",
         "n/a" if lux is None else f"{lux}",
         "n/a" if occupancy is None else f"{occupancy}",
+        float(battery_level),
     )
 
-    if predicted_energy_kwh is None or actual_load_kwh is None:
+    if predicted_energy is None:
         return current_mode, (
-            "Decision skipped: missing predicted energy or load data "
+            "Decision skipped: no ML prediction available "
             "→ maintaining current mode"
         )
 
-    if predicted_energy_kwh <= actual_load_kwh:
-        return current_mode, (
-            f"Condition 1 — Predicted energy {predicted_energy_kwh:.4f}kWh "
-            f"<= actual load {actual_load_kwh:.4f}kWh "
-            "→ maintaining current mode"
+    predicted_energy = float(predicted_energy)
+
+    # ── Lag helpers ──────────────────────────────────────────────
+    # "Full lag" means we have readings in all three slots.
+    has_full_lag = (battery_t_now is not None
+                    and battery_t1 is not None
+                    and battery_t2 is not None)
+    # Drop = T-2 minus T-now (positive means battery fell)
+    lag_drop = (battery_t2 - battery_t_now) if has_full_lag else 0.0
+
+    def _lag_info() -> str:
+        """Short string describing the lag window state."""
+        if not has_full_lag:
+            return "lag window not full yet (treated as stable)"
+        return (
+            f"lag drop={lag_drop:.2f}%, "
+            f"T-now={battery_t_now:.1f}% T-1={battery_t1:.1f}% T-2={battery_t2:.1f}%"
         )
 
+    # ── STEP 1: predicted_energy >= peak demand (energy sufficient) ──
+    if predicted_energy >= MODE_A_MAX_KWH:
+        step = (
+            f"Step 1 — Predicted {predicted_energy:.4f}kW "
+            f">= peak demand {MODE_A_MAX_KWH}kW"
+        )
+        lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
+
+        # 1 — Battery >= 80%
+        if battery_level >= 80.0:
+            if lag_stable:
+                return "A", (
+                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
+                    f"lag stable ({_lag_info()}) → Mode A"
+                )
+            else:
+                return "B", (
+                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
+                    f"lag NOT stable ({_lag_info()}) → Mode B"
+                )
+
+        # 1 — Battery >= 50%
+        if battery_level >= 50.0:
+            if lag_stable:
+                return "B", (
+                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
+                    f"lag stable ({_lag_info()}) → Mode B"
+                )
+            else:
+                return "C", (
+                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
+                    f"lag NOT stable ({_lag_info()}) → Mode C"
+                )
+
+        # 1 — Battery < 50%
+        return "C", (
+            f"{step}; Battery {battery_level:.1f}% < 50% → Mode C"
+        )
+
+    # ── STEP 2: predicted_energy < peak demand (energy is tight) ─────
+    step = (
+        f"Step 2 — Predicted {predicted_energy:.4f}kW "
+        f"< peak demand {MODE_A_MAX_KWH}kW"
+    )
+    lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
+
+    # 2a — Battery >= 80%
     if battery_level >= 80.0:
-        target_mode = "A"
-        target_reason = "Battery >= 80% → Smart Mode A"
-    elif battery_level >= 50.0:
-        target_mode = "B"
-        target_reason = "Battery >= 50% and < 80% → Smart Mode B"
-    else:
-        target_mode = "C"
-        target_reason = "Battery < 50% → Smart Mode C"
-
-    if len(battery_lag_window) >= BATTERY_LAG_READINGS:
-        drop = battery_lag_window[0] - battery_lag_window[-1]
-        if drop > MAX_BATTERY_DROP_PERCENT:
-            return current_mode, (
-                f"Condition 3 — Battery drop {drop:.2f}% exceeds "
-                f"{MAX_BATTERY_DROP_PERCENT:.2f}% over {BATTERY_LAG_INTERVAL_SECONDS}s "
-                "window → maintaining current mode"
+        if lag_stable:
+            return "A", (
+                f"{step}; Battery {battery_level:.1f}% >= 80%, "
+                f"lag stable ({_lag_info()}) → Mode A"
+            )
+        else:
+            return "B", (
+                f"{step}; Battery {battery_level:.1f}% >= 80%, "
+                f"lag NOT stable ({_lag_info()}) → Mode B"
             )
 
-        return target_mode, (
-            f"Condition 2 → {target_reason}; "
-            f"Condition 3 — Battery drop {drop:.2f}% within threshold "
-            f"{MAX_BATTERY_DROP_PERCENT:.2f}% → switching to Mode {target_mode}"
-        )
+    # 2b — Battery >= 60%
+    if battery_level >= 60.0:
+        if lag_stable:
+            return "B", (
+                f"{step}; Battery {battery_level:.1f}% >= 60%, "
+                f"lag stable ({_lag_info()}) → Mode B"
+            )
+        else:
+            return "C", (
+                f"{step}; Battery {battery_level:.1f}% >= 60%, "
+                f"lag NOT stable ({_lag_info()}) → Mode C"
+            )
 
-    return target_mode, (
-        f"Condition 2 → {target_reason}; "
-        "Condition 3 — Battery lag window not full → switching to target mode"
+    # 2bii — Battery < 60%
+    return "C", (
+        f"{step}; Battery {battery_level:.1f}% < 60% → Mode C"
     )
 
 
@@ -383,9 +457,14 @@ def run_evaluation(client: mqtt.Client) -> None:
         "relay_1": r1,
         "relay_2": r2,
         "relay_3": r3,
-        "battery_lag_values": [
-            round(v, 1) for v in reversed(list(battery_lag_window))
-        ],
+        "battery_t_now": round(battery_t_now, 1) if battery_t_now is not None else None,
+        "battery_t1":    round(battery_t1, 1)    if battery_t1 is not None else None,
+        "battery_t2":    round(battery_t2, 1)    if battery_t2 is not None else None,
+        "battery_lag_drop": (
+            round(battery_t2 - battery_t_now, 2)
+            if battery_t_now is not None and battery_t2 is not None
+            else None
+        ),
         "battery_lag_interval_seconds": BATTERY_LAG_INTERVAL_SECONDS,
         "reason": reason,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -401,8 +480,13 @@ def evaluation_loop(client: mqtt.Client) -> None:
             run_evaluation(client)
 
 
-def battery_lag_loop() -> None:
-    """Background thread: track battery lag every 30 seconds."""
+def battery_lag_loop(client: mqtt.Client) -> None:
+    """Background thread: shift battery readings every 30 seconds.
+
+    Every 30s:  T-1 → T-2,  T-now → T-1,  fresh reading → T-now
+    """
+    global battery_t_now, battery_t1, battery_t2
+
     while not shutdown_event.is_set():
         shutdown_event.wait(BATTERY_LAG_INTERVAL_SECONDS)
         if shutdown_event.is_set():
@@ -410,15 +494,34 @@ def battery_lag_loop() -> None:
         with state_lock:
             if not latest_sensor:
                 continue
-            battery_level = latest_sensor.get("battery_level")
-            if battery_level is None:
+            fresh = latest_sensor.get("battery_level")
+            if fresh is None:
                 continue
-            battery_lag_window.append(float(battery_level))
-            log.debug(
-                "Battery lag window (last %d): %s",
-                BATTERY_LAG_READINGS,
-                [round(b, 1) for b in battery_lag_window],
+            fresh = float(fresh)
+
+            # ── 30-second shift ──
+            battery_t2    = battery_t1       # old T-1 becomes T-2
+            battery_t1    = battery_t_now    # old T-now becomes T-1
+            battery_t_now = fresh            # fresh reading is T-now
+
+            log.info(
+                "Battery lag shift → T-now: %.1f%%  T-1: %s  T-2: %s",
+                battery_t_now,
+                f"{battery_t1:.1f}%" if battery_t1 is not None else "--",
+                f"{battery_t2:.1f}%" if battery_t2 is not None else "--",
             )
+
+            # Publish updated lag to dashboard immediately
+            lag_payload = {
+                "type": "battery_lag_update",
+                "battery_t_now": round(float(battery_t_now), 1) if battery_t_now is not None else None,
+                "battery_t1":    round(float(battery_t1), 1) if battery_t1 is not None else None,
+                "battery_t2":    round(float(battery_t2), 1) if battery_t2 is not None else None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            # We use the same topic the dashboard already listens to for state,
+            # but the dashboard must be updated to handle this "type" of payload.
+            client.publish(TOPIC_RELAY_STATE, json.dumps(lag_payload), qos=1)
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +557,12 @@ def on_message(client, userdata, msg):
             )
 
 
-def on_disconnect(client, userdata, rc, properties=None):
+def on_disconnect(client, userdata, *args, **kwargs):
+    # paho-mqtt v2 may pass extra positional args (flags, rc, properties).
+    rc = args[0] if args else 0
     if rc != 0:
         log.warning(
-            "Unexpected MQTT disconnect (rc=%d). Will auto-reconnect.",
+            "Unexpected MQTT disconnect (rc=%s). Will auto-reconnect.",
             rc,
         )
 
@@ -489,17 +594,12 @@ def main() -> None:
         BATTERY_LAG_READINGS,
     )
     log.info(
-        "Set DECISION_INTERVAL_MINUTES=5 for production; 3 for testing"
-    )
-    log.info(
-        "Max battery drop: %.2f%%",
-        MAX_BATTERY_DROP_PERCENT,
-    )
-    log.info(
-        "Mode energy limits: A<=%.3fkWh, B<=%.3fkWh, C<=%.3fkWh",
+        "Peak demand threshold (MODE_A_MAX_KWH): %.1f kW",
         MODE_A_MAX_KWH,
-        MODE_B_MAX_KWH,
-        MODE_C_MAX_KWH,
+    )
+    log.info(
+        "Max battery drop threshold: %.1f%%",
+        MAX_BATTERY_DROP_PERCENT,
     )
     log.info("Database: %s", os.path.abspath(DB_PATH))
     log.info("Running on Raspberry Pi: %s", ON_PI)
@@ -544,6 +644,7 @@ def main() -> None:
     # Start battery lag tracker thread
     lag_thread = threading.Thread(
         target=battery_lag_loop,
+        args=(client,),
         daemon=True,
     )
     lag_thread.start()

@@ -26,7 +26,7 @@ import pandas as pd
 import joblib
 from ai_edge_litert.interpreter import Interpreter
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -216,9 +216,17 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_mqtt_message(client, userdata, msg):
-    """Sensor message arrives → run prediction → publish result to MQTT."""
+    """Sensor message arrives → inject environmental values into the model
+    window → run prediction → publish result to MQTT.
+
+    Only environmental data (temperature, humidity, lux, occupancy) from the
+    incoming message is used. Energy_kW still comes from the CSV history —
+    the model predicts energy, so we don't feed it the actual.
+    """
     global current_sim_index
     try:
+        sensor = json.loads(msg.payload.decode("utf-8"))
+
         if current_sim_index >= len(df_sim):
             print("⚠ Simulation finished — resetting index")
             current_sim_index = WINDOW_SIZE
@@ -227,6 +235,20 @@ def on_mqtt_message(client, userdata, msg):
             current_sim_index - WINDOW_SIZE : current_sim_index + 1
         ].copy()
         current_sim_index += 1
+
+        # Override the last (current) row with incoming environmental data.
+        # Energy_kW is NOT overridden — it stays from the CSV.
+        idx = live_window.index[-1]
+        if "temperature_c" in sensor:
+            live_window.loc[idx, 'Temperature_C'] = float(sensor["temperature_c"])
+        elif "temperature" in sensor:
+            live_window.loc[idx, 'Temperature_C'] = float(sensor["temperature"])
+        if "humidity" in sensor:
+            live_window.loc[idx, 'Humidity_%'] = float(sensor["humidity"])
+        if "lux" in sensor:
+            live_window.loc[idx, 'Luminous_Intensity_Lux'] = float(sensor["lux"])
+        if "occupancy" in sensor:
+            live_window.loc[idx, 'Occupancy'] = int(sensor["occupancy"])
 
         result = run_prediction(live_window)
         mqtt_payload = build_mqtt_payload(result)
@@ -349,6 +371,27 @@ def predict_next_hour():
     current_sim_index += 1
 
     return run_prediction(live_window)
+
+
+@app.get("/csv_data")
+def serve_csv_data():
+    """Serve the CSV file to the test dashboard for client-side playback."""
+    if os.path.exists(CSV_PATH):
+        return FileResponse(CSV_PATH, media_type="text/csv")
+    return {"error": "CSV file not found locally."}
+
+
+@app.post("/reset")
+def reset_sim_index():
+    """Hard-reset the CSV row pointer back to the first valid position.
+
+    Called by data_simulator.py on boot so the ML API's internal index
+    is perfectly synchronised with the simulator's fresh Row-1 start.
+    """
+    global current_sim_index
+    current_sim_index = WINDOW_SIZE
+    print(f"\n↺ Simulation index reset to {WINDOW_SIZE} (Row 1)")
+    return {"status": "ok", "current_sim_index": current_sim_index}
 
 
 # --- Serve test_dashboard.html at root ---

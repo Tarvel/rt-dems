@@ -116,12 +116,12 @@ def compute_sensor_average(readings: list[dict]) -> dict | None:
 
     n = len(readings)
     avg = {
-        "temperature": round(sum(r["temperature"] for r in readings) / n, 2),
-        "humidity": round(sum(r["humidity"] for r in readings) / n, 2),
+        "temperature": round(float(sum(r["temperature"] for r in readings) / n), 2),
+        "humidity": round(float(sum(r["humidity"] for r in readings) / n), 2),
         "occupancy": 1 if sum(r["occupancy"] for r in readings) / n >= 0.5 else 0,
-        "voltage": round(sum(r["voltage"] for r in readings) / n, 2),
-        "current": round(sum(r["current"] for r in readings) / n, 2),
-        "battery_level": round(sum(r["battery_level"] for r in readings) / n, 2),
+        "voltage": round(float(sum(r.get("voltage", 0.0) for r in readings) / n), 2),
+        "current": round(float(sum(r.get("current", 0.0) for r in readings) / n), 2),
+        "battery_level": round(float(sum(r["battery_level"] for r in readings) / n), 2),
     }
     return avg
 
@@ -134,9 +134,9 @@ def compute_ml_average(predictions: list[dict]) -> dict | None:
     n = len(predictions)
     avg = {
         "predicted_energy_range": round(
-            sum(p["predicted_energy_range"] for p in predictions) / n, 2
+            float(sum(p["predicted_energy_range"] for p in predictions) / n), 2
         ),
-        "peak_demand": round(sum(p["peak_demand"] for p in predictions) / n, 2),
+        "peak_demand": round(float(sum(p["peak_demand"] for p in predictions) / n), 2),
     }
     return avg
 
@@ -246,8 +246,7 @@ def on_message(client, userdata, msg):
             if "temperature" not in payload and "temperature_c" in payload:
                 payload["temperature"] = payload["temperature_c"]
             required = {
-                "temperature", "humidity", "occupancy",
-                "voltage", "current", "battery_level",
+                "temperature", "humidity", "occupancy", "battery_level",
             }
             if not required.issubset(payload.keys()):
                 log.warning("Sensor payload missing keys: %s", required - payload.keys())
@@ -264,9 +263,10 @@ def on_message(client, userdata, msg):
             log.debug("Buffered ML prediction (%d in buffer)", len(ml_buffer))
 
 
-def on_disconnect(client, userdata, rc, properties=None):
+def on_disconnect(client, userdata, *args, **kwargs):
+    rc = args[0] if args else 0
     if rc != 0:
-        log.warning("Unexpected MQTT disconnect (rc=%d). Will auto-reconnect.", rc)
+        log.warning("Unexpected MQTT disconnect (rc=%s). Will auto-reconnect.", rc)
 
 
 # ---------------------------------------------------------------------------

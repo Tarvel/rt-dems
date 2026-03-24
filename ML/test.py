@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-test.py — Manual HTTP Test CLI for the ML Prediction API
+test.py — CSV Playback Test CLI for the ML Prediction API
 ==========================================================
 
-Type sensor values → POST to /predict → see model output.
-Pure HTTP. No MQTT.
+Reads abs_smart_grid_dataset_20k.csv row by row, sends environmental
+data to the ML model via HTTP, and prints actual vs predicted side
+by side for easy accuracy comparison.
 
 Usage:
-    python test.py                 # Interactive (type your inputs)
-    python test.py --auto N        # Auto-step through N CSV rows
+    python test.py              # Step through rows one at a time
+    python test.py --auto N     # Auto-run N rows
+    python test.py --auto 0     # Auto-run ALL rows
 
 Prerequisites:
     test_prediction_api.py must be running
 """
 
 import argparse
-import json
+import csv
 import sys
 import time
+from pathlib import Path
 
 import requests
 
 # ---------------------------------------------------------------------------
-# Configuration — must match test_prediction_api.py
+# Configuration
 # ---------------------------------------------------------------------------
 API_BASE = "http://127.0.0.1:5000"
 PREDICT_URL = f"{API_BASE}/predict"
-PREDICT_NEXT_URL = f"{API_BASE}/predict_next"
+
+CSV_PATH = Path(__file__).resolve().parents[1] / "abs_smart_grid_dataset_20k.csv"
 
 # ANSI colours
 G = "\033[92m"
@@ -51,156 +55,148 @@ def fail(msg): print(f"  {R}✗{X} {msg}")
 def warn(msg): print(f"  {Y}⚠{X} {msg}")
 
 
-def prompt_float(label: str, default: float) -> float:
-    raw = input(f"  {M}{label}{X} [{D}{default}{X}]: ").strip()
-    if not raw:
-        return default
+# ---------------------------------------------------------------------------
+# Load CSV rows
+# ---------------------------------------------------------------------------
+def load_csv() -> list[dict]:
     try:
-        return float(raw)
-    except ValueError:
-        warn(f"Invalid number, using default: {default}")
-        return default
+        with CSV_PATH.open("r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+    except OSError as e:
+        fail(f"Cannot read CSV: {e}")
+        sys.exit(1)
 
 
-def prompt_int(label: str, default: int) -> int:
-    raw = input(f"  {M}{label}{X} [{D}{default}{X}]: ").strip()
-    if not raw:
-        return default
+# ---------------------------------------------------------------------------
+# Send one row to the ML model and display actual vs predicted
+# ---------------------------------------------------------------------------
+def test_row(row: dict, row_num: int, total: int) -> dict | None:
+    """Send environmental data from one CSV row to /predict.
+
+    Returns the API response dict, or None on failure.
+    """
+    # Extract environmental inputs (no energy)
+    lux_col = "Luminous_Intensity_Lux" if "Luminous_Intensity_Lux" in row else "Luminous_Intensity"
+    body = {
+        "temperature_c": float(row["Temperature_C"]),
+        "humidity": float(row["Humidity_%"]),
+        "lux": float(row[lux_col]),
+        "occupancy": int(float(row["Occupancy"])),
+    }
+
+    # Actual energy from CSV (ground truth)
+    actual_kw = float(row["Energy_kW"])
+    timestamp = row.get("Timestamp", "?")
+
     try:
-        return int(raw)
-    except ValueError:
-        warn(f"Invalid number, using default: {default}")
-        return default
+        t0 = time.time()
+        resp = requests.post(PREDICT_URL, json=body, timeout=15)
+        elapsed = time.time() - t0
+
+        if resp.status_code != 200:
+            fail(f"Row {row_num}: HTTP {resp.status_code}")
+            return None
+
+        data = resp.json()
+        predicted_kw = data.get("predictions", {}).get("hybrid_final_kwh", None)
+
+        if predicted_kw is not None:
+            diff = predicted_kw - actual_kw
+            pct = (abs(diff) / actual_kw * 100) if actual_kw != 0 else 0
+
+            print(
+                f"  [{row_num:>5}/{total}] {timestamp}  "
+                f"Actual: {B}{actual_kw:>7.4f}{X} kW | "
+                f"Predicted: {B}{M}{predicted_kw:>7.4f}{X} kW | "
+                f"Diff: {(G if abs(diff) < 0.5 else Y if abs(diff) < 1 else R)}"
+                f"{diff:>+7.4f}{X} kW "
+                f"({pct:>5.1f}%) "
+                f"{D}[{elapsed:.2f}s]{X}"
+            )
+        else:
+            warn(f"Row {row_num}: No prediction returned")
+
+        return data
+
+    except requests.ConnectionError:
+        fail(f"Cannot reach {API_BASE} — is test_prediction_api.py running?")
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Display prediction results
+# Interactive mode — step through CSV one row at a time
 # ---------------------------------------------------------------------------
-def display_result(data: dict):
-    sensors = data.get("live_sensors", {})
-    pred = data.get("predictions", {})
+def interactive_mode(rows: list[dict]):
+    banner("Interactive CSV Playback")
+    print(f"  CSV: {CSV_PATH.name} ({len(rows)} rows)")
+    print(f"  Press {B}Enter{X} for next row, {B}s N{X} to skip to row N, {B}q{X} to quit.\n")
 
-    print()
-    print(f"  {B}{C}─── Inputs Used ───{X}")
-    if sensors:
-        for k, v in sensors.items():
-            if isinstance(v, float):
-                print(f"    {k:>20s}: {B}{v:.2f}{X}")
-            else:
-                print(f"    {k:>20s}: {B}{v}{X}")
+    idx = 0
+    total = len(rows)
 
-    print()
-    print(f"  {B}{M}─── Model Predictions ───{X}")
-    if pred:
-        for k, v in pred.items():
-            label = k.replace("_", " ").title()
-            if isinstance(v, float):
-                print(f"    {label:>24s}: {B}{v:.4f}{X}")
-            else:
-                print(f"    {label:>24s}: {B}{v}{X}")
+    while idx < total:
+        cmd = input(f"  {D}[Row {idx + 1}]{X} Enter/s N/q: ").strip().lower()
 
-    ts = data.get("timestamp", "?")
-    print(f"\n  {D}Timestamp: {ts}{X}")
-    print()
-
-
-# ---------------------------------------------------------------------------
-# Interactive mode: user types sensor values, model predicts
-# ---------------------------------------------------------------------------
-def interactive_mode():
-    banner("Manual Prediction Mode")
-    print(f"  Type sensor values (press Enter for default).\n"
-          f"  Type {B}'q'{X} to quit, {B}'n'{X} to auto-step CSV.\n")
-
-    while True:
-        print(f"  {C}{'─' * 45}{X}")
-        cmd = input(f"  {B}[Enter]{X} manual input | {B}n{X} CSV next | {B}q{X} quit: ").strip().lower()
-
-        if cmd == 'q':
-            print(f"\n  {G}Bye!{X}\n")
+        if cmd == "q":
+            print(f"\n  {G}Done!{X}\n")
             break
 
-        if cmd == 'n':
+        if cmd.startswith("s "):
             try:
-                resp = requests.get(PREDICT_NEXT_URL, timeout=15)
-                data = resp.json()
-                if "error" in data:
-                    fail(data["error"])
-                    continue
-                ok(f"CSV predict_next → {data['predictions']['hybrid_final_kwh']} kW")
-                display_result(data)
-            except requests.ConnectionError:
-                fail(f"Cannot reach {API_BASE} — is the API running?")
-            continue
-
-        # Manual input
-        print(f"\n  {B}Enter your sensor values:{X}")
-        temp = prompt_float("Temperature (°C)", 28.0)
-        hum = prompt_float("Humidity (%)", 60.0)
-        lux = prompt_float("Luminous Intensity (Lux)", 400.0)
-        occ = prompt_int("Occupancy (0 = empty, 1 = occupied)", 1)
-        energy = prompt_float("Energy (kW)", 1.5)
-
-        body = {
-            "temperature_c": temp,
-            "humidity": hum,
-            "lux": lux,
-            "occupancy": occ,
-            "energy_kw": energy,
-        }
-
-        try:
-            t0 = time.time()
-            resp = requests.post(PREDICT_URL, json=body, timeout=15)
-            elapsed = time.time() - t0
-
-            if resp.status_code != 200:
-                fail(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                target = int(cmd.split()[1]) - 1
+                if 0 <= target < total:
+                    idx = target
+                    ok(f"Skipped to row {idx + 1}")
+                else:
+                    warn(f"Row must be between 1 and {total}")
+                continue
+            except (ValueError, IndexError):
+                warn("Usage: s <row_number>")
                 continue
 
-            data = resp.json()
-            ok(f"Prediction received in {elapsed:.3f}s")
-            display_result(data)
+        test_row(rows[idx], idx + 1, total)
+        idx += 1
 
-        except requests.ConnectionError:
-            fail(f"Cannot reach {API_BASE} — is test_prediction_api.py running?")
+    if idx >= total:
+        print(f"\n  {G}✓ Reached end of CSV.{X}\n")
 
 
 # ---------------------------------------------------------------------------
-# Auto mode: step through N CSV rows
+# Auto mode — run through N rows automatically
 # ---------------------------------------------------------------------------
-def auto_mode(n: int):
-    banner(f"Auto Mode — {n} CSV Predictions")
+def auto_mode(rows: list[dict], n: int):
+    count = len(rows) if n == 0 else min(n, len(rows))
+    banner(f"Auto Mode — {count} CSV Rows")
 
-    for i in range(1, n + 1):
-        try:
-            resp = requests.get(PREDICT_NEXT_URL, timeout=15)
-            data = resp.json()
-            if "error" in data:
-                fail(data["error"])
-                break
+    print(
+        f"  {'Row':>10}  {'Timestamp':<20}  "
+        f"{'Actual':>10}  {'Predicted':>10}  "
+        f"{'Diff':>10}  {'Error%':>7}"
+    )
+    print(f"  {'─' * 80}")
 
-            kw = data["predictions"]["hybrid_final_kwh"]
-            ts = data.get("timestamp", "?")
-            print(f"  [{i:>4}] {ts}  →  {B}{kw:.4f} kW{X}")
-
-        except requests.ConnectionError:
-            fail(f"Cannot reach {API_BASE}")
+    for i in range(count):
+        result = test_row(rows[i], i + 1, count)
+        if result is None:
             break
 
-    print()
+    print(f"\n  {G}✓ Finished {count} rows.{X}\n")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="ML Prediction API — Manual Test CLI")
-    parser.add_argument("--auto", type=int, metavar="N",
-                        help="Auto-step through N CSV predictions")
+    parser = argparse.ArgumentParser(
+        description="CSV Playback Test — Actual vs Predicted comparison"
+    )
+    parser.add_argument(
+        "--auto", type=int, metavar="N", default=None,
+        help="Auto-run N rows (0 = all rows)"
+    )
     args = parser.parse_args()
 
-    banner("Smart Grid ML — Manual Test CLI")
+    banner("Smart Grid ML — CSV Playback Test")
 
     # Quick connectivity check
     try:
@@ -211,10 +207,14 @@ def main():
         warn("Start it first: python test_prediction_api.py")
         sys.exit(1)
 
-    if args.auto:
-        auto_mode(args.auto)
+    rows = load_csv()
+    ok(f"Loaded {len(rows)} rows from {CSV_PATH.name}")
+    print()
+
+    if args.auto is not None:
+        auto_mode(rows, args.auto)
     else:
-        interactive_mode()
+        interactive_mode(rows)
 
 
 if __name__ == "__main__":

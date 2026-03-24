@@ -88,17 +88,17 @@ cd ML && python test.py
 
 ## Key Runtime Configuration
 
-Rule engine environment variables:
+Copy `example.env` to `.env` to configure all services. Key variables for the Rule Engine include:
 
-1. `RULE_EVAL_INTERVAL_SECONDS` default `120` (test)
-2. `MODE_A_MAX_W` default `2400`
-3. `MODE_B_MAX_W` default `1400`
-4. `MODE_C_MAX_W` default `800`
+1. `DECISION_INTERVAL_MINUTES` default `3` (test)
+2. `BATTERY_LAG_INTERVAL_SECONDS` default `30`
+3. `MAX_BATTERY_DROP_PERCENT` default `2`
+4. `MODE_A_MAX_KWH` default `2.4`
 
 Production interval example:
 
 ```bash
-export RULE_EVAL_INTERVAL_SECONDS=1800
+export DECISION_INTERVAL_MINUTES=5
 ```
 
 ## API Endpoints

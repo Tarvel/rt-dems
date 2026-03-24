@@ -170,19 +170,27 @@ Both test tools use HTTP only and do not connect to MQTT.
 
 ## 7. Configuration
 
-### 7.1 Rule engine environment variables
+### 7.1 Environment variables (`.env`)
+
+Copy the provided example file to configure all services:
 
 ```bash
-export RULE_EVAL_INTERVAL_SECONDS=120
-export MODE_A_MAX_W=2400
-export MODE_B_MAX_W=1400
-export MODE_C_MAX_W=800
+cp example.env .env
 ```
 
-Production interval example:
+Key variables for the rule engine:
 
 ```bash
-export RULE_EVAL_INTERVAL_SECONDS=1800
+DECISION_INTERVAL_MINUTES=3
+BATTERY_LAG_INTERVAL_SECONDS=30
+MAX_BATTERY_DROP_PERCENT=2
+MODE_A_MAX_KWH=2.4
+```
+
+Production interval example in `.env`:
+
+```bash
+DECISION_INTERVAL_MINUTES=5
 ```
 
 ### 7.2 Broker and topic defaults

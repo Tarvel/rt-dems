@@ -38,6 +38,7 @@ QoS: `1`
 1. `temperature` is kept for legacy compatibility.
 2. `temperature_c` is the preferred name.
 3. `energy_kwh` is energy for the sample interval.
+4. `voltage` and `current` are optional (the backend logger defaults them to `0.0` if missing).
 
 ## 3. ML Payload Contract (`room/ml/predictions`)
 
@@ -93,20 +94,35 @@ Published every logger flush cycle:
 
 ## 5. Relay State Payload (`room/relays/state`)
 
+This topic publishes two different types of payloads.
+
+**A. Full Rule Evaluation Payload (every 3 to 5 minutes)**
 ```json
 {
   "mode": "B",
   "relay_1": true,
   "relay_2": true,
   "relay_3": false,
-  "battery_lag_values": [77.3, 77.9, 78.4],
+  "battery_t_now": 77.3,
+  "battery_t1": 77.9,
+  "battery_t2": 78.4,
+  "battery_lag_drop": 1.1,
   "battery_lag_interval_seconds": 30,
   "reason": "Condition 3 - Battery drop within threshold -> switch to Mode B",
   "timestamp": "2026-03-17T12:00:00+00:00"
 }
 ```
 
-`battery_lag_values` is ordered as `[T-now, T-1, T-2]` and updates at rule evaluation cadence.
+**B. Lightweight Battery Lag Update (strictly every 30 seconds)**
+```json
+{
+  "type": "battery_lag_update",
+  "battery_t_now": 77.3,
+  "battery_t1": 77.9,
+  "battery_t2": 78.4,
+  "timestamp": "2026-03-17T12:00:15+00:00"
+}
+```
 
 ## 6. Rule Threshold Contract (kWh)
 
@@ -140,7 +156,6 @@ These endpoints are for manual testing only. Production predictions flow through
 | `POST` | `/predict` | Send manual sensor values, get prediction back |
 | `GET` | `/predict_next` | Step through CSV dataset, get next prediction |
 | `GET` | `/` | Serves test_dashboard.html |
-| `GET` | `/docs` | Auto-generated API documentation |
 
 ### POST /predict request body
 
@@ -169,6 +184,6 @@ The dashboard (`dashboard/index.html`) is MQTT-driven for realtime values.
 
 ### 9.2 Battery lag display behavior
 
-1. The dashboard battery-lag display reads `battery_lag_values` from `room/relays/state`.
-2. This makes lag updates follow `RULE_EVAL_INTERVAL_SECONDS` (rule-engine cadence).
-3. The values are shown as `T-now`, `T-1`, and `T-2` and are not fetched from the REST API.
+1. The dashboard battery-lag display reads `battery_t_now`, `battery_t1`, and `battery_t2` from `room/relays/state`.
+2. To ensure real-time responsiveness, the backend pushes a lightweight `type: "battery_lag_update"` message to this topic strictly every 30 seconds, entirely independent of the `DECISION_INTERVAL_MINUTES` cadence.
+3. The dashboard ignores the missing `mode` field during these updates and safely updates the lag visualization.

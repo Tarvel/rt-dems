@@ -457,7 +457,7 @@ The background workers (`mqtt_logger.py` and `rule_engine.py`) also set WAL mode
 
 1. **Starts up** and connects to the MQTT broker on `localhost:1883`.
 2. **Subscribes** to two topics: `room/sensors` and `room/ml/predictions`.
-3. **When a sensor message arrives:** It parses the JSON, validates that all required fields are present, and adds the data to an in-memory buffer (a Python list called `sensor_buffer`).
+3. **When a sensor message arrives:** It parses the JSON, validates that all required fields are present (`voltage` and `current` are optional and default to `0.0`), and adds the data to an in-memory buffer (a Python list called `sensor_buffer`).
 4. **When an ML message arrives:** Same thing — parses, validates, adds to `ml_buffer`.
 5. **Every 5 minutes** (300 seconds), a background timer triggers the **flush** operation:
    - It copies all readings from the buffer and clears the buffer (so new readings during the flush go into a fresh buffer).
@@ -569,33 +569,32 @@ If room is empty for ≥ 5 minutes → Mode C (done, skip everything else)
 
 **The question:** Is the battery stable or is it rapidly draining?
 
-**The sliding window:** We maintain a rolling list of the last 3 battery readings taken at 5-minute intervals. This is stored in a `deque` (double-ended queue) with a maximum length of 3:
+**The independent background loop:** We maintain three variables (`battery_t_now`, `battery_t1`, `battery_t2`) to represent the exact battery percentage over the last 90 seconds. To keep this updated in real-time, the rule engine runs a separate background thread that wakes up every 30 seconds (`BATTERY_LAG_INTERVAL_SECONDS`):
 
-```python
-battery_window = deque(maxlen=3)  # e.g., [85.0, 83.5, 82.0]
-```
+1. The old `battery_t1` moves to `battery_t2`.
+2. The old `battery_t_now` moves to `battery_t1`.
+3. The latest sensor battery reading becomes the new `battery_t_now`.
+4. It publishes a lightweight `battery_lag_update` to MQTT so the dashboard updates instantly relative to the rule engine's cadence.
 
-Every 5 minutes, we push the current battery reading into this window. Python's `deque(maxlen=3)` automatically drops the oldest reading when a 4th is added.
-
-So the window always looks like: `[T-10min, T-5min, T-Now]`
+So we always have a perfectly spaced 90-second view: `[T-2 (60s ago), T-1 (30s ago), T-Now]`
 
 **The drop calculation:**
 ```python
-drop = battery_window[0] - battery_window[-1]   # oldest minus newest
+lag_drop = battery_t2 - battery_t_now   # oldest minus newest
 ```
 
-Example: If the window is `[85.0, 83.5, 82.0]`, then `drop = 85.0 - 82.0 = 3.0%`.
+Example: If `battery_t2` is `85.0` and `battery_t_now` is `82.0`, then `lag_drop = 85.0 - 82.0 = 3.0%`.
 
-**The rule:** If the drop is **≤ 2%** (battery is stable — barely draining), we keep the current mode and skip all the rules below. The system does not switch modes unnecessarily.
+**The rule:** If the drop is **≤ 2%** (`MAX_BATTERY_DROP_PERCENT`), the battery is stable — barely draining. We keep the current mode and skip all the rules below. The system does not switch modes unnecessarily.
 
 **Why:** If the battery is barely changing, there is no emergency. Switching modes too often is bad — it would make lights flicker and devices restart constantly. This "stability lock" prevents unnecessary mode switching.
 
 ```
-If battery is stable (≤2% drop over 10 minutes) → Keep current mode (done, skip Phase 3)
+If battery is stable (≤2% drop over 90 seconds) → Keep current mode (done, skip Phase 3)
 If battery is draining fast (>2% drop) → Continue to Phase 3
 ```
 
-**Special case:** If we have fewer than 3 readings yet (system just started), we skip this phase and go directly to Phase 3. We assume the battery is not draining fast during startup.
+**Special case:** If we don't have all three readings yet (system just started), we skip this phase and go directly to Phase 3. We assume the battery is not draining fast during startup.
 
 #### Phase 3: Temperature Bias & Standard Flow
 

@@ -285,6 +285,33 @@
             <p><span id="predictedEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kW</span></p>
           </div>
         </div>
+
+        <div class="mt-3 grid grid-cols-2 gap-3 text-center">
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Actual (ML Window)</p>
+            <p><span id="mlActualEnergy" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kW</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Base GRU</p>
+            <p><span id="mlBaseGru" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">LGBM Correction</p>
+            <p><span id="mlLgbmCorrection" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Hybrid Final</p>
+            <p><span id="mlHybridFinal" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Safety Lower</p>
+            <p><span id="mlSafetyLower" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Safety Upper</p>
+            <p><span id="mlSafetyUpper" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+        </div>
       </div>
 
       <!-- ─── 4. ENVIRONMENT TELEMETRY ─────────────────────────────── -->
@@ -396,6 +423,12 @@
       batteryMini:$id('batteryMini'),
       measuredEnergyKwh:$id('measuredEnergyKwh'),
       predictedEnergyKwh:$id('predictedEnergyKwh'),
+      mlActualEnergy:$id('mlActualEnergy'),
+      mlBaseGru:$id('mlBaseGru'),
+      mlLgbmCorrection:$id('mlLgbmCorrection'),
+      mlHybridFinal:$id('mlHybridFinal'),
+      mlSafetyLower:$id('mlSafetyLower'),
+      mlSafetyUpper:$id('mlSafetyUpper'),
       battLag0:$id('battLag0'),
       battLag1:$id('battLag1'),
       battLag2:$id('battLag2'),
@@ -546,6 +579,41 @@
       if (predictedEnergy !== undefined) {
         dom.predictedEnergyKwh.textContent = parseFloat(predictedEnergy).toFixed(4);
       }
+
+      if (data.actual_energy_kw !== undefined && data.actual_energy_kw !== null) {
+        dom.mlActualEnergy.textContent = parseFloat(data.actual_energy_kw).toFixed(4);
+      }
+      if (data.base_gru_kwh !== undefined && data.base_gru_kwh !== null) {
+        dom.mlBaseGru.textContent = parseFloat(data.base_gru_kwh).toFixed(4);
+      }
+      if (data.lgbm_correction_kwh !== undefined && data.lgbm_correction_kwh !== null) {
+        dom.mlLgbmCorrection.textContent = parseFloat(data.lgbm_correction_kwh).toFixed(4);
+      }
+
+      let hybridFinal = data.hybrid_final_kwh;
+      if (hybridFinal === undefined || hybridFinal === null) {
+        hybridFinal = data.predicted_energy_kw;
+      }
+      if (hybridFinal !== undefined && hybridFinal !== null) {
+        dom.mlHybridFinal.textContent = parseFloat(hybridFinal).toFixed(4);
+      }
+
+      let safetyLower = data.safety_lower_bound;
+      if (safetyLower === undefined || safetyLower === null) {
+        safetyLower = data.lower_bound_energy_kw;
+      }
+      if (safetyLower !== undefined && safetyLower !== null) {
+        dom.mlSafetyLower.textContent = parseFloat(safetyLower).toFixed(4);
+      }
+
+      let safetyUpper = data.safety_upper_bound;
+      if (safetyUpper === undefined || safetyUpper === null) {
+        safetyUpper = data.upper_bound_energy_kw;
+      }
+      if (safetyUpper !== undefined && safetyUpper !== null) {
+        dom.mlSafetyUpper.textContent = parseFloat(safetyUpper).toFixed(4);
+      }
+
       flashCard(dom.cardMode);
       addLog(`Prediction → ${predictedEnergy !== undefined ? Number(predictedEnergy).toFixed(4) + ' kW' : 'n/a'}`);
     }

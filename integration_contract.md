@@ -49,6 +49,12 @@ Published by `ML/test_prediction_api.py` via MQTT when a sensor message arrives 
   "predicted_energy_kw": 1.224,
   "upper_bound_energy_kw": 1.374,
   "predicted_energy_range": 1.374,
+  "actual_energy_kw": 1.101,
+  "base_gru_kwh": 1.052,
+  "lgbm_correction_kwh": 0.172,
+  "hybrid_final_kwh": 1.224,
+  "safety_lower_bound": 1.087,
+  "safety_upper_bound": 1.374,
   "peak_demand": 2.4,
   "timestamp": "2026-03-22T10:55:00+00:00",
   "source": "fastapi-local-model"
@@ -62,9 +68,20 @@ Published by `ML/test_prediction_api.py` via MQTT when a sensor message arrives 
 | `predicted_energy_kw` | kW | Hybrid model prediction (GRU + LightGBM combined) |
 | `upper_bound_energy_kw` | kW | Upper 95% confidence bound from Bayesian uncertainty |
 | `predicted_energy_range` | kW | Same as upper bound, kept for backward compatibility |
+| `actual_energy_kw` | kW | Actual energy value of the evaluated row (if available) |
+| `base_gru_kwh` | kWh | Base GRU model output before LightGBM correction |
+| `lgbm_correction_kwh` | kWh | Residual correction added by LightGBM |
+| `hybrid_final_kwh` | kWh | Final hybrid output (`base_gru_kwh + lgbm_correction_kwh`) |
+| `safety_lower_bound` | kWh | Lower safety bound from uncertainty estimator |
+| `safety_upper_bound` | kWh | Upper safety bound from uncertainty estimator |
 | `peak_demand` | kW | Configurable threshold (default 2.4 kW) |
 | `timestamp` | ISO 8601 | When the prediction was made |
 | `source` | string | Always `"fastapi-local-model"` |
+
+### Extended fields compatibility note
+
+1. `predicted_energy_kw`, `predicted_energy_range`, and `peak_demand` remain the minimum stable fields for existing backend consumers.
+2. Additional fields (`actual_energy_kw`, `base_gru_kwh`, `lgbm_correction_kwh`, `hybrid_final_kwh`, `safety_lower_bound`, `safety_upper_bound`) are additive and intended for richer dashboards/analytics.
 
 ### Consumer lookup order
 
@@ -155,6 +172,8 @@ These endpoints are for manual testing only. Production predictions flow through
 |---|---|---|
 | `POST` | `/predict` | Send manual sensor values, get prediction back |
 | `GET` | `/predict_next` | Step through CSV dataset, get next prediction |
+| `GET` | `/csv_data` | Returns CSV file used by the ML test dashboard |
+| `POST` | `/reset` | Resets ML internal CSV index for simulator sync |
 | `GET` | `/` | Serves test_dashboard.html |
 
 ### POST /predict request body
@@ -165,9 +184,11 @@ These endpoints are for manual testing only. Production predictions flow through
   "humidity": 60.0,
   "lux": 400.0,
   "occupancy": 1,
-  "energy_kw": 1.5
+  "datetime_str": "2026-03-26T14:30"
 }
 ```
+
+`datetime_str` is optional; if omitted, the ML service uses current server time.
 
 All fields have defaults, so you can send an empty `{}` to test with default values.
 

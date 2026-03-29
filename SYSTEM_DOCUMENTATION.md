@@ -148,7 +148,7 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **What it is:** Another standalone Python script that runs in the background forever.
 
-**What it does:** Every 5 minutes, it looks at the latest sensor data and ML predictions, runs them through a set of rules (the 3-phase decision hierarchy), decides which mode (A, B, or C) to use, and physically switches the GPIO relays.
+**What it does:** Every `DECISION_INTERVAL_MINUTES` (default 1 for testing, 5 for production), it looks at the latest sensor data and ML predictions, runs them through a set of rules (the 3-phase decision hierarchy), decides which mode (A, B, or C) to use, and drives the GPIO pins to switch the relays. A separate background thread shifts the battery lag readings (T-now, T-1, T-2) every 30 seconds and publishes them to the dashboard in real-time.
 
 **Why it exists:** This is the core intelligence of the system. Without it, the sensors just collect data but nothing happens. The rule engine is what turns data into action.
 
@@ -194,9 +194,23 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **What it is:** A single HTML file with CSS and JavaScript embedded.
 
-**What it does:** Opens in any web browser and connects directly to the MQTT broker via WebSockets. It displays live sensor data, battery level, predicted load, and the current relay mode in real time — no page refresh needed.
+**What it does:** Opens in any web browser and connects directly to the MQTT broker via WebSockets. It displays live sensor data, battery level, predicted load, battery lag trend (T-now, T-1, T-2), and the current relay mode in real time — no page refresh needed.
 
 **Why it exists:** It gives a visual way to monitor the system. It also proves that the MQTT data flow works end-to-end.
+
+### 3.10 test_gpio_pins.py (GPIO Pin Tester)
+
+**File:** `simulation/test_gpio_pins.py`
+
+**What it is:** An interactive command-line tool for testing the GPIO relay pins without needing a breadboard, LEDs, or any external wiring.
+
+**What it does:** It creates `gpiozero.LED` objects on the same BCM pins the rule engine uses (17, 27, 22). When you type a mode command (`A`, `B`, or `C`), it sets those pins to HIGH or LOW exactly as the rule engine does during a real mode change. You can also toggle individual pins, force them ON/OFF, or blink them.
+
+**How verification works (Pi only):** On a Raspberry Pi, the tool drives real GPIO pins. You can confirm the physical states by:
+- Running `pinctrl get <pin>` from another terminal to read the hardware register.
+- Using a multimeter on the header pins (3.3V = HIGH, 0V = LOW).
+
+**On a dev machine:** It uses `gpiozero`'s `MockFactory` for virtual pins, letting you test the mode-switching logic without any hardware.
 
 ---
 
@@ -528,24 +542,50 @@ This is the most complex and important part of the system. It is the component t
 5. **After evaluation**, it switches the GPIO pins to match the chosen mode and logs the decision to the database.
 6. **On shutdown**, it forces Mode C (for safety) and cleans up GPIO before exiting.
 
-### The MockGPIO System
+### The gpiozero GPIO System (Pi 5 Compatible)
 
-**Problem:** When you develop on a laptop, there is no RPi.GPIO library and no GPIO pins. The code would crash.
+**The Problem with RPi.GPIO:** The original GPIO library for Raspberry Pi, `RPi.GPIO`, does **not work** on the Raspberry Pi 5. The Pi 5 uses a new GPIO chip called the **RP1**, which has a completely different architecture than the Pi 4's Broadcom SoC. Trying to import `RPi.GPIO` on a Pi 5 causes a `RuntimeError: Cannot determine SOC peripheral base address`.
 
-**Solution:** At the top of the file, we try to import `RPi.GPIO`. If it fails (because we are on a laptop), we create a `MockGPIO` class that has the same methods (`setmode`, `setup`, `output`, `cleanup`) but just prints messages to the console instead of controlling real pins.
+**Solution: gpiozero with auto-detection.** Instead of using `RPi.GPIO` directly, we use `gpiozero` — a higher-level GPIO library maintained by the Raspberry Pi Foundation. `gpiozero` uses a **pin factory** system that automatically selects the right low-level backend:
+
+| Platform | Pin Factory | How it works |
+|----------|-------------|-------------|
+| Pi 5 | `lgpio` | The **only** library that supports the RP1 chip. Must be installed: `sudo apt install python3-lgpio` |
+| Pi 4 | `RPi.GPIO` or `lgpio` | Either works. gpiozero prefers RPi.GPIO if installed |
+| Laptop/PC | `MockFactory` | Virtual pins (no hardware). Prints state changes to console |
+
+At the top of `rule_engine.py`, the auto-detection works like this:
 
 ```python
+from gpiozero import LED, Device
+
 try:
-    import RPi.GPIO as GPIO
-    ON_PI = True
-except (ImportError, RuntimeError):
-    class MockGPIO:
-        # ... fake versions of all GPIO methods that just print
-    GPIO = MockGPIO
+    # Probe: create a throwaway LED on pin 0 to test real GPIO access
+    _probe = LED(0, initial_value=False)
+    _probe.close()
+    ON_PI = True          # Real hardware available
+except Exception:
+    # No GPIO hardware — use virtual pins for development
+    from gpiozero.pins.mock import MockFactory
+    Device.pin_factory = MockFactory()
     ON_PI = False
 ```
 
-This means the same code runs on both a Raspberry Pi (controlling real relays) and a laptop (just printing what it would do).
+**Why this is better:** The same code runs everywhere — real Pi 5 with actual GPIO control, Pi 4, or a development laptop — with zero changes. The relay objects are `gpiozero.LED` instances:
+
+```python
+# gpio_init() creates LED objects for each relay pin
+relay_leds = {}
+for pin in (17, 27, 22):
+    relay_leds[pin] = LED(pin, initial_value=False)
+
+# set_relays() simply calls .on() and .off()
+def set_relays(relay_1, relay_2, relay_3):
+    for pin, state in ((17, relay_1), (27, relay_2), (22, relay_3)):
+        relay_leds[pin].on() if state else relay_leds[pin].off()
+```
+
+This means the same code runs on both a Raspberry Pi (controlling real relays) and a laptop (just tracking virtual states).
 
 ### The 3-Phase Rule Hierarchy — Complete Explanation
 
@@ -640,7 +680,7 @@ If `predicted_energy_range < peak_demand`, energy is tight.
 
 ### How GPIO is controlled
 
-After the rule engine decides a mode, it calls `apply_mode()`:
+After the rule engine decides a mode, it calls `apply_mode()`. Under the hood, this uses `gpiozero.LED` objects (not `RPi.GPIO` directly), which ensures compatibility with both Pi 4 and Pi 5:
 
 ```python
 def apply_mode(mode):
@@ -652,20 +692,19 @@ def apply_mode(mode):
         set_relays(True, False, False)   # P1 ON only
 
 def set_relays(relay_1, relay_2, relay_3):
-    GPIO.output(RELAY_PIN_1, GPIO.HIGH if relay_1 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_2, GPIO.HIGH if relay_2 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_3, GPIO.HIGH if relay_3 else GPIO.LOW)
+    for pin, state in ((RELAY_PIN_1, relay_1), ...):
+        relay_leds[pin].on() if state else relay_leds[pin].off()
 ```
 
-`GPIO.HIGH` sends a 3.3V signal to the pin → relay activates → connected device turns ON.
-`GPIO.LOW` sends 0V → relay deactivates → device turns OFF.
+When a `gpiozero.LED` is set to `.on()`, the pin factory drives that BCM pin to 3.3V (HIGH) → the relay module activates → the connected device turns ON.
+When set to `.off()`, the pin goes to 0V (LOW) → relay deactivates → device turns OFF.
 
 ### Complete decision flowchart
 
 ```
 START EVALUATION
     │
-    ├── Push battery reading into sliding window [T-10m, T-5m, T-Now]
+    ├── Shift battery lag: T-2←T-1, T-1←T-now, T-now←latest battery (every 30s)
     │
     ╔══ PHASE 1: OCCUPANCY OVERRIDE ══╗
     ║ Is the room empty for ≥5 min?   ║

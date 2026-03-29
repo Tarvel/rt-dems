@@ -27,55 +27,33 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
-# GPIO Setup — real RPi.GPIO or mock for development machines
+# GPIO Setup — gpiozero (Pi 5 compatible) or mock for dev machines
 # ---------------------------------------------------------------------------
+# gpiozero auto-selects the right backend:
+#   • Pi 5  → lgpio      (the only lib that works with the RP1 chip)
+#   • Pi 4  → RPi.GPIO   (if installed) or lgpio
+#   • Dev   → MockFactory (no hardware)
+# This replaces the old RPi.GPIO code which is NOT compatible with Pi 5.
+from gpiozero import LED, Device
+
 try:
-    import RPi.GPIO as GPIO
-
+    # If we're on a real Pi, the default pin factory will work.
+    # Try creating a throwaway LED to see if real GPIO is available.
+    _probe = LED(0, initial_value=False)
+    _probe.close()
     ON_PI = True
-except (ImportError, RuntimeError):
-
-    class MockGPIO:
-        """Lightweight GPIO mock so rule_engine.py runs on dev machines."""
-
-        BCM = "BCM"
-        OUT = "OUT"
-        HIGH = 1
-        LOW = 0
-        _pins: dict[int, int] = {}
-
-        @classmethod
-        def setmode(cls, mode):
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setmode(%s)",
-                mode,
-            )
-
-        @classmethod
-        def setwarnings(cls, flag):
-            pass
-
-        @classmethod
-        def setup(cls, pin, mode):
-            cls._pins[pin] = cls.LOW
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setup(pin=%d, mode=%s)", pin, mode
-            )
-
-        @classmethod
-        def output(cls, pin, state):
-            cls._pins[pin] = state
-            state_str = "HIGH (ON)" if state == cls.HIGH else "LOW (OFF)"
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: pin %d → %s", pin, state_str
-            )
-
-        @classmethod
-        def cleanup(cls):
-            logging.getLogger("rule_engine").info("MockGPIO: cleanup()")
-
-    GPIO = MockGPIO  # type: ignore[misc]
+except Exception:
+    # Not on a Pi — fall back to virtual pins for development.
+    from gpiozero.pins.mock import MockFactory
+    Device.pin_factory = MockFactory()
     ON_PI = False
+
+_log_boot = logging.getLogger("rule_engine")
+_log_boot.info("gpiozero pin factory: %s (ON_PI=%s)", Device.pin_factory, ON_PI)
+
+# Relay LED objects are created later (in gpio_init) after pin numbers are read
+# from env vars. We store them here so set_relays / cleanup can access them.
+relay_leds: dict[int, LED] = {}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -182,22 +160,37 @@ shutdown_event = threading.Event()
 # GPIO helpers
 # ---------------------------------------------------------------------------
 def gpio_init() -> None:
-    """Set up GPIO pins as outputs."""
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
+    """Create gpiozero LED objects for each relay pin."""
     for pin in (RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3):
-        GPIO.setup(pin, GPIO.OUT)
+        relay_leds[pin] = LED(pin, initial_value=False)
     log.info(
-        "GPIO initialized: P1=pin%d, P2=pin%d, P3=pin%d",
+        "GPIO initialized (gpiozero): P1=pin%d, P2=pin%d, P3=pin%d",
         RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3,
     )
 
 
 def set_relays(relay_1: bool, relay_2: bool, relay_3: bool) -> None:
-    """Drive the three relay GPIO pins."""
-    GPIO.output(RELAY_PIN_1, GPIO.HIGH if relay_1 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_2, GPIO.HIGH if relay_2 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_3, GPIO.HIGH if relay_3 else GPIO.LOW)
+    """Drive the three relay GPIO pins via gpiozero LEDs."""
+    for pin, state in (
+        (RELAY_PIN_1, relay_1),
+        (RELAY_PIN_2, relay_2),
+        (RELAY_PIN_3, relay_3),
+    ):
+        led = relay_leds[pin]
+        if state:
+            led.on()
+        else:
+            led.off()
+        log.debug("Pin %d → %s", pin, "ON" if state else "OFF")
+
+
+def gpio_cleanup() -> None:
+    """Close all gpiozero LED objects (releases GPIO pins)."""
+    for pin, led in relay_leds.items():
+        led.off()
+        led.close()
+    relay_leds.clear()
+    log.info("GPIO cleaned up (all pins released)")
 
 
 def apply_mode(mode: str) -> tuple[bool, bool, bool]:
@@ -630,7 +623,7 @@ def main() -> None:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     except OSError as exc:
         log.critical("Cannot connect to MQTT broker: %s", exc)
-        GPIO.cleanup()
+        gpio_cleanup()
         sys.exit(1)
 
     # Start evaluation thread
@@ -665,7 +658,7 @@ def main() -> None:
         False,
         "Shutdown — forced Mode C for safety",
     )
-    GPIO.cleanup()
+    gpio_cleanup()
     client.loop_stop()
     client.disconnect()
     log.info("Rule Engine stopped.")

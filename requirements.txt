@@ -16,6 +16,7 @@ fastapi==0.135.1
 flatbuffers==25.12.19
 gast==0.7.0
 google-pasta==0.2.0
+gpiozero==2.0.1
 grpcio==1.78.0
 h11==0.16.0
 h5py==3.14.0

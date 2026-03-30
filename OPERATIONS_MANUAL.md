@@ -43,6 +43,47 @@ sudo apt install -y python3-lgpio
 - **Pi 4** → uses `RPi.GPIO` if available, otherwise `lgpio`
 - **Dev machine** → uses `MockFactory` (virtual pins, no hardware)
 
+### 1.3 Important: venv and system GPIO packages
+
+`sudo apt install python3-lgpio` installs `lgpio` into the **system** Python. A standard `venv` isolates itself from system packages, so `gpiozero` inside the venv **cannot see** `lgpio`. This causes a silent fallback to virtual (mock) pins — the code runs without errors but does not drive real GPIO.
+
+To confirm the problem, activate your venv and run:
+
+```bash
+python -c "import lgpio; print('OK')"
+# If this says "ModuleNotFoundError" → lgpio is not visible in the venv
+```
+
+**Option A — Recreate venv with system package access (recommended):**
+
+```bash
+cd ~/Documents/project/PROJECT_CODE_U/rt-dems
+deactivate
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+This creates a new venv that can see all system-installed packages (including `lgpio`). Your pip packages are still installed into the venv, but system packages are also accessible.
+
+**Option B — Symlink lgpio into an existing venv:**
+
+If you do not want to recreate the venv, you can manually link the system `lgpio` module into it:
+
+```bash
+LGPIO_PATH=$(python3 -c "import lgpio; print(lgpio.__file__)" 2>/dev/null)
+ln -s "$(dirname $LGPIO_PATH)"/lgpio* venv/lib/python3.*/site-packages/
+```
+
+After either option, verify:
+
+```bash
+source venv/bin/activate
+python -c "import lgpio; print('lgpio OK')"
+python simulation/test_gpio_pins.py
+# Should now show: Hardware: REAL GPIO (Pi detected)
+```
+
 ## 2. Initial Setup
 
 ### 2.1 Django database

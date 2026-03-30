@@ -45,7 +45,7 @@ This is a group project split between three teams:
 
 ### What the Raspberry Pi does (our responsibility)
 
-The Raspberry Pi 4 acts as three things at once:
+The Raspberry Pi (4 or 5) acts as three things at once:
 
 1. **MQTT Broker** — It runs Mosquitto, which is the message post office. Every team sends and receives messages through it.
 2. **Database Server** — It stores the 5-minute averaged historical data in SQLite.
@@ -55,12 +55,13 @@ The Raspberry Pi 4 acts as three things at once:
 
 ## 2. The Hardware Layer
 
-### The Raspberry Pi 4
+### The Raspberry Pi
 
-- **Model:** Raspberry Pi 4 with 4GB RAM
+- **Model:** Raspberry Pi 4 (4GB RAM) or Raspberry Pi 5
 - **OS:** Raspberry Pi OS (Linux-based)
 - **Network:** Connected to the local network via Wi-Fi or Ethernet
 - **GPIO Pins:** 40 pins on the board that can send electrical signals to control external devices
+- **GPIO Library:** `gpiozero` with auto-detected backend (`lgpio` on Pi 5, `RPi.GPIO` or `lgpio` on Pi 4)
 
 ### The 3 Relays
 
@@ -172,9 +173,15 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 ### 3.7 data_simulator.py (Testing Tool)
 
-**What it is:** A Python script that generates fake sensor data.
+**What it is:** A Python script that plays back real sensor data from a CSV file.
 
-**What it does:** It reads from a CSV file of realistic sensor readings and publishes them to `room/sensors` via MQTT every 5 seconds. This triggers the ML service to produce predictions, which in turn triggers the rule engine and dashboard updates.
+**What it does:** It reads from `abs_smart_grid_dataset_20k.csv` and publishes each row as a sensor payload to `room/sensors` via MQTT. It is **prediction-paced** — after publishing a row, it waits for the ML service to publish a prediction before advancing to the next row. This means the simulation speed is determined by how fast the model responds, not a fixed timer.
+
+**What it publishes:** Each payload includes `temperature_c`, `temperature`, `humidity`, `lux`, `occupancy`, `energy_kw`, and `battery_level`. It does NOT publish `voltage` or `current` (these are optional and the logger defaults them to `0.0`).
+
+**Battery simulation:** Battery starts at 85% and drains 0.1% per row deterministically (no randomness), flooring at 20%.
+
+**Hard reset on boot:** Every time the simulator starts, it resets to Row 1 and calls the ML API's `/reset` endpoint to synchronise the model's CSV pointer.
 
 **Why it exists:** During development and testing, you do not have the hardware team's sensors connected. The simulator stands in for the real hardware.
 
@@ -227,7 +234,7 @@ STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto
                     STEP 4a: Logger                            STEP 4b: Rule Engine
                     receives & buffers                         receives & stores latest
                            │                                           │
-                           │ (every 5 min)                             │ (every 5 min)
+                            │ (every 5 min)                             │ (every DECISION_INTERVAL)
                            ▼                                           ▼
                     STEP 5a: Computes average               STEP 5b: Evaluates rules
                     and writes to SQLite                    and switches GPIO relays
@@ -244,7 +251,7 @@ STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto
 ### Detailed walkthrough:
 
 **Step 1: Physical measurement.**
-The hardware team's sensors physically measure the room's temperature, humidity, whether someone is present (occupancy), the mains voltage, the current draw, and the battery percentage.
+The hardware team's sensors physically measure the room's temperature, humidity, light level (lux), whether someone is present (occupancy), and the battery percentage. Voltage and current may also be included but are optional.
 
 **Step 2: Hardware team publishes to MQTT.**
 Their microcontroller (like an ESP32 or Arduino) packages the readings into a JSON message and publishes it to the MQTT topic `room/sensors`. Similarly, the ML team publishes energy predictions to `room/ml/predictions`.
@@ -269,13 +276,13 @@ A background timer fires every 5 minutes. When it fires, the logger:
 4. Writes one single row to the `energy_sensorlog` table in SQLite.
 5. Clears the buffer and starts collecting again.
 
-**Step 5b: Rule Engine evaluates rules (every 5 minutes).**
-A background timer fires every 5 minutes. When it fires, the rule engine:
+**Step 5b: Rule Engine evaluates rules (every `DECISION_INTERVAL_MINUTES`).**
+A background timer fires at the configured interval (default 1 minute for testing, 5 for production). When it fires, the rule engine:
 1. Reads the latest sensor values and ML predictions.
-2. Pushes the current battery reading into a rolling window of 3 readings.
+2. Reads the current battery lag values (T-now, T-1, T-2) which are maintained by a separate 30-second background loop.
 3. Runs the 3-phase rule hierarchy (occupancy override → battery stability lock → temperature bias + standard flow).
 4. Determines the correct mode (A, B, or C).
-5. Sends HIGH or LOW signals to the 3 GPIO pins to physically switch the relays.
+5. Drives the `gpiozero.LED` objects to physically switch the relays via GPIO.
 6. Writes the decision (mode, relay states, reason) to the `energy_relaystate` table.
 
 **Step 6a: Logger republishes averaged data.**
@@ -325,10 +332,10 @@ A topic is like an address. Here are all the topics in our system:
 
 | Topic | Who publishes | Who subscribes | What data | How often |
 |-------|--------------|----------------|-----------|-----------|
-| `room/sensors` | Hardware team (or simulator) | ML service, Logger, Rule Engine, Dashboard | Temperature, humidity, occupancy, voltage, current, battery | Every few seconds |
-| `room/ml/predictions` | ML service (`test_prediction_api.py`) | Logger, Rule Engine, Dashboard | Predicted energy (kW), upper bound, peak demand | Each time a sensor message arrives |
+| `room/sensors` | Hardware team (or simulator) | ML service, Logger, Rule Engine, Dashboard | Temperature, humidity, lux, occupancy, energy_kw, battery_level (voltage/current optional) | Every few seconds (prediction-paced when using simulator) |
+| `room/ml/predictions` | ML service (`test_prediction_api.py`) | Logger, Rule Engine, Dashboard | Predicted energy (kW), upper/lower bounds, peak demand, actual energy | Each time a sensor message arrives |
 | `room/data/averaged` | Logger | Dashboard | 5-minute averaged sensor data | Every 5 minutes |
-| `room/relays/state` | Rule Engine | Dashboard | Current mode (A/B/C), relay states, reason | Every 5 minutes |
+| `room/relays/state` | Rule Engine | Dashboard | Current mode (A/B/C), relay states, battery lag (T-now/T-1/T-2), reason | Full payload at decision interval + lightweight battery_lag_update every 30s |
 
 ### QoS (Quality of Service)
 
@@ -341,17 +348,25 @@ We use **QoS 1** for all messages. This means:
 
 Every MQTT message in our system carries a JSON payload. JSON is a text format that looks like a Python dictionary:
 
-**Sensor payload** (published by hardware team to `room/sensors`):
+**Sensor payload** (published by hardware team or simulator to `room/sensors`):
 ```json
 {
+    "timestamp": "2026-03-22T10:00:00",
+    "temperature_c": 27.5,
     "temperature": 27.5,
     "humidity": 62.3,
+    "lux": 450.2,
     "occupancy": 1,
-    "voltage": 220.1,
-    "current": 4.8,
+    "energy_kw": 1.2345,
     "battery_level": 73.5
 }
 ```
+
+**Notes on the sensor payload:**
+- `temperature_c` is the preferred field name. `temperature` is a legacy alias (the logger accepts either).
+- `lux` is the luminous intensity in lux — used by the ML model.
+- `energy_kw` is the actual measured energy — shown on the dashboard as "Actual Load".
+- `voltage` and `current` are **optional**. If missing, the logger defaults them to `0.0` for averaging.
 
 **ML payload** (published by `test_prediction_api.py` to `room/ml/predictions`):
 ```json
@@ -359,21 +374,43 @@ Every MQTT message in our system carries a JSON payload. JSON is a text format t
     "predicted_energy_kw": 1.224,
     "upper_bound_energy_kw": 1.374,
     "predicted_energy_range": 1.374,
+    "actual_energy_kw": 1.2345,
+    "base_gru_kwh": 1.18,
+    "lgbm_correction_kwh": 0.044,
+    "hybrid_final_kwh": 1.224,
+    "safety_lower_bound": 1.074,
+    "safety_upper_bound": 1.374,
     "peak_demand": 2.4,
     "timestamp": "2026-03-22T10:55:00+00:00",
     "source": "fastapi-local-model"
 }
 ```
 
-**Relay state payload** (published by rule engine to `room/relays/state`):
+**Relay state payload — full decision** (published by rule engine to `room/relays/state`):
 ```json
 {
     "mode": "B",
     "relay_1": true,
     "relay_2": true,
     "relay_3": false,
+    "battery_t_now": 73.5,
+    "battery_t1": 74.0,
+    "battery_t2": 74.5,
+    "battery_lag_drop": 1.0,
+    "battery_lag_interval_seconds": 30,
     "reason": "Phase 3 — Temperature Bias: 29.5°C > 28°C and battery 73.5% > 40% → Mode B",
     "timestamp": "2026-03-04T12:30:00+00:00"
+}
+```
+
+**Relay state payload — lightweight battery lag update** (published every 30 seconds):
+```json
+{
+    "type": "battery_lag_update",
+    "battery_t_now": 73.5,
+    "battery_t1": 74.0,
+    "battery_t2": 74.5,
+    "timestamp": "2026-03-04T12:30:15+00:00"
 }
 ```
 
@@ -512,14 +549,16 @@ def compute_sensor_average(readings):
         "temperature": sum(r["temperature"] for r in readings) / n,
         "humidity":    sum(r["humidity"]    for r in readings) / n,
         "occupancy":   1 if sum(r["occupancy"] for r in readings) / n >= 0.5 else 0,
-        "voltage":     sum(r["voltage"]     for r in readings) / n,
-        "current":     sum(r["current"]     for r in readings) / n,
+        "voltage":     sum(r.get("voltage", 0.0) for r in readings) / n,
+        "current":     sum(r.get("current", 0.0) for r in readings) / n,
         "battery_level": sum(r["battery_level"] for r in readings) / n,
     }
     return avg
 ```
 
 For occupancy, since it is 0 or 1, we use a majority vote: if the average is 0.5 or higher (meaning the room was occupied more than half the time), we record it as 1 (occupied).
+
+Note that `voltage` and `current` use `.get("field", 0.0)` because they are **optional** — the simulator and some hardware setups do not include them. If a reading is missing these fields, they default to `0.0` for averaging purposes.
 
 ### Why direct sqlite3 and not Django ORM?
 
@@ -535,12 +574,13 @@ This is the most complex and important part of the system. It is the component t
 
 ### What it does step by step:
 
-1. **Starts up**, initializes GPIO pins (sets them as outputs), and defaults to **Mode C** (the safest mode — only critical devices on).
+1. **Starts up**, creates `gpiozero.LED` objects for each relay pin (using `lgpio` on Pi 5 or `MockFactory` on dev machines), and defaults to **Mode C** (the safest mode — only critical devices on).
 2. **Connects to MQTT** and subscribes to `room/sensors` and `room/ml/predictions`.
 3. **When messages arrive**, it updates its internal state variables (`latest_sensor`, `latest_ml`).
-4. **Every 5 minutes**, it runs the full rule evaluation.
-5. **After evaluation**, it switches the GPIO pins to match the chosen mode and logs the decision to the database.
-6. **On shutdown**, it forces Mode C (for safety) and cleans up GPIO before exiting.
+4. **Every `DECISION_INTERVAL_MINUTES`** (default 1 minute for testing, 5 for production), it runs the full rule evaluation.
+5. **A separate 30-second background loop** shifts the battery lag readings (T-now, T-1, T-2) and publishes lightweight `battery_lag_update` payloads to the dashboard.
+6. **After evaluation**, it drives the `gpiozero.LED` objects to match the chosen mode and logs the decision to the database.
+7. **On shutdown**, it forces Mode C (for safety), closes all LED objects, and disconnects.
 
 ### The gpiozero GPIO System (Pi 5 Compatible)
 
@@ -885,15 +925,28 @@ For example, when a sensor message arrives with `temperature: 30.5`:
 
 ### What it does
 
-It reads from a CSV file of realistic sensor readings and publishes them to the MQTT broker every 5 seconds. It stands in for the hardware sensors during development. The ML service handles predictions separately — when it receives the simulator's sensor data via MQTT, it automatically runs the model and publishes predictions.
+It reads from `abs_smart_grid_dataset_20k.csv` row by row and publishes each row as a sensor payload to `room/sensors` via MQTT. The simulator is **prediction-paced** — after publishing a row, it waits for the ML service to publish a prediction on `room/ml/predictions` before advancing to the next row. This ensures the simulation stays synchronised with the model's internal CSV pointer.
 
 ### How it works
 
-The simulator reads rows from `abs_smart_grid_dataset_40k.csv` one at a time and publishes each row as a sensor payload to `room/sensors`. The data includes temperature, humidity, luminous intensity, occupancy, voltage, current, energy, and battery level.
+1. **On startup**, the simulator always resets to Row 1 of the CSV and calls the ML API's `POST /reset` endpoint so the model's CSV pointer is synchronised.
+2. It reads each row's `Temperature_C`, `Humidity_%`, `Luminous_Intensity_Lux` (or `Luminous_Intensity`), `Occupancy`, and `Energy_kW` directly from the CSV.
+3. Battery is simulated deterministically: starts at 85%, drops 0.1% per row, and floors at 20%. No randomness.
+4. Each row is published as a JSON payload to `room/sensors` with the fields: `timestamp`, `temperature_c`, `temperature`, `humidity`, `lux`, `occupancy`, `energy_kw`, and `battery_level`.
+5. After publishing, the simulator waits for a prediction to arrive on `room/ml/predictions` (with a configurable timeout, default 30 seconds).
+6. Once the prediction arrives (or the timeout expires), it enforces a minimum delay (`MIN_ROW_DELAY`, default 3 seconds) before moving to the next row.
 
-### Why publish every 5 seconds?
+### Why prediction-paced and not timer-based?
 
-In the real system, sensors might publish every few seconds. Publishing every 5 seconds during testing lets you see data flowing in the logger buffer quickly. The logger still waits 5 minutes before computing averages and writing to the database (you can reduce this to 30 seconds for faster testing).
+In earlier versions, the simulator published every 5 seconds on a fixed timer. This was changed because the ML model needs time to run inference (GRU + LightGBM + Bayesian uncertainty). If the simulator advances faster than the model can keep up, the internal CSV pointers drift apart and predictions no longer align with the published sensor data. By waiting for each prediction before advancing, we guarantee 1:1 alignment between sensor rows and predictions.
+
+### Key environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ML_API_BASE` | `http://127.0.0.1:5000` | URL of the ML service (for the `/reset` call) |
+| `PREDICTION_TIMEOUT` | `30` | Max seconds to wait for a prediction per row |
+| `MIN_ROW_DELAY` | `3` | Minimum seconds between rows (keeps output readable) |
 
 ---
 
@@ -1040,4 +1093,4 @@ This system is a complete **IoT edge computing** solution that:
 5. **Serves** historical data via a REST API
 6. **Displays** live data in a browser dashboard
 
-Everything runs on a single Raspberry Pi 4 with no cloud dependency, no external database server, and no complex infrastructure. The entire system is designed to be simple, reliable, and explainable.
+Everything runs on a single Raspberry Pi (4 or 5) with no cloud dependency, no external database server, and no complex infrastructure. The entire system is designed to be simple, reliable, and explainable.

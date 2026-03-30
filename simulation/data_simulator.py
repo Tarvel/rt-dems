@@ -49,11 +49,11 @@ ML_API_BASE = os.environ.get("ML_API_BASE", "http://127.0.0.1:5000")
 CSV_PATH = Path(__file__).resolve().parents[1] / "abs_smart_grid_dataset_20k.csv"
 
 # Maximum seconds to wait for a prediction before timing out.
-PREDICTION_TIMEOUT = int(os.environ.get("PREDICTION_TIMEOUT", 30))
+PREDICTION_TIMEOUT = int(os.environ.get("PREDICTION_TIMEOUT", 60))
 
 # Minimum seconds between rows — keeps output readable even when
 # the model responds instantly. Set to 0 to go as fast as possible.
-MIN_ROW_DELAY = float(os.environ.get("MIN_ROW_DELAY", 3))
+MIN_ROW_DELAY = float(os.environ.get("MIN_ROW_DELAY", 60))
 
 # ---------------------------------------------------------------------------
 # Synchronisation: wait for prediction before advancing
@@ -148,11 +148,14 @@ def main():
     print(f"  Timeout : {PREDICTION_TIMEOUT}s per row")
     print("=" * 60)
 
-    # ── HARD RESET: Fresh CSV load, always from Row 1 ──
+    # ── HARD RESET: Fresh CSV load ──
     global rows
-    rows = load_csv_rows()
+    all_rows = load_csv_rows()
+    # The ML model needs 24 rows of history. By starting the simulator at index 24 (row 25),
+    # the very first payload is synced with the ML model's initialized state.
+    rows = all_rows[24:] if len(all_rows) > 24 else all_rows
     step = 0  # Local counter, NOT cached anywhere
-    print(f"Loaded {len(rows)} rows from CSV dataset")
+    print(f"Loaded {len(all_rows)} rows. Simulator starting from row 25 (index 24).")
 
     try:
         client.connect(BROKER_ADDRESS, BROKER_PORT, keepalive=60)

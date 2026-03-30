@@ -27,33 +27,55 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
-# GPIO Setup — gpiozero (Pi 5 compatible) or mock for dev machines
+# GPIO Setup — real RPi.GPIO or mock for development machines
 # ---------------------------------------------------------------------------
-# gpiozero auto-selects the right backend:
-#   • Pi 5  → lgpio      (the only lib that works with the RP1 chip)
-#   • Pi 4  → RPi.GPIO   (if installed) or lgpio
-#   • Dev   → MockFactory (no hardware)
-# This replaces the old RPi.GPIO code which is NOT compatible with Pi 5.
-from gpiozero import LED, Device
-
 try:
-    # If we're on a real Pi, the default pin factory will work.
-    # Try creating a throwaway LED to see if real GPIO is available.
-    _probe = LED(0, initial_value=False)
-    _probe.close()
+    import RPi.GPIO as GPIO
+
     ON_PI = True
-except Exception:
-    # Not on a Pi — fall back to virtual pins for development.
-    from gpiozero.pins.mock import MockFactory
-    Device.pin_factory = MockFactory()
+except (ImportError, RuntimeError):
+
+    class MockGPIO:
+        """Lightweight GPIO mock so rule_engine.py runs on dev machines."""
+
+        BCM = "BCM"
+        OUT = "OUT"
+        HIGH = 1
+        LOW = 0
+        _pins: dict[int, int] = {}
+
+        @classmethod
+        def setmode(cls, mode):
+            logging.getLogger("rule_engine").info(
+                "MockGPIO: setmode(%s)",
+                mode,
+            )
+
+        @classmethod
+        def setwarnings(cls, flag):
+            pass
+
+        @classmethod
+        def setup(cls, pin, mode):
+            cls._pins[pin] = cls.LOW
+            logging.getLogger("rule_engine").info(
+                "MockGPIO: setup(pin=%d, mode=%s)", pin, mode
+            )
+
+        @classmethod
+        def output(cls, pin, state):
+            cls._pins[pin] = state
+            state_str = "HIGH (ON)" if state == cls.HIGH else "LOW (OFF)"
+            logging.getLogger("rule_engine").info(
+                "MockGPIO: pin %d → %s", pin, state_str
+            )
+
+        @classmethod
+        def cleanup(cls):
+            logging.getLogger("rule_engine").info("MockGPIO: cleanup()")
+
+    GPIO = MockGPIO  # type: ignore[misc]
     ON_PI = False
-
-_log_boot = logging.getLogger("rule_engine")
-_log_boot.info("gpiozero pin factory: %s (ON_PI=%s)", Device.pin_factory, ON_PI)
-
-# Relay LED objects are created later (in gpio_init) after pin numbers are read
-# from env vars. We store them here so set_relays / cleanup can access them.
-relay_leds: dict[int, LED] = {}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -88,9 +110,9 @@ DECISION_INTERVAL_MINUTES = int(
 )
 DECISION_INTERVAL_SECONDS = DECISION_INTERVAL_MINUTES * 60
 
-# Battery lag tracker: sample every 30 seconds (T-now, T-30s, T-60s).
+# Battery lag tracker: sample every 60 seconds (T-now, T-60s, T-120s).
 BATTERY_LAG_INTERVAL_SECONDS = int(
-    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 30)
+    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 60)
 )
 BATTERY_LAG_READINGS = 3
 
@@ -141,9 +163,9 @@ latest_sensor: dict = {}
 latest_ml: dict = {}
 
 # Rolling battery lag: three explicit time slots.
-# T-now  = current reading (updated every 30s)
-# T-1    = reading from 30 seconds ago
-# T-2    = reading from 60 seconds ago
+# T-now  = current reading (updated every 60s)
+# T-1    = reading from 60 seconds ago
+# T-2    = reading from 120 seconds ago
 # None means "no reading yet".
 battery_t_now: float | None = None
 battery_t1:    float | None = None
@@ -160,37 +182,22 @@ shutdown_event = threading.Event()
 # GPIO helpers
 # ---------------------------------------------------------------------------
 def gpio_init() -> None:
-    """Create gpiozero LED objects for each relay pin."""
+    """Set up GPIO pins as outputs."""
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
     for pin in (RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3):
-        relay_leds[pin] = LED(pin, initial_value=False)
+        GPIO.setup(pin, GPIO.OUT)
     log.info(
-        "GPIO initialized (gpiozero): P1=pin%d, P2=pin%d, P3=pin%d",
+        "GPIO initialized: P1=pin%d, P2=pin%d, P3=pin%d",
         RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3,
     )
 
 
 def set_relays(relay_1: bool, relay_2: bool, relay_3: bool) -> None:
-    """Drive the three relay GPIO pins via gpiozero LEDs."""
-    for pin, state in (
-        (RELAY_PIN_1, relay_1),
-        (RELAY_PIN_2, relay_2),
-        (RELAY_PIN_3, relay_3),
-    ):
-        led = relay_leds[pin]
-        if state:
-            led.on()
-        else:
-            led.off()
-        log.debug("Pin %d → %s", pin, "ON" if state else "OFF")
-
-
-def gpio_cleanup() -> None:
-    """Close all gpiozero LED objects (releases GPIO pins)."""
-    for pin, led in relay_leds.items():
-        led.off()
-        led.close()
-    relay_leds.clear()
-    log.info("GPIO cleaned up (all pins released)")
+    """Drive the three relay GPIO pins."""
+    GPIO.output(RELAY_PIN_1, GPIO.HIGH if relay_1 else GPIO.LOW)
+    GPIO.output(RELAY_PIN_2, GPIO.HIGH if relay_2 else GPIO.LOW)
+    GPIO.output(RELAY_PIN_3, GPIO.HIGH if relay_3 else GPIO.LOW)
 
 
 def apply_mode(mode: str) -> tuple[bool, bool, bool]:
@@ -460,7 +467,7 @@ def run_evaluation(client: mqtt.Client) -> None:
         ),
         "battery_lag_interval_seconds": BATTERY_LAG_INTERVAL_SECONDS,
         "reason": reason,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
     }
     client.publish(TOPIC_RELAY_STATE, json.dumps(relay_payload), qos=1)
 
@@ -474,9 +481,9 @@ def evaluation_loop(client: mqtt.Client) -> None:
 
 
 def battery_lag_loop(client: mqtt.Client) -> None:
-    """Background thread: shift battery readings every 30 seconds.
+    """Background thread: shift battery readings every 60 seconds.
 
-    Every 30s:  T-1 → T-2,  T-now → T-1,  fresh reading → T-now
+    Every 60s:  T-1 → T-2,  T-now → T-1,  fresh reading → T-now
     """
     global battery_t_now, battery_t1, battery_t2
 
@@ -492,7 +499,7 @@ def battery_lag_loop(client: mqtt.Client) -> None:
                 continue
             fresh = float(fresh)
 
-            # ── 30-second shift ──
+            # ── 60-second shift ──
             battery_t2    = battery_t1       # old T-1 becomes T-2
             battery_t1    = battery_t_now    # old T-now becomes T-1
             battery_t_now = fresh            # fresh reading is T-now
@@ -510,7 +517,7 @@ def battery_lag_loop(client: mqtt.Client) -> None:
                 "battery_t_now": round(float(battery_t_now), 1) if battery_t_now is not None else None,
                 "battery_t1":    round(float(battery_t1), 1) if battery_t1 is not None else None,
                 "battery_t2":    round(float(battery_t2), 1) if battery_t2 is not None else None,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
             }
             # We use the same topic the dashboard already listens to for state,
             # but the dashboard must be updated to handle this "type" of payload.
@@ -623,7 +630,7 @@ def main() -> None:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     except OSError as exc:
         log.critical("Cannot connect to MQTT broker: %s", exc)
-        gpio_cleanup()
+        GPIO.cleanup()
         sys.exit(1)
 
     # Start evaluation thread
@@ -658,7 +665,7 @@ def main() -> None:
         False,
         "Shutdown — forced Mode C for safety",
     )
-    gpio_cleanup()
+    GPIO.cleanup()
     client.loop_stop()
     client.disconnect()
     log.info("Rule Engine stopped.")

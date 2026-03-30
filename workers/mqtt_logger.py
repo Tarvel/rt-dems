@@ -165,7 +165,12 @@ def flush_to_db(client: mqtt.Client) -> None:
         conn = get_db_connection()
         ensure_tables(conn)
 
-        now = datetime.now(timezone.utc).isoformat()
+        # Use the timestamp from the most recent sensor reading in the buffer
+        # This ensures simulation dates (e.g. 2022) are preserved in the DB/Averaged topic
+        if sensors_snapshot:
+            now = sensors_snapshot[-1].get("timestamp", datetime.now(timezone.utc).isoformat())
+        else:
+            now = datetime.now(timezone.utc).isoformat()
 
         if sensor_avg:
             conn.execute(

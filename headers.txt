@@ -1,0 +1,12 @@
+Date: Fri, 27 Mar 2026 05:25:50 GMT
+Server: WSGIServer/0.2 CPython/3.13.4
+content-length: 0
+Content-Type: text/html; charset=utf-8
+Vary: origin
+access-control-allow-origin: *
+access-control-allow-headers: accept, authorization, content-type, user-agent, x-csrftoken, x-requested-with
+access-control-allow-methods: DELETE, GET, OPTIONS, PATCH, POST, PUT
+access-control-max-age: 86400
+X-Content-Type-Options: nosniff
+Referrer-Policy: same-origin
+Cross-Origin-Opener-Policy: same-origin

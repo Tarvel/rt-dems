@@ -12,10 +12,17 @@ class MqttService {
   final String clientIdentifier;
   late MqttClient client;
 
+  // room/data/averaged — 5-minute averaged sensor telemetry
   final _dataStreamController =
       StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get dataStream => _dataStreamController.stream;
 
+  // room/ml/predictions — real-time ML prediction payloads
+  final _mlStreamController =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get mlStream => _mlStreamController.stream;
+
+  // room/relays/state — relay decisions and battery lag updates
   final _relayStreamController =
       StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get relayStream => _relayStreamController.stream;
@@ -62,8 +69,14 @@ class MqttService {
 
       try {
         final data = json.decode(pt);
-        if (c[0].topic == 'room/data/averaged') {
+        // room/sensors — raw sensor telemetry every ~5 s (carries energy_kwh for real-time load)
+        // room/data/averaged — 5-minute averages from mqtt_logger
+        // Both go into dataStream; _updateSensorState handles both gracefully.
+        if (c[0].topic == 'room/sensors' ||
+            c[0].topic == 'room/data/averaged') {
           _dataStreamController.add(data);
+        } else if (c[0].topic == 'room/ml/predictions') {
+          _mlStreamController.add(data);
         } else if (c[0].topic == 'room/relays/state') {
           _relayStreamController.add(data);
         }
@@ -72,7 +85,9 @@ class MqttService {
       }
     });
 
+    client.subscribe('room/sensors', MqttQos.atLeastOnce);
     client.subscribe('room/data/averaged', MqttQos.atLeastOnce);
+    client.subscribe('room/ml/predictions', MqttQos.atLeastOnce);
     client.subscribe('room/relays/state', MqttQos.atLeastOnce);
   }
 
@@ -91,6 +106,7 @@ class MqttService {
   void dispose() {
     client.disconnect();
     _dataStreamController.close();
+    _mlStreamController.close();
     _relayStreamController.close();
   }
 }

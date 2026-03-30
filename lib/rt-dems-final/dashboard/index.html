@@ -1,0 +1,791 @@
+<html lang="en" class="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Room — Energy Dashboard</title>
+  <meta name="description" content="Real-time energy management dashboard for Smart Room system" />
+
+  <!-- Tailwind CSS (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+          colors: {
+            surface: { 50: '#f8fafc', 100: '#f1f5f9', 200: '#e2e8f0', 300: '#cbd5e1' },
+            accent:  { 400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed' },
+          },
+          keyframes: {
+            pulseGlow: {
+              '0%, 100%': { boxShadow: '0 0 8px 0 rgba(139,92,246,0.2)' },
+              '50%':      { boxShadow: '0 0 20px 4px rgba(139,92,246,0.4)' },
+            },
+            fadeUp: {
+              from: { opacity: 0, transform: 'translateY(12px)' },
+              to:   { opacity: 1, transform: 'translateY(0)' },
+            },
+            barGrow: {
+              from: { width: '0%' },
+            },
+          },
+          animation: {
+            pulseGlow: 'pulseGlow 2.5s ease-in-out infinite',
+            fadeUp:    'fadeUp .5s ease-out both',
+            barGrow:   'barGrow 1s ease-out both',
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- Google Font — Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- FontAwesome 6 (CDN) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+
+  <!-- Paho MQTT (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js"></script>
+
+  <style>
+    /* ── Base reset & global ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Inter', system-ui, sans-serif;
+      background: #f8fafc;
+      color: #334155;
+      min-height: 100vh;
+    }
+
+    /* ── Glass card ──────────────────────────────────────────────── */
+    .glass {
+      background: rgba(255, 255, 255, 0.85);
+      backdrop-filter: blur(16px) saturate(160%);
+      -webkit-backdrop-filter: blur(16px) saturate(160%);
+      border: 1px solid rgba(255,255,255,0.8);
+      border-radius: 1rem;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+      transition: transform .25s ease, box-shadow .25s ease;
+    }
+    .glass:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 12px 24px -6px rgba(139,92,246,0.15), 0 4px 8px -4px rgba(0,0,0,0.05);
+    }
+
+    /* ── Animated background mesh ────────────────────────────────── */
+    .bg-mesh {
+      position: fixed; inset: 0; z-index: -1;
+      background:
+        radial-gradient(ellipse 60% 50% at 10% 20%, rgba(139,92,246,0.15) 0%, transparent 60%),
+        radial-gradient(ellipse 50% 40% at 85% 75%, rgba(56,189,248,0.15) 0%, transparent 55%),
+        radial-gradient(ellipse 40% 55% at 50% 50%, rgba(236,72,153,0.12) 0%, transparent 50%);
+    }
+
+    /* ── Battery bar ─────────────────────────────────────────────── */
+    .battery-bar {
+      height: 14px;
+      border-radius: 9999px;
+      transition: width .8s cubic-bezier(.4,0,.2,1), background-color .4s ease;
+    }
+
+    /* ── Status dot ──────────────────────────────────────────────── */
+    .dot {
+      width: 12px; height: 12px; border-radius: 9999px;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+    .dot-green  { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.4); }
+    .dot-grey   { background: #cbd5e1; }
+
+    /* ── Connection badge ────────────────────────────────────────── */
+    .conn-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 14px; border-radius: 9999px; font-size: .75rem; font-weight: 600;
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid rgba(0,0,0,0.05);
+      backdrop-filter: blur(8px);
+      transition: background .3s ease, color .3s ease;
+    }
+    .conn-badge.connected    { background: rgba(220,252,231,0.8); color: #166534; border-color: rgba(34,197,94,0.2); }
+    .conn-badge.disconnected { background: rgba(254,226,226,0.8); color: #991b1b; border-color: rgba(239,68,68,0.2); }
+    .conn-badge.connecting   { background: rgba(254,249,195,0.8); color: #854d0e; border-color: rgba(234,179,8,0.2); }
+
+    /* ── Mode badges ─────────────────────────────────────────────── */
+    .mode-badge { padding: 6px 18px; border-radius: 0.5rem; font-weight: 700; font-size: .85rem; letter-spacing: .03em; }
+
+    /* ── Fade-in stagger ─────────────────────────────────────────── */
+    .stagger-1 { animation-delay: .1s; }
+    .stagger-2 { animation-delay: .2s; }
+    .stagger-3 { animation-delay: .3s; }
+    .stagger-4 { animation-delay: .4s; }
+
+    /* ── Subtle flash on data update ─────────────────────────────── */
+    @keyframes dataFlash {
+      0%   { background: rgba(139,92,246,0.1); }
+      100% { background: rgba(255,255,255,0.85); }
+    }
+    .data-flash { animation: dataFlash .6s ease-out; }
+
+    /* ── Scrollbar ───────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.3); border-radius: 3px; }
+  </style>
+</head>
+
+<body>
+  <div class="bg-mesh"></div>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       HEADER
+       ════════════════════════════════════════════════════════════════ -->
+  <header class="sticky top-0 z-30 backdrop-blur-md bg-white/70 border-b border-slate-200/50 shadow-sm">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <!-- Logo / Title -->
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center shadow-lg shadow-violet-500/20">
+          <i class="fa-solid fa-bolt text-white text-sm"></i>
+        </div>
+        <div>
+          <h1 class="text-base font-bold tracking-tight text-slate-900 leading-none">Smart Room</h1>
+          <p class="text-[11px] text-slate-500 font-medium">Energy Management Dashboard</p>
+        </div>
+      </div>
+
+      <!-- Connection Badge -->
+      <div id="connBadge" class="conn-badge disconnected">
+        <span class="dot dot-grey" id="connDot" style="width:8px;height:8px;"></span>
+        <span id="connText">Disconnected</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       MAIN DASHBOARD
+       ════════════════════════════════════════════════════════════════ -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+    <!-- Time banner -->
+    <div class="flex items-center justify-between mb-6">
+      <p class="text-sm text-slate-500"><i class="fa-regular fa-clock mr-1"></i> <span id="liveTime" class="font-medium text-slate-700">--:--:--</span></p>
+      <p class="text-xs text-slate-400">Updates via MQTT &middot; <code class="text-violet-600 bg-violet-50 px-1.5 py-0.5 rounded border border-violet-100">ws://127.0.0.1:9001</code></p>
+    </div>
+
+    <!-- ── Card Grid ─────────────────────────────────────────────── -->
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+
+      <!-- ─── 1. ROOM STATUS ──────────────────────────────────────── -->
+      <div class="glass p-6 animate-fadeUp stagger-1" id="cardRoom">
+        <div class="flex items-center gap-2 mb-5">
+          <div class="w-8 h-8 rounded-lg bg-sky-100 flex items-center justify-center">
+            <i class="fa-solid fa-house-chimney text-sky-600 text-sm"></i>
+          </div>
+          <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wider">Room Status</h2>
+        </div>
+
+        <!-- Temperature -->
+        <div class="mb-5">
+          <p class="text-xs text-slate-500 mb-1 font-medium">Temperature</p>
+          <div class="flex items-end gap-1">
+            <span id="tempValue" class="text-4xl font-extrabold tracking-tight text-slate-800">--</span>
+            <span class="text-lg font-semibold text-slate-500 mb-1">°C</span>
+          </div>
+          <div class="h-1.5 w-full rounded-full bg-slate-100 mt-2 overflow-hidden shadow-inner">
+            <div id="tempBar" class="h-full rounded-full bg-sky-500 transition-all duration-700" style="width:0%"></div>
+          </div>
+        </div>
+
+        <!-- Occupancy -->
+        <div class="flex items-center gap-3 p-3 rounded-lg bg-slate-50 border border-slate-100">
+          <span class="dot dot-grey shadow-sm" id="occDot"></span>
+          <span id="occText" class="text-sm font-semibold text-slate-500">Waiting for data…</span>
+        </div>
+      </div>
+
+      <!-- ─── 2. BATTERY STATUS ───────────────────────────────────── -->
+      <div class="glass p-6 animate-fadeUp stagger-2" id="cardBattery">
+        <div class="flex items-center gap-2 mb-5">
+          <div class="w-8 h-8 rounded-lg bg-emerald-100 flex items-center justify-center">
+            <i class="fa-solid fa-battery-three-quarters text-emerald-600 text-sm"></i>
+          </div>
+          <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wider">Battery Status</h2>
+        </div>
+
+        <div class="text-center mb-4">
+          <span id="battValue" class="text-5xl font-extrabold tracking-tighter text-slate-800">--</span>
+          <span class="text-2xl font-bold text-slate-400">%</span>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="w-full rounded-full bg-slate-100 overflow-hidden p-[3px] shadow-inner">
+          <div id="battBar" class="battery-bar bg-emerald-500 shadow-sm" style="width:0%"></div>
+        </div>
+        <p id="battLabel" class="text-xs text-slate-500 mt-2 text-center font-medium">Waiting for data…</p>
+
+        <div class="mt-4 rounded-lg bg-slate-50 border border-slate-100 p-3">
+          <p class="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-2 text-center">Battery Lag (Most Recent 3)</p>
+          <div id="batteryLagList" class="grid grid-cols-3 gap-2 text-center">
+            <div class="rounded-md bg-white border border-slate-100 p-2 shadow-sm">
+              <p class="text-[10px] uppercase font-semibold text-slate-400">T-now</p>
+              <p id="battLag0" class="text-sm font-bold text-slate-700">--</p>
+            </div>
+            <div class="rounded-md bg-white border border-slate-100 p-2 shadow-sm">
+              <p class="text-[10px] uppercase font-semibold text-slate-400">T-1</p>
+              <p id="battLag1" class="text-sm font-bold text-slate-700">--</p>
+            </div>
+            <div class="rounded-md bg-white border border-slate-100 p-2 shadow-sm">
+              <p class="text-[10px] uppercase font-semibold text-slate-400">T-2</p>
+              <p id="battLag2" class="text-sm font-bold text-slate-700">--</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── 3. ACTIVE LOAD LEVEL ────────────────────────────────── -->
+      <div class="glass p-6 animate-fadeUp stagger-3 md:col-span-2 xl:col-span-1" id="cardMode">
+        <div class="flex items-center gap-2 mb-5">
+          <div class="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center">
+            <i class="fa-solid fa-gauge-high text-amber-600 text-sm"></i>
+          </div>
+          <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wider">Active Load Level</h2>
+        </div>
+
+        <div id="modeDisplay" class="text-center py-6">
+          <div class="inline-block mode-badge bg-slate-100 text-slate-500 border border-slate-200 mb-3 shadow-sm">
+            <i class="fa-solid fa-spinner fa-spin mr-1"></i> Waiting…
+          </div>
+          <p class="text-sm text-slate-500 font-medium">No mode data received yet</p>
+        </div>
+
+        <!-- Relay indicator pills -->
+        <div class="flex items-center justify-center gap-4 mt-2">
+          <div class="flex items-center gap-1.5 text-xs font-bold text-slate-500 bg-slate-50 px-2.5 py-1 rounded-full border border-slate-100 shadow-sm">
+            <span id="r1Dot" class="dot dot-grey shadow-sm" style="width:10px;height:10px;"></span> P1
+          </div>
+          <div class="flex items-center gap-1.5 text-xs font-bold text-slate-500 bg-slate-50 px-2.5 py-1 rounded-full border border-slate-100 shadow-sm">
+            <span id="r2Dot" class="dot dot-grey shadow-sm" style="width:10px;height:10px;"></span> P2
+          </div>
+          <div class="flex items-center gap-1.5 text-xs font-bold text-slate-500 bg-slate-50 px-2.5 py-1 rounded-full border border-slate-100 shadow-sm">
+            <span id="r3Dot" class="dot dot-grey shadow-sm" style="width:10px;height:10px;"></span> P3
+          </div>
+        </div>
+
+        <div class="mt-6 grid grid-cols-2 gap-3 text-center">
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Actual Load</p>
+            <p><span id="measuredEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kW</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Predicted Load</p>
+            <p><span id="predictedEnergyKwh" class="text-xl font-extrabold text-slate-800">--</span> <span class="text-xs font-bold text-slate-400">kW</span></p>
+          </div>
+        </div>
+
+        <div class="mt-3 grid grid-cols-2 gap-3 text-center">
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Actual (ML Window)</p>
+            <p><span id="mlActualEnergy" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kW</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Base GRU</p>
+            <p><span id="mlBaseGru" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">LGBM Correction</p>
+            <p><span id="mlLgbmCorrection" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Hybrid Final</p>
+            <p><span id="mlHybridFinal" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Safety Lower</p>
+            <p><span id="mlSafetyLower" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+          <div class="rounded-lg bg-slate-50 border border-slate-100 p-3 shadow-sm">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Safety Upper</p>
+            <p><span id="mlSafetyUpper" class="text-base font-extrabold text-slate-700">--</span> <span class="text-[10px] font-bold text-slate-400">kWh</span></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── 4. ENVIRONMENT TELEMETRY ─────────────────────────────── -->
+      <div class="glass p-6 animate-fadeUp stagger-4 md:col-span-2 xl:col-span-3" id="cardEnvironment">
+        <div class="flex items-center gap-2 mb-5">
+          <div class="w-8 h-8 rounded-lg bg-cyan-100 flex items-center justify-center">
+            <i class="fa-solid fa-chart-line text-cyan-600 text-sm"></i>
+          </div>
+          <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wider">Environmental Telemetry</h2>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Humidity</p>
+            <p><span id="humidityValue" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">%</span></p>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Light</p>
+            <p><span id="luxValue" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">lux</span></p>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Voltage</p>
+            <p><span id="voltageValue" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">V</span></p>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Current</p>
+            <p><span id="currentValue" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">A</span></p>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Occupancy</p>
+            <p><span id="occupancyValue" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">state</span></p>
+          </div>
+          <div class="rounded-lg bg-white border border-slate-100 p-3 shadow-sm text-center">
+            <p class="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1">Battery</p>
+            <p><span id="batteryMini" class="text-xl font-bold text-slate-700">--</span> <span class="text-xs font-bold text-slate-400">%</span></p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Activity Log ──────────────────────────────────────────── -->
+    <div class="glass p-6 mt-6 animate-fadeUp stagger-4">
+      <div class="flex items-center gap-2 mb-4">
+        <div class="w-8 h-8 rounded-lg bg-violet-100 flex items-center justify-center">
+          <i class="fa-solid fa-list-timeline text-violet-600 text-sm"></i>
+        </div>
+        <h2 class="text-sm font-semibold text-slate-700 uppercase tracking-wider">Live Activity Log</h2>
+      </div>
+      <div id="activityLog" class="space-y-1.5 max-h-48 overflow-y-auto text-xs font-mono text-slate-600 bg-slate-50 p-4 rounded-lg border border-slate-100 shadow-inner">
+        <p class="text-slate-400 italic">Waiting for MQTT messages…</p>
+      </div>
+    </div>
+  </main>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       FOOTER
+       ════════════════════════════════════════════════════════════════ -->
+  <footer class="text-center py-6 text-xs text-slate-500 font-medium">
+    Smart Room Energy Management System &middot; Final Year Project &middot; <span id="footerYear">2026</span>
+  </footer>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       JAVASCRIPT — MQTT + DOM Updates
+       ════════════════════════════════════════════════════════════════ -->
+  <script>
+    // ── Configuration ────────────────────────────────────────────────
+    const MQTT_HOST    = window.location.hostname || '127.0.0.1';
+    const MQTT_PORT    = 9001;                   // WebSocket port
+    const CLIENT_ID    = 'dashboard-' + Math.random().toString(16).slice(2, 8);
+
+    const TOPIC_SENSORS = 'room/sensors';
+    const TOPIC_AVERAGED= 'room/data/averaged';
+    const TOPIC_ML      = 'room/ml/predictions';
+    const TOPIC_MODE    = 'room/relays/state';
+
+    // Energy conversions
+    const SENSOR_INTERVAL_MINUTES = 1;
+    const DECISION_INTERVAL_MINUTES = 3;
+
+    // ── DOM References ───────────────────────────────────────────────
+    const $id = (id) => document.getElementById(id);
+
+    const dom = {
+      connBadge:  $id('connBadge'),
+      connDot:    $id('connDot'),
+      connText:   $id('connText'),
+      liveTime:   $id('liveTime'),
+      tempValue:  $id('tempValue'),
+      tempBar:    $id('tempBar'),
+      occDot:     $id('occDot'),
+      occText:    $id('occText'),
+      battValue:  $id('battValue'),
+      battBar:    $id('battBar'),
+      battLabel:  $id('battLabel'),
+      modeDisplay:$id('modeDisplay'),
+      r1Dot:      $id('r1Dot'),
+      r2Dot:      $id('r2Dot'),
+      r3Dot:      $id('r3Dot'),
+      cardRoom:   $id('cardRoom'),
+      cardBattery:$id('cardBattery'),
+      cardMode:   $id('cardMode'),
+      cardEnvironment:$id('cardEnvironment'),
+      activityLog:$id('activityLog'),
+      humidityValue:$id('humidityValue'),
+      luxValue:$id('luxValue'),
+      voltageValue:$id('voltageValue'),
+      currentValue:$id('currentValue'),
+      occupancyValue:$id('occupancyValue'),
+      batteryMini:$id('batteryMini'),
+      measuredEnergyKwh:$id('measuredEnergyKwh'),
+      predictedEnergyKwh:$id('predictedEnergyKwh'),
+      mlActualEnergy:$id('mlActualEnergy'),
+      mlBaseGru:$id('mlBaseGru'),
+      mlLgbmCorrection:$id('mlLgbmCorrection'),
+      mlHybridFinal:$id('mlHybridFinal'),
+      mlSafetyLower:$id('mlSafetyLower'),
+      mlSafetyUpper:$id('mlSafetyUpper'),
+      battLag0:$id('battLag0'),
+      battLag1:$id('battLag1'),
+      battLag2:$id('battLag2'),
+    };
+
+    const batteryLagWindow = [];
+
+    // ── Helper: flash a card on update ───────────────────────────────
+    function flashCard(el) {
+      el.classList.remove('data-flash');
+      void el.offsetWidth;  // force reflow
+      el.classList.add('data-flash');
+    }
+
+    // ── Helper: add activity log entry ───────────────────────────────
+    let logStarted = false;
+    function addLog(msg) {
+      if (!logStarted) {
+        dom.activityLog.innerHTML = '';
+        logStarted = true;
+      }
+      const now = new Date().toLocaleTimeString();
+      const line = document.createElement('p');
+      line.textContent = `[${now}] ${msg}`;
+      line.classList.add('text-slate-400');
+      dom.activityLog.prepend(line);
+      // Keep max 50 entries
+      while (dom.activityLog.children.length > 50) {
+        dom.activityLog.removeChild(dom.activityLog.lastChild);
+      }
+    }
+
+    // ── Live Clock ───────────────────────────────────────────────────
+    function tickClock() {
+      dom.liveTime.textContent = new Date().toLocaleTimeString();
+    }
+    tickClock();
+    setInterval(tickClock, 1000);
+
+    // ── Update: Sensor Data ──────────────────────────────────────────
+    function updateBatteryLagWindow(lagValues) {
+      batteryLagWindow.length = 0;
+      for (const value of lagValues.slice(0, 3)) {
+        batteryLagWindow.push(value);
+      }
+      const lagCells = [dom.battLag0, dom.battLag1, dom.battLag2];
+      lagCells.forEach((cell, idx) => {
+        const value = batteryLagWindow[idx];
+        cell.textContent = value === undefined ? '--' : `${value.toFixed(1)}%`;
+      });
+    }
+
+    function updateSensors(data, topic) {
+      const tempRaw = data.temperature !== undefined
+        ? data.temperature
+        : data.temperature_c;
+      const batteryRaw = data.battery_level !== undefined
+        ? data.battery_level
+        : data.battery;
+
+      // Temperature
+      if (tempRaw !== undefined) {
+        const temp = parseFloat(tempRaw);
+        dom.tempValue.textContent = temp.toFixed(1);
+        // Color: red if > 28°C, sky otherwise
+        dom.tempValue.className = temp > 28
+          ? 'text-4xl font-extrabold tracking-tight text-red-500'
+          : 'text-4xl font-extrabold tracking-tight text-slate-800';
+        // Temp bar (range 15–45°C mapped to 0–100%)
+        const pct = Math.min(100, Math.max(0, ((temp - 15) / 30) * 100));
+        dom.tempBar.style.width = pct + '%';
+        dom.tempBar.className = 'h-full rounded-full transition-all duration-700 '
+          + (temp > 28 ? 'bg-red-400' : 'bg-sky-400');
+      }
+
+      // Occupancy
+      if (data.occupancy !== undefined) {
+        const occ = parseInt(data.occupancy, 10);
+        if (occ === 1) {
+          dom.occDot.className  = 'dot dot-green shadow-sm';
+          dom.occText.textContent = 'Room Occupied';
+          dom.occText.className   = 'text-sm font-semibold text-emerald-600';
+          dom.occupancyValue.textContent = 'Occupied';
+        } else {
+          dom.occDot.className  = 'dot dot-grey shadow-sm';
+          dom.occText.textContent = 'Room Empty';
+          dom.occText.className   = 'text-sm font-semibold text-slate-500';
+          dom.occupancyValue.textContent = 'Empty';
+        }
+      }
+
+      // Battery
+      if (batteryRaw !== undefined) {
+        const batt = parseFloat(batteryRaw);
+        dom.battValue.textContent = batt.toFixed(1);
+        dom.batteryMini.textContent = batt.toFixed(1);
+        dom.battBar.style.width = Math.min(100, Math.max(0, batt)) + '%';
+
+        let barColor, labelText;
+        if (batt > 50) {
+          barColor = 'bg-emerald-500';
+          labelText = 'Battery healthy';
+        } else if (batt > 20) {
+          barColor = 'bg-amber-400';
+          labelText = 'Battery moderate — monitor usage';
+        } else {
+          barColor = 'bg-red-500';
+          labelText = 'Battery critically low!';
+        }
+        dom.battBar.className = 'battery-bar shadow-sm ' + barColor;
+        dom.battLabel.textContent = labelText;
+        dom.battLabel.className = 'text-xs mt-2 text-center font-semibold '
+          + (batt <= 20 ? 'text-red-500' : 'text-slate-500');
+      }
+
+      if (data.humidity !== undefined) {
+        dom.humidityValue.textContent = parseFloat(data.humidity).toFixed(1);
+      }
+      if (data.lux !== undefined) {
+        dom.luxValue.textContent = parseFloat(data.lux).toFixed(1);
+      }
+      if (data.voltage !== undefined) {
+        dom.voltageValue.textContent = parseFloat(data.voltage).toFixed(1);
+      }
+      if (data.current !== undefined) {
+        dom.currentValue.textContent = parseFloat(data.current).toFixed(2);
+      }
+
+      // Actual load from CSV Energy_kW (sent by simulator for display only)
+      let actualLoad = data.energy_kw;
+      if (actualLoad === undefined) actualLoad = data.energy_kwh;
+      if (actualLoad !== undefined) {
+        dom.measuredEnergyKwh.textContent = parseFloat(actualLoad).toFixed(4);
+      }
+
+      flashCard(dom.cardRoom);
+      flashCard(dom.cardBattery);
+      flashCard(dom.cardEnvironment);
+      addLog(`Sensor → Temp: ${tempRaw}°C | Occupancy: ${data.occupancy} | Battery: ${batteryRaw}%`);
+    }
+
+    function updatePrediction(data) {
+      // Show predicted_energy_kw directly in kW (hybrid_final from ML model)
+      // for side-by-side comparison with the actual load.
+      let predictedEnergy = data.predicted_energy_kw;
+      if (predictedEnergy === undefined) predictedEnergy = data.predicted_energy_kwh;
+      if (predictedEnergy === undefined) predictedEnergy = data.predicted_energy_range;
+      if (predictedEnergy !== undefined) {
+        dom.predictedEnergyKwh.textContent = parseFloat(predictedEnergy).toFixed(4);
+      }
+
+      if (data.actual_energy_kw !== undefined && data.actual_energy_kw !== null) {
+        dom.mlActualEnergy.textContent = parseFloat(data.actual_energy_kw).toFixed(4);
+      }
+      if (data.base_gru_kwh !== undefined && data.base_gru_kwh !== null) {
+        dom.mlBaseGru.textContent = parseFloat(data.base_gru_kwh).toFixed(4);
+      }
+      if (data.lgbm_correction_kwh !== undefined && data.lgbm_correction_kwh !== null) {
+        dom.mlLgbmCorrection.textContent = parseFloat(data.lgbm_correction_kwh).toFixed(4);
+      }
+
+      let hybridFinal = data.hybrid_final_kwh;
+      if (hybridFinal === undefined || hybridFinal === null) {
+        hybridFinal = data.predicted_energy_kw;
+      }
+      if (hybridFinal !== undefined && hybridFinal !== null) {
+        dom.mlHybridFinal.textContent = parseFloat(hybridFinal).toFixed(4);
+      }
+
+      let safetyLower = data.safety_lower_bound;
+      if (safetyLower === undefined || safetyLower === null) {
+        safetyLower = data.lower_bound_energy_kw;
+      }
+      if (safetyLower !== undefined && safetyLower !== null) {
+        dom.mlSafetyLower.textContent = parseFloat(safetyLower).toFixed(4);
+      }
+
+      let safetyUpper = data.safety_upper_bound;
+      if (safetyUpper === undefined || safetyUpper === null) {
+        safetyUpper = data.upper_bound_energy_kw;
+      }
+      if (safetyUpper !== undefined && safetyUpper !== null) {
+        dom.mlSafetyUpper.textContent = parseFloat(safetyUpper).toFixed(4);
+      }
+
+      flashCard(dom.cardMode);
+      addLog(`Prediction → ${predictedEnergy !== undefined ? Number(predictedEnergy).toFixed(4) + ' kW' : 'n/a'}`);
+    }
+
+    // ── Update: Mode ─────────────────────────────────────────────────
+    const MODE_CONFIG = {
+      A: {
+        label: 'Peak Demand',
+        desc:  'All Relays ON — full energy delivery',
+        badge: 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm',
+        icon:  'fa-solid fa-bolt',
+        relays: [true, true, true],
+      },
+      B: {
+        label: 'Average Load',
+        desc:  'Luxury Relays OFF — fans allowed, heavy loads restricted',
+        badge: 'bg-amber-50 text-amber-700 border border-amber-200 shadow-sm',
+        icon:  'fa-solid fa-gauge',
+        relays: [true, true, false],
+      },
+      C: {
+        label: 'Baseline Load',
+        desc:  'Critical Only — minimal survival mode',
+        badge: 'bg-red-50 text-red-700 border border-red-200 shadow-sm',
+        icon:  'fa-solid fa-shield-halved',
+        relays: [true, false, false],
+      },
+    };
+
+    function updateMode(data) {
+      // 1. Handle lightweight battery lag updates first
+      if (data.type === 'battery_lag_update') {
+        const lagValues = [
+          data.battery_t_now !== null ? data.battery_t_now : undefined,
+          data.battery_t1 !== null ? data.battery_t1 : undefined,
+          data.battery_t2 !== null ? data.battery_t2 : undefined
+        ];
+        updateBatteryLagWindow(lagValues);
+        return; // Don't process mode changes
+      }
+
+      // 2. Handle full mode changes
+      const mode = (data.mode || data.current_mode || '').toUpperCase();
+      const cfg = MODE_CONFIG[mode];
+
+      if (!cfg) {
+        dom.modeDisplay.innerHTML = `
+          <div class="inline-block mode-badge bg-slate-100 text-slate-500 border border-slate-200 mb-3 shadow-sm">
+            <i class="fa-solid fa-circle-question mr-1"></i> Unknown Mode: ${mode || '?'}
+          </div>
+          <p class="text-sm text-slate-500 font-medium">Unrecognized mode received</p>`;
+        return;
+      }
+
+      dom.modeDisplay.innerHTML = `
+        <div class="inline-block mode-badge ${cfg.badge} mb-3 text-lg font-bold">
+          <i class="${cfg.icon} mr-2"></i>Mode ${mode} — ${cfg.label}
+        </div>
+        <p class="text-sm font-medium text-slate-500 mt-1">${cfg.desc}</p>`;
+
+      // Relay dots — use actual payload values if present, else use mode defaults
+      const dots = [dom.r1Dot, dom.r2Dot, dom.r3Dot];
+      const relayKeys = ['relay_1', 'relay_2', 'relay_3'];
+      relayKeys.forEach((key, i) => {
+        const on = data[key] !== undefined ? data[key] : cfg.relays[i];
+        dots[i].className = on ? 'dot dot-green shadow-sm' : 'dot dot-grey shadow-sm';
+        dots[i].style.width = '10px';
+        dots[i].style.height = '10px';
+      });
+
+      const lagValues = [
+        data.battery_t_now !== null ? data.battery_t_now : undefined,
+        data.battery_t1 !== null ? data.battery_t1 : undefined,
+        data.battery_t2 !== null ? data.battery_t2 : undefined
+      ];
+      updateBatteryLagWindow(lagValues);
+
+      flashCard(dom.cardMode);
+      addLog(`Mode → ${mode} (${cfg.label})`);
+    }
+
+    // ── MQTT Connection ──────────────────────────────────────────────
+    function setConnState(state) {
+      const badge = dom.connBadge;
+      const dot   = dom.connDot;
+      const text  = dom.connText;
+
+      badge.className = 'conn-badge ' + state;
+      if (state === 'connected') {
+        dot.className = 'dot dot-green';
+        dot.style.width = '8px'; dot.style.height = '8px';
+        text.textContent = 'Connected';
+      } else if (state === 'connecting') {
+        dot.className = 'dot';
+        dot.style.background = '#facc15';
+        dot.style.boxShadow = '0 0 6px #facc1580';
+        dot.style.width = '8px'; dot.style.height = '8px';
+        text.textContent = 'Connecting…';
+      } else {
+        dot.className = 'dot dot-grey';
+        dot.style.width = '8px'; dot.style.height = '8px';
+        text.textContent = 'Disconnected';
+      }
+    }
+
+    // Paho MQTT client
+    const client = new Paho.Client(MQTT_HOST, MQTT_PORT, CLIENT_ID);
+
+    client.onConnectionLost = function(resp) {
+      setConnState('disconnected');
+      addLog('⚠ MQTT connection lost: ' + (resp.errorMessage || 'unknown'));
+      // Auto-reconnect after 3 seconds
+      setTimeout(connectMQTT, 3000);
+    };
+
+    client.onMessageArrived = function(message) {
+      const topic   = message.destinationName;
+      const payload = message.payloadString;
+
+      let data;
+      try {
+        data = JSON.parse(payload);
+      } catch (e) {
+        addLog('⚠ Bad JSON on ' + topic);
+        return;
+      }
+
+      if (topic === TOPIC_SENSORS || topic === TOPIC_AVERAGED) {
+        updateSensors(data, topic);
+      } else if (topic === TOPIC_ML) {
+        updatePrediction(data);
+      } else if (topic === TOPIC_MODE) {
+        updateMode(data);
+      }
+    };
+
+    function connectMQTT() {
+      setConnState('connecting');
+      addLog('Attempting MQTT connection to ws://' + MQTT_HOST + ':' + MQTT_PORT + ' …');
+
+      client.connect({
+        onSuccess: function() {
+          setConnState('connected');
+          addLog('✓ Connected to MQTT broker');
+          client.subscribe(TOPIC_SENSORS);
+          client.subscribe(TOPIC_AVERAGED);
+          client.subscribe(TOPIC_ML);
+          client.subscribe(TOPIC_MODE);
+          addLog(
+            '✓ Subscribed to '
+            + TOPIC_SENSORS + ', '
+            + TOPIC_AVERAGED + ', '
+            + TOPIC_ML + ', '
+            + TOPIC_MODE
+          );
+        },
+        onFailure: function(err) {
+          setConnState('disconnected');
+          addLog('✗ MQTT connection failed: ' + (err.errorMessage || 'broker unreachable'));
+          // Retry in 5 seconds
+          setTimeout(connectMQTT, 5000);
+        },
+        timeout: 5,
+        useSSL: false,
+      });
+    }
+
+    // Kick off connection
+    connectMQTT();
+
+    // Footer year
+    document.getElementById('footerYear').textContent = new Date().getFullYear();
+  </script>
+</body>
+</html>

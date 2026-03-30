@@ -1,0 +1,43 @@
+﻿Analyzing main.dart...                                          
+
+   info - The private field _batteryHistory could be 'final' - lib\main.dart:109:16 - prefer_final_fields
+   info - Statements in an if should be enclosed in a block - lib\main.dart:185:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:187:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:189:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:191:9 - curly_braces_in_flow_control_structures
+   info - Statements in an if should be enclosed in a block - lib\main.dart:204:9 - curly_braces_in_flow_control_structures
+   info - The local variable '_pages' starts with an underscore - lib\main.dart:289:24 - no_leading_underscores_for_local_identifiers
+  error - Undefined name '_predictedEnergy' - lib\main.dart:660:37 - undefined_identifier
+  error - Undefined name '_predictedEnergy' - lib\main.dart:690:33 - undefined_identifier
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:805:37 - deprecated_member_use
+warning - A value for optional parameter 'reverse' isn't ever given - lib\main.dart:1172:10 - unused_element_parameter
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1496:33 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1584:33 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1673:33 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:1818:39 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2088:33 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2218:39 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2376:33 - deprecated_member_use
+   info - 'withOpacity' is deprecated and shouldn't be used. Use .withValues() to avoid precision loss - lib\main.dart:2644:33 - deprecated_member_use
+
+flutter : 19 issues 
+found. (ran in 5.7s)
+At line:1 char:1
++ flutter analyze 
+lib/main.dart --no-pub 
+> flutter_full_errors.t
+xt 2>&1
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (19 issues fou   
+ nd. (ran in 5.7s):    
+String) [], Remote    
+Exception
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 

@@ -104,16 +104,36 @@ class _DashboardShellState extends State<DashboardShell> {
   double _humidity = 50.0;
   int _occupancy = 0;
   double _voltage = 220.0;
-  double _current = 0.0;
+  double _current = 0.0; // Current draw in Amps (from 'current' sensor field)
+  // Real-time actual load in kW — from energy_kwh sensor field (simulated from CSV Energy_kW column).
+  // In production this would come from a real energy meter. In simulation it's the CSV row
+  // that was fed as input to the ML model, so it's always in sync with the prediction.
+  double _actualLoad = 0.0;
   double _batteryLevel = 100.0;
   List<double> _batteryHistory = [100.0, 100.0, 100.0];
+  // Timestamps for each battery lag reading [t2, t1, t_now] — derived when relay state arrives
+  List<DateTime> _batteryTimestamps = [
+    DateTime.now().subtract(const Duration(seconds: 60)),
+    DateTime.now().subtract(const Duration(seconds: 30)),
+    DateTime.now(),
+  ];
   double _luminousIntensity = 0.0;
   double _predictedEnergy = 0.0;
-  double _peakDemand = 0.0;
+  // _upperBound = 95% confidence upper bound from Bayesian ML (upper_bound_energy_kw)
+  double _upperBound = 0.0;
+  // _lowerBound = 95% confidence lower bound from Bayesian ML (safety_lower_bound)
+  double _lowerBound = 0.0;
+  // _peakDemand = configurable threshold published by the backend (peak_demand, default 2.4 kW)
+  double _peakDemand = 2.4;
+  // ISO 8601 timestamp from the ML prediction payload — tells us when the prediction was made
+  String _predictionTimestamp = '';
+  // ISO 8601 timestamp from the sensor payload — tells us when the inputs were sampled
+  String _sensorTimestamp = '';
 
   late ApiService _apiService;
   late MqttService _mqttService;
   Timer? _pollingTimer;
+  DateTime _lastMqttUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   List<dynamic> _historyData = [];
 
@@ -123,8 +143,11 @@ class _DashboardShellState extends State<DashboardShell> {
     _apiService = ApiService(baseUrl: 'http://127.0.0.1:8000/api/v1');
     _mqttService = MqttService(server: '127.0.0.1');
     _initBackend();
-    // Poll REST API every 10 seconds as a fallback
-    _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+    // Poll REST API every 60 seconds as a fallback
+    _pollingTimer = Timer.periodic(const Duration(seconds: 60), (_) async {
+      // Only use the REST fallback if we haven't received live MQTT data recently
+      if (DateTime.now().difference(_lastMqttUpdate).inSeconds < 65) return;
+
       final data = await _apiService.getLatestSensors();
       if (data.isNotEmpty && mounted) _updateSensorState(data);
       final prediction = await _apiService.getLatestPrediction();
@@ -159,10 +182,19 @@ class _DashboardShellState extends State<DashboardShell> {
 
     // Connect to MQTT (uses WebSockets on Web over port 9001 and TCP on Native)
     await _mqttService.connect();
+    // room/data/averaged — 5-minute averaged sensor telemetry
     _mqttService.dataStream.listen((data) {
+      _lastMqttUpdate = DateTime.now();
       if (mounted) _updateSensorState(data);
     });
+    // room/ml/predictions — real-time ML predictions (new rt-dems-main backend)
+    _mqttService.mlStream.listen((data) {
+      _lastMqttUpdate = DateTime.now();
+      if (mounted) _updatePredictionState(data);
+    });
+    // room/relays/state — mode decisions + 60-second battery lag updates
     _mqttService.relayStream.listen((data) {
+      _lastMqttUpdate = DateTime.now();
       if (mounted) _updateRelayState(data);
     });
   }
@@ -177,56 +209,112 @@ class _DashboardShellState extends State<DashboardShell> {
         _occupancy = (data['occupancy'] as num).toInt();
       if (data.containsKey('voltage'))
         _voltage = (data['voltage'] as num).toDouble();
-      if (data.containsKey('current'))
+      // Actual current draw in Amps
+      if (data.containsKey('current')) {
         _current = (data['current'] as num).toDouble();
+      }
+      // Real-time energy load in kW
+      if (data.containsKey('energy_kwh')) {
+        _actualLoad = (data['energy_kwh'] as num).toDouble();
+      } else if (data.containsKey('energy_kw')) {
+        _actualLoad = (data['energy_kw'] as num).toDouble();
+      }
+
       if (data.containsKey('battery_level')) {
         _batteryLevel = (data['battery_level'] as num).toDouble();
+        _batteryHistory.add(_batteryLevel);
+        if (_batteryHistory.length > 3) _batteryHistory.removeAt(0);
       }
       if (data.containsKey('luminous_intensity'))
         _luminousIntensity = (data['luminous_intensity'] as num).toDouble();
-        
-      if (data.containsKey('mean_prediction_kw')) {
-        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
-      } else if (data.containsKey('predicted_energy_range')) {
-        _predictedEnergy = (data['predicted_energy_range'] as num).toDouble();
-      }
 
-      if (data.containsKey('upper_bound_kw')) {
-        _peakDemand = (data['upper_bound_kw'] as num).toDouble();
-      } else if (data.containsKey('peak_demand')) {
-        _peakDemand = (data['peak_demand'] as num).toDouble();
+      // Timestamp of when these sensor readings were sampled
+      if (data.containsKey('timestamp')) {
+        _sensorTimestamp = data['timestamp'] as String;
       }
     });
   }
 
   void _updatePredictionState(Map<String, dynamic> data) {
     setState(() {
-      if (data.containsKey('mean_prediction_kw')) {
-        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
-      } else if (data.containsKey('predicted_energy_range')) {
-        _predictedEnergy = (data['predicted_energy_range'] as num).toDouble();
+      // UNIFIED FRAME: update actual sensor values if present in prediction packet
+      if (data.containsKey('actual_temperature'))
+        _temperature = (data['actual_temperature'] as num).toDouble();
+      if (data.containsKey('actual_humidity'))
+        _humidity = (data['actual_humidity'] as num).toDouble();
+      if (data.containsKey('actual_energy_kw'))
+        _actualLoad = (data['actual_energy_kw'] as num).toDouble();
+      if (data.containsKey('actual_occupancy'))
+        _occupancy = (data['actual_occupancy'] as num).toInt();
+      if (data.containsKey('actual_battery')) {
+        _batteryLevel = (data['actual_battery'] as num).toDouble();
+        if (_batteryHistory.isEmpty || _batteryHistory.last != _batteryLevel) {
+          _batteryHistory.add(_batteryLevel);
+          if (_batteryHistory.length > 3) _batteryHistory.removeAt(0);
+        }
       }
 
-      if (data.containsKey('upper_bound_kw')) {
-        _peakDemand = (data['upper_bound_kw'] as num).toDouble();
-      } else if (data.containsKey('peak_demand')) {
+      // Mean / hybrid prediction
+      if (data.containsKey('predicted_energy_kw')) {
+        _predictedEnergy = (data['predicted_energy_kw'] as num).toDouble();
+      } else if (data.containsKey('mean_prediction_kw')) {
+        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
+      }
+
+      // 95% Bayesian upper confidence bound
+      if (data.containsKey('safety_upper_bound')) {
+        _upperBound = (data['safety_upper_bound'] as num).toDouble();
+      } else if (data.containsKey('upper_bound_energy_kw')) {
+        _upperBound = (data['upper_bound_energy_kw'] as num).toDouble();
+      }
+
+      // 95% Bayesian lower confidence bound
+      if (data.containsKey('safety_lower_bound')) {
+        _lowerBound = (data['safety_lower_bound'] as num).toDouble();
+      }
+
+      // Configurable peak demand threshold
+      if (data.containsKey('peak_demand')) {
         _peakDemand = (data['peak_demand'] as num).toDouble();
+      }
+
+      // Timestamp of when this prediction was generated
+      if (data.containsKey('timestamp')) {
+        _predictionTimestamp = data['timestamp'] as String;
       }
     });
   }
 
   void _updateRelayState(Map<String, dynamic> data) {
     setState(() {
+      // Full rule evaluation payload (every 3–5 min) carries 'mode'
       if (data.containsKey('mode')) _currentMode = data['mode'];
-      
-      if (data.containsKey('battery_lag_values')) {
-        try {
-          List<dynamic> rawList = data['battery_lag_values'];
-          // Rule engine sends [T-now, T-1, T-2]. Visualizer expects oldest first: [T-2, T-1, T-now]
-          _batteryHistory = rawList.reversed.map((e) => (e as num).toDouble()).toList();
-        } catch (e) {
-          print('Failed to parse battery_lag_values = $e');
-        }
+
+      // Both the full payload and the lightweight battery_lag_update carry these three fields.
+      // The rule engine publishes this strictly every 30 s for real-time lag display.
+      final hasLag =
+          data.containsKey('battery_t_now') &&
+          data.containsKey('battery_t1') &&
+          data.containsKey('battery_t2');
+      if (hasLag) {
+        final tNow = (data['battery_t_now'] as num).toDouble();
+        final t1 = (data['battery_t1'] as num).toDouble();
+        final t2 = (data['battery_t2'] as num).toDouble();
+        // Store as [oldest, middle, newest] to match _BatteryLagCard display
+        _batteryHistory = [t2, t1, tNow];
+        // Derive timestamps from the payload timestamp (or fallback to now)
+        final timestampStr = data['timestamp'] as String?;
+        final baseTime = timestampStr != null
+            ? DateTime.tryParse(timestampStr)?.toLocal() ?? DateTime.now()
+            : DateTime.now();
+
+        _batteryTimestamps = [
+          baseTime.subtract(const Duration(seconds: 120)), // t2 (oldest)
+          baseTime.subtract(const Duration(seconds: 60)), // t1
+          baseTime, // t_now (current)
+        ];
+        // Keep _batteryLevel in sync with the most recent lag reading
+        _batteryLevel = tNow;
       }
     });
   }
@@ -266,9 +354,15 @@ class _DashboardShellState extends State<DashboardShell> {
         occupancy: _occupancy,
         batteryLevel: _batteryLevel,
         batteryHistory: _batteryHistory,
+        batteryTimestamps: _batteryTimestamps,
         luminousIntensity: _luminousIntensity,
+        actualLoad: _actualLoad,
         predictedEnergy: _predictedEnergy,
+        upperBound: _upperBound,
+        lowerBound: _lowerBound,
         peakDemand: _peakDemand,
+        predictionTimestamp: _predictionTimestamp,
+        sensorTimestamp: _sensorTimestamp,
         currentPower: (_current * _voltage / 1000),
       ),
       AnalyticsPage(historyData: _historyData),
@@ -524,9 +618,26 @@ class OverviewPage extends StatelessWidget {
   final int occupancy;
   final double batteryLevel;
   final List<double> batteryHistory;
+  final List<DateTime> batteryTimestamps;
   final double luminousIntensity;
+
+  /// Real-time actual energy load in kW from sensor (energy_kwh field / CSV Energy_kW column)
+  final double actualLoad;
   final double predictedEnergy;
+
+  /// 95% Bayesian upper confidence bound (upper_bound_energy_kw)
+  final double upperBound;
+  final double lowerBound;
+
+  /// Configurable peak demand threshold (peak_demand, default 2.4 kW)
   final double peakDemand;
+
+  /// ISO 8601 timestamp from the ML prediction payload
+  final String predictionTimestamp;
+
+  /// ISO 8601 timestamp from the sensor payload
+  final String sensorTimestamp;
+
   final double currentPower;
 
   const OverviewPage({
@@ -537,26 +648,47 @@ class OverviewPage extends StatelessWidget {
     required this.occupancy,
     required this.batteryLevel,
     required this.batteryHistory,
+    required this.batteryTimestamps,
     required this.luminousIntensity,
+    required this.actualLoad,
     required this.predictedEnergy,
+    required this.upperBound,
+    required this.lowerBound,
     required this.peakDemand,
+    required this.predictionTimestamp,
+    required this.sensorTimestamp,
     required this.currentPower,
   });
 
   bool isBatteryStable() {
     if (batteryHistory.length < 3) return true;
-    double first = batteryHistory[0];
-    double last = batteryHistory.last;
-    // Stable if non-decreasing or within 0.5% fluctuation
-    return last >= first || (first - last).abs() < 0.5;
+    final oldest = batteryHistory[0]; // t2 (oldest)
+    final newest = batteryHistory.last; // t_now
+    // Mirrors the rule engine: stable when drop over the window is ≤ 2%
+    final drop = oldest - newest;
+    return drop <= 2.0;
   }
 
   String getModeReasoning() {
+    // Compare actual load against the ML prediction window
     bool fallsBetween =
-        currentPower >= predictedEnergy && currentPower <= peakDemand;
+        actualLoad >= predictedEnergy && actualLoad <= upperBound;
     String energyReason = fallsBetween ? "falls" : "does not fall";
     String stability = isBatteryStable() ? "stable" : "unstable";
-    return "The real time energy usage $energyReason between the mean and upper bound of predicted energy usage and battery is $stability, Mode $currentMode is activated.";
+    return "The real-time load $energyReason between the mean prediction and upper confidence bound, battery is $stability — Mode $currentMode active.";
+  }
+
+  String _formatTimestamp(String ts) {
+    if (ts.isEmpty) return '';
+    try {
+      final dt = DateTime.parse(ts).toLocal();
+      final h = dt.hour.toString().padLeft(2, '0');
+      final m = dt.minute.toString().padLeft(2, '0');
+      final s = dt.second.toString().padLeft(2, '0');
+      return '$h:$m:$s';
+    } catch (_) {
+      return '';
+    }
   }
 
   @override
@@ -588,105 +720,83 @@ class OverviewPage extends StatelessWidget {
             const SizedBox(height: 24),
           ],
 
-          // Top Status Cards
-          LayoutBuilder(
-            builder: (context, constraints) {
-              double width = constraints.maxWidth;
-
-              if (width > 900) {
-                return SizedBox(
-                  height: 140, // Increased height
-                  child: Row(
-                    children: [
-                      Expanded(
-                        flex: 2,
-                        child: _MetricCard(
-                          title: 'System Mode',
-                          value: 'Class $currentMode',
-                          subtitle: getModeReasoning(),
-                          icon: Icons.bolt,
-                          color: currentMode == 'A'
-                              ? Colors.green
-                              : (currentMode == 'B'
-                                    ? Colors.orange
-                                    : Colors.red),
-                          linePlacement: Alignment.bottomCenter,
-                        ),
-                      ),
-                      const SizedBox(width: 24),
-                      Expanded(
-                        flex: 1,
-                        child: _MetricCard(
-                          title: 'Real-time Energy',
-                          value: '${currentPower.toStringAsFixed(2)} kW',
-                          icon: Icons.flash_on,
-                          color: Colors.blue,
-                          linePlacement: Alignment.bottomCenter,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              } else {
-                return GridView.count(
-                  crossAxisCount: width > 600 ? 2 : 1,
-                  crossAxisSpacing: 16,
-                  mainAxisSpacing: 16,
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  childAspectRatio: width > 600 ? 2.2 : 1.8,
-                  children: [
-                    _MetricCard(
-                      title: 'System Mode',
-                      value: 'Class $currentMode',
-                      subtitle: getModeReasoning(),
-                      icon: Icons.bolt,
-                      color: currentMode == 'A'
-                          ? Colors.green
-                          : (currentMode == 'B' ? Colors.orange : Colors.red),
-                      linePlacement: Alignment.bottomCenter,
-                    ),
-                    _MetricCard(
-                      title: 'Real-time Energy',
-                      value: '${currentPower.toStringAsFixed(2)} kW',
-                      icon: Icons.flash_on,
-                      color: Colors.blue,
-                      linePlacement: Alignment.bottomCenter,
-                    ),
-                  ],
-                );
-              }
-            },
-          ),
-          const SizedBox(height: 24),
-
-          // Main Layout Area
+          // Desktop: single Row — left column has metric cards + graphic,
+          // right column has all 3 detail cards spanning full height.
           if (isDesktop)
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // ── LEFT: metric cards stacked above energy flow graphic ──
                 Expanded(
                   flex: 2,
-                  child: _EnergyFlowGraphic(
-                    currentMode: currentMode,
-                    batteryLevel: batteryLevel,
+                  child: Column(
+                    children: [
+                      // Two metric cards side-by-side, same total width as graphic
+                      SizedBox(
+                        height: 130,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              flex: 2,
+                              child: _MetricCard(
+                                title: 'System Mode',
+                                value: 'Class $currentMode',
+                                subtitle: getModeReasoning(),
+                                icon: Icons.bolt,
+                                color: currentMode == 'A'
+                                    ? Colors.green
+                                    : (currentMode == 'B'
+                                          ? Colors.orange
+                                          : Colors.red),
+                                linePlacement: Alignment.bottomCenter,
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              flex: 1,
+                              child: _MetricCard(
+                                title: 'Expected Prediction',
+                                value: '${actualLoad.toStringAsFixed(3)} kW',
+                                subtitle: sensorTimestamp.isNotEmpty
+                                    ? 'Last Update: ${_formatTimestamp(sensorTimestamp)}\nForecast: ${predictedEnergy.toStringAsFixed(3)} kW'
+                                    : 'ML Forecast: ${predictedEnergy.toStringAsFixed(3)} kW',
+                                icon: Icons.electric_meter_outlined,
+                                color: Colors.teal,
+                                linePlacement: Alignment.bottomCenter,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      // Energy Flow Graphic fills the rest
+                      _EnergyFlowGraphic(
+                        currentMode: currentMode,
+                        batteryLevel: batteryLevel,
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(width: 24),
+                // ── RIGHT: 3 detail cards, full height ──
                 Expanded(
                   flex: 1,
                   child: Column(
                     children: [
                       _PredictionDetailsCard(
                         mean: predictedEnergy,
-                        upperBound: peakDemand,
+                        upperBound: upperBound,
+                        lowerBound: lowerBound,
+                        peakDemand: peakDemand,
+                        timestamp: predictionTimestamp,
                       ),
-                      const SizedBox(height: 24),
+                      const SizedBox(height: 20),
                       _BatteryLagCard(
                         history: batteryHistory,
+                        timestamps: batteryTimestamps,
                         isStable: isBatteryStable(),
                       ),
-                      const SizedBox(height: 24),
+                      const SizedBox(height: 20),
                       _EnvironmentCard(
                         temperature: temperature,
                         humidity: humidity,
@@ -699,8 +809,45 @@ class OverviewPage extends StatelessWidget {
               ],
             )
           else
+            // Mobile / tablet: classic vertical stack
             Column(
               children: [
+                // metric cards grid
+                GridView.count(
+                  crossAxisCount: MediaQuery.of(context).size.width > 600
+                      ? 2
+                      : 1,
+                  crossAxisSpacing: 16,
+                  mainAxisSpacing: 16,
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  childAspectRatio: MediaQuery.of(context).size.width > 600
+                      ? 2.2
+                      : 1.8,
+                  children: [
+                    _MetricCard(
+                      title: 'System Mode',
+                      value: 'Class $currentMode',
+                      subtitle: getModeReasoning(),
+                      icon: Icons.bolt,
+                      color: currentMode == 'A'
+                          ? Colors.green
+                          : (currentMode == 'B' ? Colors.orange : Colors.red),
+                      linePlacement: Alignment.bottomCenter,
+                    ),
+                    _MetricCard(
+                      title: 'Real Time Prediction',
+                      value: '${actualLoad.toStringAsFixed(3)} kW',
+                      subtitle: sensorTimestamp.isNotEmpty
+                          ? 'Last Update: ${_formatTimestamp(sensorTimestamp)}\nForecast: ${predictedEnergy.toStringAsFixed(3)} kW'
+                          : 'ML Forecast: ${predictedEnergy.toStringAsFixed(3)} kW',
+                      icon: Icons.electric_meter_outlined,
+                      color: Colors.teal,
+                      linePlacement: Alignment.bottomCenter,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
                 _EnergyFlowGraphic(
                   currentMode: currentMode,
                   batteryLevel: batteryLevel,
@@ -708,11 +855,15 @@ class OverviewPage extends StatelessWidget {
                 const SizedBox(height: 24),
                 _PredictionDetailsCard(
                   mean: predictedEnergy,
-                  upperBound: peakDemand,
+                  upperBound: upperBound,
+                  lowerBound: lowerBound,
+                  peakDemand: peakDemand,
+                  timestamp: predictionTimestamp,
                 ),
                 const SizedBox(height: 24),
                 _BatteryLagCard(
                   history: batteryHistory,
+                  timestamps: batteryTimestamps,
                   isStable: isBatteryStable(),
                 ),
                 const SizedBox(height: 24),
@@ -1079,7 +1230,7 @@ class _EnergyFlowGraphic extends StatelessWidget {
                           children: [
                             _GraphicNode(
                               icon: Icons.check_circle_outline,
-                              label: 'Tier A',
+                              label: 'Smart A',
                               subtitle: 'Essential',
                               color: Colors.greenAccent,
                               small: true,
@@ -1087,7 +1238,7 @@ class _EnergyFlowGraphic extends StatelessWidget {
                             ),
                             _GraphicNode(
                               icon: Icons.wb_incandescent_outlined,
-                              label: 'Tier B',
+                              label: 'Smart B',
                               subtitle: 'Prioritized',
                               color: Colors.orangeAccent,
                               small: true,
@@ -1096,7 +1247,7 @@ class _EnergyFlowGraphic extends StatelessWidget {
                             ),
                             _GraphicNode(
                               icon: Icons.block,
-                              label: 'Tier C',
+                              label: 'Smart C',
                               subtitle: 'Load Shed',
                               color: Colors.redAccent,
                               small: true,
@@ -1435,14 +1586,58 @@ class _GraphicNode extends StatelessWidget {
 }
 
 class _PredictionDetailsCard extends StatelessWidget {
+  /// Mean hybrid prediction (GRU + LightGBM), field: predicted_energy_kw
   final double mean;
-  final double upperBound;
 
-  const _PredictionDetailsCard({required this.mean, required this.upperBound});
+  /// 95% Bayesian upper confidence bound, field: upper_bound_energy_kw
+  final double upperBound;
+  final double lowerBound;
+
+  /// Configurable peak demand threshold (default 2.4 kW), field: peak_demand
+  final double peakDemand;
+
+  /// ISO 8601 timestamp string from the ML payload — when the prediction was made
+  final String timestamp;
+
+  const _PredictionDetailsCard({
+    required this.mean,
+    required this.upperBound,
+    required this.lowerBound,
+    required this.peakDemand,
+    required this.timestamp,
+  });
+
+  /// Parse ISO 8601 to a compact "HH:MM · DD MMM" label, e.g. "00:58 · 25 Mar"
+  String _formatTimestamp() {
+    if (timestamp.isEmpty) return '';
+    try {
+      final dt = DateTime.parse(timestamp).toLocal();
+      final h = dt.hour.toString().padLeft(2, '0');
+      final m = dt.minute.toString().padLeft(2, '0');
+      const months = [
+        'Jan',
+        'Feb',
+        'Mar',
+        'Apr',
+        'May',
+        'Jun',
+        'Jul',
+        'Aug',
+        'Sep',
+        'Oct',
+        'Nov',
+        'Dec',
+      ];
+      return '$h:$m · ${dt.day} ${months[dt.month - 1]}';
+    } catch (_) {
+      return '';
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     bool isDark = Theme.of(context).brightness == Brightness.dark;
+    final String timeLabel = _formatTimestamp();
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(20),
@@ -1460,25 +1655,48 @@ class _PredictionDetailsCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Predicted Energy Data',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Energy Management System',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+              if (timeLabel.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  'As of $timeLabel',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context).textTheme.bodySmall?.color,
+                  ),
+                ),
+              ],
+            ],
           ),
           const SizedBox(height: 16),
           _detailRow(
             context,
-            'Mean Prediction',
-            '${mean.toStringAsFixed(2)} kW',
+            'Real Time Prediction',
+            '${mean.toStringAsFixed(3)} kW',
             Colors.blue,
             Icons.auto_graph,
           ),
           const SizedBox(height: 12),
           _detailRow(
             context,
-            'Upper Bound (95%)',
-            '${upperBound.toStringAsFixed(2)} kW',
+            'Upper Bound Prediction',
+            '${upperBound.toStringAsFixed(3)} kW',
             Colors.orange,
             Icons.trending_up,
+          ),
+          const SizedBox(height: 12),
+          _detailRow(
+            context,
+            'Lower Bound Prediction',
+            '${lowerBound.toStringAsFixed(3)} kW',
+            Colors.red.shade300,
+            Icons.warning_amber_outlined,
           ),
         ],
       ),
@@ -1516,9 +1734,20 @@ class _PredictionDetailsCard extends StatelessWidget {
 
 class _BatteryLagCard extends StatelessWidget {
   final List<double> history;
+  final List<DateTime> timestamps;
   final bool isStable;
 
-  const _BatteryLagCard({required this.history, required this.isStable});
+  const _BatteryLagCard({
+    required this.history,
+    required this.timestamps,
+    required this.isStable,
+  });
+
+  String _fmt(DateTime dt) {
+    final h = dt.hour.toString().padLeft(2, '0');
+    final m = dt.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1540,35 +1769,18 @@ class _BatteryLagCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                '3-Time Battery Lag',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: (isStable ? Colors.green : Colors.red).withAlpha(50),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  isStable ? 'STABLE' : 'UNSTABLE',
-                  style: TextStyle(
-                    color: isStable ? Colors.green : Colors.red,
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-            ],
+          const Text(
+            '3-Time Battery Lag',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
           ),
           const SizedBox(height: 16),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: history.asMap().entries.map((entry) {
-              return _lagItem(context, entry.value, entry.key);
+              final ts = entry.key < timestamps.length
+                  ? timestamps[entry.key]
+                  : null;
+              return _lagItem(context, entry.value, entry.key, ts);
             }).toList(),
           ),
         ],
@@ -1576,7 +1788,9 @@ class _BatteryLagCard extends StatelessWidget {
     );
   }
 
-  Widget _lagItem(BuildContext context, double val, int index) {
+  Widget _lagItem(BuildContext context, double val, int index, DateTime? ts) {
+    final labels = ['t-2', 't-1', 't-0'];
+    final label = index < labels.length ? labels[index] : 't-$index';
     return Column(
       children: [
         Text(
@@ -1584,12 +1798,23 @@ class _BatteryLagCard extends StatelessWidget {
           style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         Text(
-          't-$index',
+          label,
           style: TextStyle(
             color: Theme.of(context).textTheme.bodySmall?.color,
             fontSize: 10,
           ),
         ),
+        if (ts != null)
+          Text(
+            _fmt(ts),
+            style: TextStyle(
+              color: Theme.of(
+                context,
+              ).textTheme.bodySmall?.color?.withAlpha(180),
+              fontSize: 10,
+              fontStyle: FontStyle.italic,
+            ),
+          ),
       ],
     );
   }

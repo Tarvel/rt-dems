@@ -280,7 +280,7 @@ A background timer fires every 5 minutes. When it fires, the logger:
 A background timer fires at the configured interval (default 1 minute for testing, 5 for production). When it fires, the rule engine:
 1. Reads the latest sensor values and ML predictions.
 2. Reads the current battery lag values (T-now, T-1, T-2) which are maintained by a separate 30-second background loop.
-3. Runs the 3-phase rule hierarchy (occupancy override → battery stability lock → temperature bias + standard flow).
+3. Runs the 2-step decision hierarchy comparing predicted energy against peak demand, factoring in battery level and stability.
 4. Determines the correct mode (A, B, or C).
 5. Drives the `gpiozero.LED` objects to physically switch the relays via GPIO.
 6. Writes the decision (mode, relay states, reason) to the `energy_relaystate` table.
@@ -627,27 +627,13 @@ def set_relays(relay_1, relay_2, relay_3):
 
 This means the same code runs on both a Raspberry Pi (controlling real relays) and a laptop (just tracking virtual states).
 
-### The 3-Phase Rule Hierarchy — Complete Explanation
+### The 2-Step Decision Hierarchy — Complete Explanation
 
-The rules are evaluated in strict order. Once a rule triggers, the evaluation stops. This is like a priority system — higher-priority rules override lower-priority ones.
+The rules are evaluated in two main steps based on whether the predicted energy consumption exceeds the allowed peak demand. Note that **occupancy and temperature are only used for dashboard visualization and logging**, they do not override the energy-based decisions.
 
-#### Phase 1: Master Override — Occupancy Check
+#### Battery Stability Lock — The "3-Time Lag" Check
 
-**The question:** Is the room empty?
-
-**How we track it:** We keep a counter called `occupancy_zero_streak`. Every time we evaluate (every 5 minutes), if occupancy is 0 (empty), we add 1 to the counter. If occupancy is 1 (someone is there), we reset the counter to 0.
-
-**The rule:** If the counter is 1 or more (meaning the room has been empty for at least one 5-minute cycle), immediately force **Mode C**.
-
-**Why:** There is no point running fans or AC in an empty room. This is the highest priority rule because it saves the most energy.
-
-```
-If room is empty for ≥ 5 minutes → Mode C (done, skip everything else)
-```
-
-#### Phase 2: Battery Stability Lock — The "3-Time Lag" Check
-
-**The question:** Is the battery stable or is it rapidly draining?
+Before making a decision, the engine checks if the battery is rapidly draining.
 
 **The independent background loop:** We maintain three variables (`battery_t_now`, `battery_t1`, `battery_t2`) to represent the exact battery percentage over the last 90 seconds. To keep this updated in real-time, the rule engine runs a separate background thread that wakes up every 30 seconds (`BATTERY_LAG_INTERVAL_SECONDS`):
 
@@ -665,58 +651,33 @@ lag_drop = battery_t2 - battery_t_now   # oldest minus newest
 
 Example: If `battery_t2` is `85.0` and `battery_t_now` is `82.0`, then `lag_drop = 85.0 - 82.0 = 3.0%`.
 
-**The rule:** If the drop is **≤ 2%** (`MAX_BATTERY_DROP_PERCENT`), the battery is stable — barely draining. We keep the current mode and skip all the rules below. The system does not switch modes unnecessarily.
+**The rule:** If the drop is **≤ 2%** (`MAX_BATTERY_DROP_PERCENT`), the battery is considered **stable**. This stability flag is used in the main decision steps below to determine if we can safely run higher loads. (If we don't have a full 90-second lag window yet, we assume the battery is stable.)
 
-**Why:** If the battery is barely changing, there is no emergency. Switching modes too often is bad — it would make lights flicker and devices restart constantly. This "stability lock" prevents unnecessary mode switching.
-
-```
-If battery is stable (≤2% drop over 90 seconds) → Keep current mode (done, skip Phase 3)
-If battery is draining fast (>2% drop) → Continue to Phase 3
-```
-
-**Special case:** If we don't have all three readings yet (system just started), we skip this phase and go directly to Phase 3. We assume the battery is not draining fast during startup.
-
-#### Phase 3: Temperature Bias & Standard Flow
-
-This phase has three sub-rules evaluated in order:
-
-##### Step 5: Temperature Bias
-
-**The question:** Is the room too hot?
-
-**The rule:** If temperature is **above 28°C** AND battery is **above 40%**, force **Mode B**.
-
-**Why:** Mode B keeps fans running (relay 2 is ON). If the room is hot, we want fans to work even if we might otherwise go to Mode C. But only if the battery can handle it (above 40%).
-
-```
-If temp > 28°C AND battery > 40% → Mode B (done)
-```
-
-##### Step 6: Energy ≥ Peak Demand (we have enough energy)
+#### Step 1: Energy ≥ Peak Demand (We have enough energy)
 
 **The question:** Is the predicted energy available enough to meet peak demand?
+If `predicted_energy >= peak_demand`, we have enough energy. The mode depends on battery tier and stability:
 
-If `predicted_energy_range >= peak_demand`, we have enough energy. Now it depends on battery level:
-
-| Battery Level | Battery Draining? | Result |
+| Battery Level | Battery Lag Stable? | Result |
 |--------------|-------------------|--------|
-| ≥ 80% | No (stable) | **Mode A** — Full energy, everything on |
-| ≥ 80% | Yes (dropping fast) | **Mode B** — Have battery but it's draining, be careful |
-| 50% – 79% | Any | **Mode B** — Moderate battery, run fans but not heavy loads |
+| ≥ 80% | Yes (≤2% drop) | **Mode A** — Full energy, everything on |
+| ≥ 80% | No (>2% drop) | **Mode B** — Have battery but it's draining fast, reduce load |
+| 50% – 79% | Yes (≤2% drop) | **Mode B** — Moderate battery, run fans but not heavy loads |
+| 50% – 79% | No (>2% drop) | **Mode C** — Battery draining, survival mode |
 | Below 50% | Any | **Mode C** — Battery too low, survival mode |
 
-##### Step 7: Energy < Peak Demand (energy is tight)
+#### Step 2: Energy < Peak Demand (Energy is tight)
 
 **The question:** Is the predicted energy NOT enough for peak demand?
+If `predicted_energy < peak_demand`, energy is tight.
 
-If `predicted_energy_range < peak_demand`, energy is tight.
-
-| Battery Level | Result |
-|--------------|--------|
-| ≥ 60% | **Mode A** — We have enough battery to compensate for the energy shortfall |
-| < 60% | Re-apply Step 6 logic — battery is too low to compensate, use the strict rules above |
-
-**Why this re-routing exists:** When energy supply is low but battery is high (≥60%), we can run at full energy by drawing from the battery. But if both energy supply is low AND battery is low, we cannot take that risk, so we fall back to the conservative Step 6 rules.
+| Battery Level | Battery Lag Stable? | Result |
+|--------------|-------------------|--------|
+| ≥ 80% | Yes (≤2% drop) | **Mode A** — Full energy, compensate with deep battery |
+| ≥ 80% | No (>2% drop) | **Mode B** — Compensate with battery, but reduce load |
+| ≥ 60% | Yes (≤2% drop) | **Mode B** — Moderate battery, compensate partially |
+| ≥ 60% | No (>2% drop) | **Mode C** — Battery draining, survival mode |
+| Below 60% | Any | **Mode C** — Battery too low to compensate, survival mode |
 
 ### How GPIO is controlled
 
@@ -746,45 +707,25 @@ START EVALUATION
     │
     ├── Shift battery lag: T-2←T-1, T-1←T-now, T-now←latest battery (every 30s)
     │
-    ╔══ PHASE 1: OCCUPANCY OVERRIDE ══╗
-    ║ Is the room empty for ≥5 min?   ║
-    ╚════════╤════════════════════════╝
-         YES │                     NO
-             ▼                      │
-        → MODE C (done)             │
-                                    ▼
-    ╔══ PHASE 2: STABILITY LOCK ══════╗
-    ║ Battery drop ≤2% over 3 reads? ║
-    ╚════════╤════════════════════════╝
-         YES │                     NO
-             ▼                      │
-    → KEEP CURRENT MODE (done)      │
-                                    ▼
-    ╔══ PHASE 3: TEMP BIAS ═══════════╗
-    ║ Temp >28°C AND battery >40%?   ║
-    ╚════════╤════════════════════════╝
-         YES │                     NO
-             ▼                      │
-        → MODE B (done)             │
-                                    ▼
     ╔══ ENERGY vs PEAK DEMAND ════════╗
     ║ predicted_energy ≥ peak_demand? ║
-    ╚════════╤════════════╤══════════╝
-         YES │            NO │
-             ▼               ▼
-      ┌──────────┐    Battery ≥60%?
-      │ Battery  │      YES → MODE A
-      │  ≥80%    │      NO  → Re-apply
-      │ stable?  │            left rules
-      │ Y→MODE A │
-      │ N→MODE B │
-      ├──────────┤
-      │ 50%-79%  │
-      │ → MODE B │
-      ├──────────┤
-      │  <50%    │
-      │ → MODE C │
-      └──────────┘
+    ╚════════╤════════════╤═══════════╝
+         YES │            │ NO
+             ▼            ▼
+      ┌──────────┐   ┌──────────┐
+      │ Bat ≥80% │   │ Bat ≥80% │
+      │  stable? │   │  stable? │
+      │ Y→MODE A │   │ Y→MODE A │
+      │ N→MODE B │   │ N→MODE B │
+      ├──────────┤   ├──────────┤
+      │ 50%-79%  │   │ 60%-79%  │
+      │  stable? │   │  stable? │
+      │ Y→MODE B │   │ Y→MODE B │
+      │ N→MODE C │   │ N→MODE C │
+      ├──────────┤   ├──────────┤
+      │  <50%    │   │  <60%    │
+      │ → MODE C │   │ → MODE C │
+      └──────────┘   └──────────┘
 ```
 
 ---

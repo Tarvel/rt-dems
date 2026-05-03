@@ -4,7 +4,11 @@ rule_engine.py — Relay Control Rule Engine
 ============================================
 
 Subscribes to sensor & ML MQTT topics, evaluates energy-management rules
-on a fixed decision cycle, controls 3 GPIO relays, and logs every decision.
+on a fixed decision cycle, and publishes relay state decisions via MQTT.
+
+An external ESP32 subscribes to room/relays/state and drives the physical
+relay GPIO pins based on the relay_1, relay_2, relay_3 booleans in the
+published payload.  This engine does NOT touch any local GPIO.
 
 Relay Modes:
   A  — Peak Demand   : All relays ON  (Priority 1, 2, 3)
@@ -27,57 +31,6 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
-# GPIO Setup — real RPi.GPIO or mock for development machines
-# ---------------------------------------------------------------------------
-try:
-    import RPi.GPIO as GPIO
-
-    ON_PI = True
-except (ImportError, RuntimeError):
-
-    class MockGPIO:
-        """Lightweight GPIO mock so rule_engine.py runs on dev machines."""
-
-        BCM = "BCM"
-        OUT = "OUT"
-        HIGH = 1
-        LOW = 0
-        _pins: dict[int, int] = {}
-
-        @classmethod
-        def setmode(cls, mode):
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setmode(%s)",
-                mode,
-            )
-
-        @classmethod
-        def setwarnings(cls, flag):
-            pass
-
-        @classmethod
-        def setup(cls, pin, mode):
-            cls._pins[pin] = cls.LOW
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setup(pin=%d, mode=%s)", pin, mode
-            )
-
-        @classmethod
-        def output(cls, pin, state):
-            cls._pins[pin] = state
-            state_str = "HIGH (ON)" if state == cls.HIGH else "LOW (OFF)"
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: pin %d → %s", pin, state_str
-            )
-
-        @classmethod
-        def cleanup(cls):
-            logging.getLogger("rule_engine").info("MockGPIO: cleanup()")
-
-    GPIO = MockGPIO  # type: ignore[misc]
-    ON_PI = False
-
-# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
@@ -87,11 +40,6 @@ MQTT_CLIENT_ID = "room-rule-engine"
 TOPIC_SENSORS = "room/sensors"
 TOPIC_ML = "room/ml/predictions"
 TOPIC_RELAY_STATE = "room/relays/state"
-
-# GPIO pins (BCM numbering) — change via env vars or edit here
-RELAY_PIN_1 = int(os.environ.get("RELAY_PIN_1", 17))   # Priority 1
-RELAY_PIN_2 = int(os.environ.get("RELAY_PIN_2", 27))   # Priority 2
-RELAY_PIN_3 = int(os.environ.get("RELAY_PIN_3", 22))   # Priority 3
 
 # Database path
 DB_PATH = os.environ.get(
@@ -204,41 +152,22 @@ shutdown_event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
-# GPIO helpers
+# Mode → relay-state mapping (pure logic, no hardware)
 # ---------------------------------------------------------------------------
-def gpio_init() -> None:
-    """Set up GPIO pins as outputs."""
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    for pin in (RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3):
-        GPIO.setup(pin, GPIO.OUT)
-    log.info(
-        "GPIO initialized: P1=pin%d, P2=pin%d, P3=pin%d",
-        RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3,
-    )
-
-
-def set_relays(relay_1: bool, relay_2: bool, relay_3: bool) -> None:
-    """Drive the three relay GPIO pins."""
-    GPIO.output(RELAY_PIN_1, GPIO.HIGH if relay_1 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_2, GPIO.HIGH if relay_2 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_3, GPIO.HIGH if relay_3 else GPIO.LOW)
-
-
 def apply_mode(mode: str) -> tuple[bool, bool, bool]:
-    """Translate a mode letter into relay states and actuate GPIO.
+    """Translate a mode letter into relay state booleans.
 
-    Returns (relay_1, relay_2, relay_3) as booleans.
+    No local GPIO is driven — the returned values are published
+    via MQTT for the ESP32 relay controller to consume.
+
+    Returns (relay_1, relay_2, relay_3).
     """
     if mode == "A":
-        states = (True, True, True)
+        return (True, True, True)
     elif mode == "B":
-        states = (True, True, False)
+        return (True, True, False)
     else:  # "C"
-        states = (True, False, False)
-
-    set_relays(*states)
-    return states
+        return (True, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +388,7 @@ def run_evaluation(client: mqtt.Client) -> None:
 
         new_mode, reason = evaluate_rules()
 
-    # Actuate relays
+    # Compute relay states (published via MQTT — ESP32 actuates)
     r1, r2, r3 = apply_mode(new_mode)
 
     # Update current mode
@@ -625,17 +554,14 @@ def main() -> None:
         MODE_A_MAX_KWH,
     )
     log.info(
-        "Max battery drop threshold: %.1f%%",
+        "Max battery drop threshold: %.1f%% (day) / %.1f%% (night)",
         MAX_BATTERY_DROP_PERCENT,
+        MAX_BATTERY_DROP_NIGHT_PERCENT,
     )
     log.info("Database: %s", os.path.abspath(DB_PATH))
-    log.info("Running on Raspberry Pi: %s", ON_PI)
+    log.info("GPIO: disabled (ESP32 handles relay actuation via MQTT)")
 
-    # Initialize GPIO
-    gpio_init()
-
-    # Start in Mode C (safest)
-    apply_mode("C")
+    # Start in Mode C (safest) — no GPIO, just internal state
     log.info("Initial state: Mode C (Baseline Load)")
 
     # Ensure DB table exists
@@ -657,7 +583,6 @@ def main() -> None:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     except OSError as exc:
         log.critical("Cannot connect to MQTT broker: %s", exc)
-        GPIO.cleanup()
         sys.exit(1)
 
     # Start evaluation thread
@@ -682,17 +607,19 @@ def main() -> None:
     # Wait for shutdown
     shutdown_event.wait()
 
-    # Clean up
-    log.info("Shutting down relays (Mode C for safety) …")
-    apply_mode("C")
-    log_decision(
-        "C",
-        True,
-        False,
-        False,
-        "Shutdown — forced Mode C for safety",
-    )
-    GPIO.cleanup()
+    # Clean up — publish Mode C so the ESP32 drops to safe state
+    log.info("Publishing Mode C (safety shutdown) to MQTT …")
+    r1, r2, r3 = apply_mode("C")
+    shutdown_payload = {
+        "mode": "C",
+        "relay_1": r1,
+        "relay_2": r2,
+        "relay_3": r3,
+        "reason": "Shutdown — forced Mode C for safety",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    client.publish(TOPIC_RELAY_STATE, json.dumps(shutdown_payload), qos=1)
+    log_decision("C", r1, r2, r3, "Shutdown — forced Mode C for safety")
     client.loop_stop()
     client.disconnect()
     log.info("Rule Engine stopped.")

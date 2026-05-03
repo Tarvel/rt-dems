@@ -93,7 +93,7 @@ def _enable_wal(sender, connection, **kwargs):
         cursor.execute("PRAGMA busy_timeout=5000;")
 
 
-from django.db.backends.signals import connection_created  # noqa: E402
+from django.db.backends.signals import connection_created
 
 connection_created.connect(_enable_wal)
 

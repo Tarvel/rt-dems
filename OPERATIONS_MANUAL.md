@@ -175,6 +175,19 @@ python simulation/data_simulator.py
 
 Keep this terminal running. If it stops, sensor values stop and ML predictions stop.
 
+**Battery drain modes:** The simulator supports two battery simulation profiles, controlled by the `BATTERY_DRAIN_MODE` environment variable:
+
+```bash
+# Default (set in example.env) — randomised fluctuations to stress-test
+# the rule engine's 3-time battery lag:
+BATTERY_DRAIN_MODE=inconsistent python simulation/data_simulator.py
+
+# Linear drain — deterministic -0.1% per row (for baseline/predictable testing):
+BATTERY_DRAIN_MODE=consistent python simulation/data_simulator.py
+```
+
+The inconsistent mode produces a mix of normal drain (70%), sharp drops of 2-5% (15%), flat periods (10%), and small recoveries (5%). This ensures the rule engine's lag stability check (`MAX_BATTERY_DROP_PERCENT`) is properly exercised.
+
 ### Terminal 7 - Open dashboard in browser (optional)
 
 Open this file in your browser:
@@ -313,7 +326,7 @@ pinctrl get 22
 
 ## 7. What to Expect When Running
 
-1. Simulator publishes sensor payloads to `room/sensors` every 5 seconds.
+1. Simulator publishes sensor payloads to `room/sensors` (prediction-paced — waits for ML response before advancing).
 2. ML service receives sensor data via MQTT, runs the GRU + LightGBM model, and publishes predictions to `room/ml/predictions`.
 3. Logger buffers sensor and prediction data and writes 5-minute averages to SQLite.
 4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state`.
@@ -323,7 +336,7 @@ pinctrl get 22
 
 ## 8. Configuration
 
-### 7.1 Environment variables (`.env`)
+### 8.1 Environment variables (`.env`)
 
 Copy the provided example file to configure all services:
 
@@ -338,6 +351,17 @@ DECISION_INTERVAL_MINUTES=3
 BATTERY_LAG_INTERVAL_SECONDS=30
 MAX_BATTERY_DROP_PERCENT=2
 MODE_A_MAX_KWH=2.4
+```
+
+Key variables for the data simulator:
+
+```bash
+BATTERY_DRAIN_MODE=inconsistent    # "consistent" (linear) or "inconsistent" (randomised)
+BATTERY_START=85.0                 # Initial battery % at simulation start
+BATTERY_FLOOR=20.0                 # Minimum battery % (drain stops here)
+ML_API_BASE=http://127.0.0.1:5000  # ML service URL (for /reset call)
+PREDICTION_TIMEOUT=30              # Max seconds to wait for ML prediction per row
+MIN_ROW_DELAY=3                    # Min seconds between rows
 ```
 
 Production interval example in `.env`:

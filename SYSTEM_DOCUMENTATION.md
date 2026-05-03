@@ -872,10 +872,25 @@ It reads from `abs_smart_grid_dataset_20k.csv` row by row and publishes each row
 
 1. **On startup**, the simulator always resets to Row 1 of the CSV and calls the ML API's `POST /reset` endpoint so the model's CSV pointer is synchronised.
 2. It reads each row's `Temperature_C`, `Humidity_%`, `Luminous_Intensity_Lux` (or `Luminous_Intensity`), `Occupancy`, and `Energy_kW` directly from the CSV.
-3. Battery is simulated deterministically: starts at 85%, drops 0.1% per row, and floors at 20%. No randomness.
+3. Battery is simulated via a configurable drain mode (see below).
 4. Each row is published as a JSON payload to `room/sensors` with the fields: `timestamp`, `temperature_c`, `temperature`, `humidity`, `lux`, `occupancy`, `energy_kw`, and `battery_level`.
 5. After publishing, the simulator waits for a prediction to arrive on `room/ml/predictions` (with a configurable timeout, default 30 seconds).
 6. Once the prediction arrives (or the timeout expires), it enforces a minimum delay (`MIN_ROW_DELAY`, default 3 seconds) before moving to the next row.
+
+### Battery drain modes
+
+The simulator supports two modes, selected via the `BATTERY_DRAIN_MODE` environment variable:
+
+**`consistent` (default)** — Deterministic linear drain. Battery starts at `BATTERY_START` (default 85%), drops exactly 0.1% per row, and floors at `BATTERY_FLOOR` (default 20%). This produces a smooth, predictable curve for baseline testing.
+
+**`inconsistent`** — Randomised fluctuations designed to stress-test the rule engine's 3-time battery lag:
+
+| Probability | What happens | Purpose |
+|-------------|-------------|----------|
+| 70% | Normal drain: −0.0% to −0.8% | Gentle, variable depletion |
+| 15% | Sharp drop: −2.0% to −5.0% | Triggers lag instability (≥2% drop → mode change) |
+| 10% | Flat: 0.0% change | Tests the stability lock (battery barely changing) |
+| 5% | Small recovery: +0.5% to +1.5% | Simulates charging or regenerative events |
 
 ### Why prediction-paced and not timer-based?
 
@@ -888,6 +903,9 @@ In earlier versions, the simulator published every 5 seconds on a fixed timer. T
 | `ML_API_BASE` | `http://127.0.0.1:5000` | URL of the ML service (for the `/reset` call) |
 | `PREDICTION_TIMEOUT` | `30` | Max seconds to wait for a prediction per row |
 | `MIN_ROW_DELAY` | `3` | Minimum seconds between rows (keeps output readable) |
+| `BATTERY_DRAIN_MODE` | `consistent` | `consistent` (linear) or `inconsistent` (randomised) |
+| `BATTERY_START` | `85.0` | Initial battery percentage at simulation start |
+| `BATTERY_FLOOR` | `20.0` | Minimum battery percentage (drain stops here) |
 
 ---
 

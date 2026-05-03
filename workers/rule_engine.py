@@ -118,12 +118,37 @@ BATTERY_LAG_READINGS = 3
 
 # Max safe battery drop (%) over the lag window.
 # ┌─────────────────────────────────────────────────────────────────┐
-# │  TESTING DEFAULT: 2%.  Change to 10 for production.           │
-# │  export MAX_BATTERY_DROP_PERCENT=10                           │
+# │  Two profiles based on solar availability:                      │
+# │                                                                 │
+# │  DAYTIME  (11:00–15:59) — Solar is charging. A >2% drop in the │
+# │  lag window means real overconsumption → strict threshold.      │
+# │                                                                 │
+# │  NIGHTTIME (16:00–10:59) — No solar. Battery naturally drains   │
+# │  under normal loads. A wider threshold prevents false-positive  │
+# │  instability flags that force premature Mode C.                 │
+# │                                                                 │
+# │  export MAX_BATTERY_DROP_PERCENT=2       (daytime, default)     │
+# │  export MAX_BATTERY_DROP_NIGHT_PERCENT=8 (nighttime, default)   │
 # └─────────────────────────────────────────────────────────────────┘
 MAX_BATTERY_DROP_PERCENT = float(
     os.environ.get("MAX_BATTERY_DROP_PERCENT", 2)
 )
+MAX_BATTERY_DROP_NIGHT_PERCENT = float(
+    os.environ.get("MAX_BATTERY_DROP_NIGHT_PERCENT", 8)
+)
+
+# Solar window boundaries (24-hour format).
+# Daytime = SOLAR_START..SOLAR_END-1 (inclusive hours).
+SOLAR_HOUR_START = int(os.environ.get("SOLAR_HOUR_START", 11))   # 11:00 AM
+SOLAR_HOUR_END   = int(os.environ.get("SOLAR_HOUR_END",   16))   # 4:00 PM (exclusive)
+
+
+def _active_battery_threshold() -> tuple[float, str]:
+    """Return (threshold_pct, profile_name) based on current hour."""
+    hour = datetime.now().hour
+    if SOLAR_HOUR_START <= hour < SOLAR_HOUR_END:
+        return MAX_BATTERY_DROP_PERCENT, "daytime"
+    return MAX_BATTERY_DROP_NIGHT_PERCENT, "nighttime"
 
 
 def _format_duration(seconds: int) -> str:
@@ -336,7 +361,7 @@ def evaluate_rules() -> tuple[str, str]:
         if not has_full_lag:
             return "lag window not full yet (treated as stable)"
         return (
-            f"lag drop={lag_drop:.2f}%, "
+            f"lag drop={lag_drop:.2f}% (threshold={_active_battery_threshold()[0]}% {_active_battery_threshold()[1]}), "
             f"T-now={battery_t_now:.1f}% T-1={battery_t1:.1f}% T-2={battery_t2:.1f}%"
         )
 
@@ -346,7 +371,8 @@ def evaluate_rules() -> tuple[str, str]:
             f"Step 1 — Predicted {predicted_energy:.4f}kW "
             f">= peak demand {MODE_A_MAX_KWH}kW"
         )
-        lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
+        lag_threshold, lag_profile = _active_battery_threshold()
+        lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
 
         # 1 — Battery >= 80%
         if battery_level >= 80.0:
@@ -384,7 +410,8 @@ def evaluate_rules() -> tuple[str, str]:
         f"Step 2 — Predicted {predicted_energy:.4f}kW "
         f"< peak demand {MODE_A_MAX_KWH}kW"
     )
-    lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
+    lag_threshold, lag_profile = _active_battery_threshold()
+    lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
 
     # 2a — Battery >= 80%
     if battery_level >= 80.0:

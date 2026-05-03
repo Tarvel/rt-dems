@@ -60,8 +60,7 @@ The Raspberry Pi (4 or 5) acts as three things at once:
 - **Model:** Raspberry Pi 4 (4GB RAM) or Raspberry Pi 5
 - **OS:** Raspberry Pi OS (Linux-based)
 - **Network:** Connected to the local network via Wi-Fi or Ethernet
-- **GPIO Pins:** 40 pins on the board that can send electrical signals to control external devices
-- **GPIO Library:** `gpiozero` with auto-detected backend (`lgpio` on Pi 5, `RPi.GPIO` or `lgpio` on Pi 4)
+- **GPIO Pins:** 40 pins on the header, but **not used by the rule engine**. Relay actuation is delegated to an external ESP32 microcontroller via MQTT.
 
 ### The 3 Relays
 
@@ -75,11 +74,13 @@ We have 3 relays, each connected to a different GPIO pin on the Pi:
 | Relay 2 | Pin 27 | Priority 2 (Medium) | Comfort loads — fans, ventilation |
 | Relay 3 | Pin 22 | Priority 3 (Luxury) | Heavy loads — AC, heaters, high-energy appliances |
 
-### How relays work with GPIO
+### How relays work with the ESP32
 
-- The Pi sends a **HIGH signal** (3.3V) to a GPIO pin → the relay closes the circuit → the connected device turns **ON**
-- The Pi sends a **LOW signal** (0V) to a GPIO pin → the relay opens the circuit → the connected device turns **OFF**
-- We use **BCM numbering** (Broadcom pin numbering), which is the standard way to refer to GPIO pins in Python
+- The rule engine publishes `relay_1`, `relay_2`, `relay_3` booleans to `room/relays/state` via MQTT
+- The ESP32 subscribes to this topic and drives its GPIO pins accordingly
+- A `true` value means the relay should be ON (circuit closed, device energized)
+- A `false` value means the relay should be OFF (circuit open, device de-energized)
+- We use **BCM numbering** on the ESP32 side (the pin mapping is configured in the ESP32 firmware)
 
 ### The 3 Operating Modes
 
@@ -149,9 +150,11 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **What it is:** Another standalone Python script that runs in the background forever.
 
-**What it does:** Every `DECISION_INTERVAL_MINUTES` (default 1 for testing, 5 for production), it looks at the latest sensor data and ML predictions, runs them through a set of rules (the 3-phase decision hierarchy), decides which mode (A, B, or C) to use, and drives the GPIO pins to switch the relays. A separate background thread shifts the battery lag readings (T-now, T-1, T-2) every 30 seconds and publishes them to the dashboard in real-time.
+**What it does:** Every `DECISION_INTERVAL_MINUTES` (default 1 for testing, 5 for production), it looks at the latest sensor data and ML predictions, runs them through the 2-step decision hierarchy, decides which mode (A, B, or C) to use, and **publishes the decision to MQTT** (`room/relays/state`). An external ESP32 microcontroller subscribes to this topic and actuates the physical relay modules. A separate background thread shifts the battery lag readings (T-now, T-1, T-2) every 30 seconds and publishes them to the dashboard in real-time.
 
 **Why it exists:** This is the core intelligence of the system. Without it, the sensors just collect data but nothing happens. The rule engine is what turns data into action.
+
+**Important architecture note:** The rule engine does **not** drive any local GPIO pins. All hardware actuation is handled by the ESP32 over MQTT. This decouples the decision logic from the physical hardware, allowing the Pi to focus on computation while the ESP32 handles electrical switching.
 
 ### 3.6 ML Prediction Service (FastAPI)
 
@@ -205,19 +208,15 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **Why it exists:** It gives a visual way to monitor the system. It also proves that the MQTT data flow works end-to-end.
 
-### 3.10 test_gpio_pins.py (GPIO Pin Tester)
+### 3.10 test_rule_engine_mqtt.py (MQTT Integration Test)
 
-**File:** `simulation/test_gpio_pins.py`
+**File:** `simulation/test_rule_engine_mqtt.py`
 
-**What it is:** An interactive command-line tool for testing the GPIO relay pins without needing a breadboard, LEDs, or any external wiring.
+**What it is:** A test script that validates the rule engine publishes the correct JSON payloads for every mode transition.
 
-**What it does:** It creates `gpiozero.LED` objects on the same BCM pins the rule engine uses (17, 27, 22). When you type a mode command (`A`, `B`, or `C`), it sets those pins to HIGH or LOW exactly as the rule engine does during a real mode change. You can also toggle individual pins, force them ON/OFF, or blink them.
+**What it does:** It mocks the MQTT client, injects sensor/ML state directly into the rule engine's globals, runs evaluations, and asserts the published payload has the correct mode, relay booleans, and reason strings. It covers all mode transitions, day/night lag thresholds, and edge cases like missing ML predictions.
 
-**How verification works (Pi only):** On a Raspberry Pi, the tool drives real GPIO pins. You can confirm the physical states by:
-- Running `pinctrl get <pin>` from another terminal to read the hardware register.
-- Using a multimeter on the header pins (3.3V = HIGH, 0V = LOW).
-
-**On a dev machine:** It uses `gpiozero`'s `MockFactory` for virtual pins, letting you test the mode-switching logic without any hardware.
+**On any machine:** Runs without hardware or a real MQTT broker. Just `python simulation/test_rule_engine_mqtt.py`.
 
 ---
 
@@ -237,15 +236,19 @@ STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto
                             │ (every 5 min)                             │ (every DECISION_INTERVAL)
                            ▼                                           ▼
                     STEP 5a: Computes average               STEP 5b: Evaluates rules
-                    and writes to SQLite                    and switches GPIO relays
+                    and writes to SQLite                    and publishes relay state
                            │                                           │
                            ▼                                           ▼
-                    STEP 6a: Republishes averaged           STEP 6b: Publishes relay
-                    data to MQTT for dashboard              state to MQTT for dashboard
+                    STEP 6a: Republishes averaged           STEP 6b: Publishes mode to
+                    data to MQTT for dashboard              room/relays/state (MQTT)
                            │                                           │
                            ▼                                           ▼
-                    STEP 7: Django serves                   STEP 7: Dashboard shows
-                    historical data via API                 live data in browser
+                    STEP 7: Django serves                   STEP 7: ESP32 receives
+                    historical data via API                 and drives GPIO relays
+                                                                       │
+                                                                       ▼
+                                                           STEP 8: Dashboard shows
+                                                           live data in browser
 ```
 
 ### Detailed walkthrough:
@@ -574,58 +577,28 @@ This is the most complex and important part of the system. It is the component t
 
 ### What it does step by step:
 
-1. **Starts up**, creates `gpiozero.LED` objects for each relay pin (using `lgpio` on Pi 5 or `MockFactory` on dev machines), and defaults to **Mode C** (the safest mode — only critical devices on).
+1. **Starts up** and defaults to **Mode C** (the safest mode — only critical devices on). No GPIO initialization is needed.
 2. **Connects to MQTT** and subscribes to `room/sensors` and `room/ml/predictions`.
 3. **When messages arrive**, it updates its internal state variables (`latest_sensor`, `latest_ml`).
 4. **Every `DECISION_INTERVAL_MINUTES`** (default 1 minute for testing, 5 for production), it runs the full rule evaluation.
 5. **A separate 30-second background loop** shifts the battery lag readings (T-now, T-1, T-2) and publishes lightweight `battery_lag_update` payloads to the dashboard.
-6. **After evaluation**, it drives the `gpiozero.LED` objects to match the chosen mode and logs the decision to the database.
-7. **On shutdown**, it forces Mode C (for safety), closes all LED objects, and disconnects.
+6. **After evaluation**, it publishes the mode decision and relay booleans to `room/relays/state` for the ESP32 and dashboard to consume, and logs the decision to the database.
+7. **On shutdown**, it publishes Mode C to MQTT (so the ESP32 drops to safe state) and disconnects.
 
-### The gpiozero GPIO System (Pi 5 Compatible)
+### The ESP32 Relay Controller Architecture
 
-**The Problem with RPi.GPIO:** The original GPIO library for Raspberry Pi, `RPi.GPIO`, does **not work** on the Raspberry Pi 5. The Pi 5 uses a new GPIO chip called the **RP1**, which has a completely different architecture than the Pi 4's Broadcom SoC. Trying to import `RPi.GPIO` on a Pi 5 causes a `RuntimeError: Cannot determine SOC peripheral base address`.
+**The previous approach:** Earlier versions of the system used `RPi.GPIO` or `gpiozero` to drive relay GPIO pins directly on the Raspberry Pi. This created problems:
+- `RPi.GPIO` does not work on Pi 5 (different GPIO chip architecture)
+- GPIO libraries require root access or group membership
+- The rule engine was tightly coupled to hardware
 
-**Solution: gpiozero with auto-detection.** Instead of using `RPi.GPIO` directly, we use `gpiozero` — a higher-level GPIO library maintained by the Raspberry Pi Foundation. `gpiozero` uses a **pin factory** system that automatically selects the right low-level backend:
+**The current approach:** The rule engine now operates as a pure decision engine. It evaluates rules and publishes mode decisions to `room/relays/state` via MQTT. An external **ESP32 microcontroller** subscribes to this topic and drives its own GPIO pins to actuate the relay modules.
 
-| Platform | Pin Factory | How it works |
-|----------|-------------|-------------|
-| Pi 5 | `lgpio` | The **only** library that supports the RP1 chip. Must be installed: `sudo apt install python3-lgpio` |
-| Pi 4 | `RPi.GPIO` or `lgpio` | Either works. gpiozero prefers RPi.GPIO if installed |
-| Laptop/PC | `MockFactory` | Virtual pins (no hardware). Prints state changes to console |
-
-At the top of `rule_engine.py`, the auto-detection works like this:
-
-```python
-from gpiozero import LED, Device
-
-try:
-    # Probe: create a throwaway LED on pin 0 to test real GPIO access
-    _probe = LED(0, initial_value=False)
-    _probe.close()
-    ON_PI = True          # Real hardware available
-except Exception:
-    # No GPIO hardware — use virtual pins for development
-    from gpiozero.pins.mock import MockFactory
-    Device.pin_factory = MockFactory()
-    ON_PI = False
-```
-
-**Why this is better:** The same code runs everywhere — real Pi 5 with actual GPIO control, Pi 4, or a development laptop — with zero changes. The relay objects are `gpiozero.LED` instances:
-
-```python
-# gpio_init() creates LED objects for each relay pin
-relay_leds = {}
-for pin in (17, 27, 22):
-    relay_leds[pin] = LED(pin, initial_value=False)
-
-# set_relays() simply calls .on() and .off()
-def set_relays(relay_1, relay_2, relay_3):
-    for pin, state in ((17, relay_1), (27, relay_2), (22, relay_3)):
-        relay_leds[pin].on() if state else relay_leds[pin].off()
-```
-
-This means the same code runs on both a Raspberry Pi (controlling real relays) and a laptop (just tracking virtual states).
+**Benefits of this architecture:**
+- **Decoupled:** The Pi focuses on computation (MQTT, ML, database). The ESP32 focuses on hardware switching.
+- **Platform-independent:** The rule engine runs identically on any machine (Pi 4, Pi 5, laptop, server).
+- **No GPIO dependencies:** No need for `lgpio`, `gpiozero`, `RPi.GPIO`, or root access on the Pi.
+- **Testable:** The rule engine can be fully tested by mocking the MQTT client (see `test_rule_engine_mqtt.py`).
 
 ### The 2-Step Decision Hierarchy — Complete Explanation
 
@@ -651,7 +624,14 @@ lag_drop = battery_t2 - battery_t_now   # oldest minus newest
 
 Example: If `battery_t2` is `85.0` and `battery_t_now` is `82.0`, then `lag_drop = 85.0 - 82.0 = 3.0%`.
 
-**The rule:** If the drop is **≤ 2%** (`MAX_BATTERY_DROP_PERCENT`), the battery is considered **stable**. This stability flag is used in the main decision steps below to determine if we can safely run higher loads. (If we don't have a full 90-second lag window yet, we assume the battery is stable.)
+**The rule:** If the drop is **≤ threshold** (2% daytime, 8% nighttime), the battery is considered **stable**. The threshold is dynamic based on solar availability:
+
+| Profile | Hours | Threshold | Rationale |
+|---------|-------|-----------|----------|
+| **Daytime** | 11:00–15:59 | 2% (`MAX_BATTERY_DROP_PERCENT`) | Solar is charging. A >2% drop = real overconsumption. |
+| **Nighttime** | 16:00–10:59 | 8% (`MAX_BATTERY_DROP_NIGHT_PERCENT`) | No solar. Normal drain shouldn't trigger Mode C. |
+
+This stability flag is used in the main decision steps below to determine if we can safely run higher loads. (If we don't have a full 90-second lag window yet, we assume the battery is stable.)
 
 #### Step 1: Energy ≥ Peak Demand (We have enough energy)
 
@@ -679,26 +659,23 @@ If `predicted_energy < peak_demand`, energy is tight.
 | ≥ 60% | No (>2% drop) | **Mode C** — Battery draining, survival mode |
 | Below 60% | Any | **Mode C** — Battery too low to compensate, survival mode |
 
-### How GPIO is controlled
+### How mode decisions are published
 
-After the rule engine decides a mode, it calls `apply_mode()`. Under the hood, this uses `gpiozero.LED` objects (not `RPi.GPIO` directly), which ensures compatibility with both Pi 4 and Pi 5:
+After the rule engine decides a mode, it calls `apply_mode()` which returns relay boolean states. These are then published to `room/relays/state` via MQTT:
 
 ```python
 def apply_mode(mode):
     if mode == "A":
-        set_relays(True, True, True)     # All ON
+        return (True, True, True)     # All ON
     elif mode == "B":
-        set_relays(True, True, False)    # P1+P2 ON, P3 OFF
+        return (True, True, False)    # P1+P2 ON, P3 OFF
     else:  # "C"
-        set_relays(True, False, False)   # P1 ON only
-
-def set_relays(relay_1, relay_2, relay_3):
-    for pin, state in ((RELAY_PIN_1, relay_1), ...):
-        relay_leds[pin].on() if state else relay_leds[pin].off()
+        return (True, False, False)   # P1 ON only
 ```
 
-When a `gpiozero.LED` is set to `.on()`, the pin factory drives that BCM pin to 3.3V (HIGH) → the relay module activates → the connected device turns ON.
-When set to `.off()`, the pin goes to 0V (LOW) → relay deactivates → device turns OFF.
+The returned booleans are packaged into a JSON payload and published to `room/relays/state`. The ESP32 microcontroller subscribes to this topic and drives its GPIO pins accordingly:
+- `relay_1: true` → ESP32 sets relay 1 pin HIGH → device ON
+- `relay_1: false` → ESP32 sets relay 1 pin LOW → device OFF
 
 ### Complete decision flowchart
 
@@ -943,7 +920,7 @@ WantedBy=multi-user.target  ← Start when the system reaches multi-user mode (n
 ```
 
 **rule-engine.service:**
-Same structure, but `User=root` because GPIO access requires root privileges on the Pi.
+Same structure. No longer requires root because GPIO is handled by the ESP32.
 
 ### Useful systemd commands
 

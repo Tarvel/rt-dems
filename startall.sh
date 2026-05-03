@@ -40,7 +40,7 @@ echo "-> Starting MQTT Logger worker..."
 cd "$BASE_DIR"
 "$VENV_PYTHON" workers/mqtt_logger.py &
 
-# 4. Start Rule Engine
+# 4. Start Rule Engine (publishes mode decisions via MQTT — ESP32 actuates relays)
 echo "-> Starting Rule Engine worker..."
 "$VENV_PYTHON" workers/rule_engine.py &
 

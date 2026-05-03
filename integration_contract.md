@@ -13,7 +13,7 @@ QoS: `1`
 | `room/sensors` | Hardware or simulator | ML service, logger, rule engine, dashboard | Raw telemetry stream |
 | `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
 | `room/data/averaged` | logger | dashboard | 5-minute averaged values |
-| `room/relays/state` | rule engine | dashboard | Current mode and relay states |
+| `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
 
 ## 2. Sensor Payload Contract (`room/sensors`)
 
@@ -141,15 +141,30 @@ This topic publishes two different types of payloads.
 }
 ```
 
-## 6. Rule Threshold Contract (kWh)
+## 6. Rule Threshold Contract
 
-Default limits:
+The rule engine uses a 2-step decision hierarchy based on energy sufficiency and battery state.
 
-1. `MODE_A_MAX_KWH=2.4`
-2. `MODE_B_MAX_KWH=1.4`
-3. `MODE_C_MAX_KWH=0.8`
+### Energy threshold
 
-Rule engine uses these thresholds for mode decisions.
+1. `MODE_A_MAX_KWH=2.4` — Peak demand ceiling. Determines Step 1 (≥ threshold) vs Step 2 (< threshold).
+
+### Battery lag thresholds (time-of-day dynamic)
+
+The "stable" check compares the 3-time battery lag drop against a **dynamic threshold** based on solar availability:
+
+| Profile | Hours | Threshold | Rationale |
+|---------|-------|-----------|----------|
+| **Daytime** | 11:00 AM – 3:59 PM | `MAX_BATTERY_DROP_PERCENT` (default 2%) | Solar is charging. A >2% drop = real overconsumption. |
+| **Nighttime** | 4:00 PM – 10:59 AM | `MAX_BATTERY_DROP_NIGHT_PERCENT` (default 8%) | No solar. Normal drain shouldn't trigger Mode C. |
+
+Configurable via:
+- `SOLAR_HOUR_START` (default `11`)
+- `SOLAR_HOUR_END` (default `16`, exclusive)
+
+### Hardware actuation
+
+The rule engine does **not** drive GPIO pins directly. It publishes the `relay_1`, `relay_2`, `relay_3` booleans to `room/relays/state`. An external **ESP32 microcontroller** subscribes to this topic and actuates the physical relay modules based on these values.
 
 ## 7. REST API Contract
 

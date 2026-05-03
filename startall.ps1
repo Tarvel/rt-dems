@@ -44,7 +44,7 @@ try {
     Write-Host "-> Starting MQTT Logger worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/mqtt_logger.py" -WorkingDirectory $BASE_DIR
 
-    # 4. Start Rule Engine
+    # 4. Start Rule Engine (publishes mode decisions via MQTT — ESP32 actuates relays)
     Write-Host "-> Starting Rule Engine worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/rule_engine.py" -WorkingDirectory $BASE_DIR
 

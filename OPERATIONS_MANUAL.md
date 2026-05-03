@@ -28,61 +28,20 @@ pip install -r requirements.txt
 cd ..
 ```
 
-On Raspberry Pi only (Pi 5 requires `lgpio`, Pi 4 can use either):
+On Raspberry Pi only:
 
 ```bash
-# Pi 5 — lgpio is the ONLY GPIO library that works with the RP1 chip
-sudo apt install -y python3-lgpio
-
-# Pi 4 — RPi.GPIO works but lgpio is also fine
-# sudo apt install -y python3-rpi.gpio   # optional, gpiozero will use lgpio
+# No GPIO libraries needed on the Pi anymore — the rule engine
+# publishes relay decisions via MQTT. An ESP32 handles physical
+# relay actuation. lgpio/gpiozero are only needed if you run
+# the GPIO test script separately (now removed).
 ```
 
-`gpiozero` (installed via `requirements.txt`) auto-detects the correct backend:
-- **Pi 5** → uses `lgpio` (mandatory — RPi.GPIO is NOT compatible with Pi 5)
-- **Pi 4** → uses `RPi.GPIO` if available, otherwise `lgpio`
-- **Dev machine** → uses `MockFactory` (virtual pins, no hardware)
+### 1.3 Important: ESP32 relay controller
 
-### 1.3 Important: venv and system GPIO packages
+The rule engine no longer drives GPIO pins on the Raspberry Pi. Instead, it publishes mode decisions to `room/relays/state` via MQTT. A separate **ESP32 microcontroller** subscribes to this topic and actuates the physical relay modules using the `relay_1`, `relay_2`, `relay_3` booleans in the payload.
 
-`sudo apt install python3-lgpio` installs `lgpio` into the **system** Python. A standard `venv` isolates itself from system packages, so `gpiozero` inside the venv **cannot see** `lgpio`. This causes a silent fallback to virtual (mock) pins — the code runs without errors but does not drive real GPIO.
-
-To confirm the problem, activate your venv and run:
-
-```bash
-python -c "import lgpio; print('OK')"
-# If this says "ModuleNotFoundError" → lgpio is not visible in the venv
-```
-
-**Option A — Recreate venv with system package access (recommended):**
-
-```bash
-cd ~/Documents/project/PROJECT_CODE_U/rt-dems
-deactivate
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-This creates a new venv that can see all system-installed packages (including `lgpio`). Your pip packages are still installed into the venv, but system packages are also accessible.
-
-**Option B — Symlink lgpio into an existing venv:**
-
-If you do not want to recreate the venv, you can manually link the system `lgpio` module into it:
-
-```bash
-LGPIO_PATH=$(python3 -c "import lgpio; print(lgpio.__file__)" 2>/dev/null)
-ln -s "$(dirname $LGPIO_PATH)"/lgpio* venv/lib/python3.*/site-packages/
-```
-
-After either option, verify:
-
-```bash
-source venv/bin/activate
-python -c "import lgpio; print('lgpio OK')"
-python simulation/test_gpio_pins.py
-# Should now show: Hardware: REAL GPIO (Pi detected)
-```
+This means you do **not** need `lgpio`, `gpiozero`, or any GPIO-related Python packages on the Pi for normal operation.
 
 ## 2. Initial Setup
 
@@ -139,6 +98,8 @@ python workers/mqtt_logger.py
 ```
 
 ### Terminal 4 - Rule engine
+
+The rule engine evaluates energy/battery rules and publishes relay state decisions via MQTT. It does **not** drive local GPIO pins — an ESP32 subscribes to the published topic and handles physical relay actuation.
 
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
@@ -222,114 +183,62 @@ Open `http://127.0.0.1:5000` in your browser (the ML service serves the page). F
 
 Both test tools use HTTP only and do not connect to MQTT.
 
-## 6. GPIO Pin Testing (No Breadboard Required)
+## 6. Testing the Rule Engine (MQTT-Based)
 
-**File:** `simulation/test_gpio_pins.py`
+**File:** `simulation/test_rule_engine_mqtt.py`
 
-This interactive tool lets you test the relay GPIO pins without needing a breadboard, LEDs, or any external components. On a Raspberry Pi, it drives the **real GPIO pins**. On a dev machine, it uses virtual (mock) pins for logic testing.
+This test script validates that the rule engine publishes the correct JSON payloads for every mode transition, without requiring any hardware or a real MQTT broker.
 
-### 6.1 How it works
+### 6.1 What it tests
 
-The tool creates `gpiozero.LED` objects on the same BCM pins the rule engine uses (17, 27, 22). When you type a mode command, it sets those pins to HIGH or LOW exactly as the rule engine would during a real mode switch. On the Pi, this physically changes the voltage on the header pins — you can measure it with a multimeter or verify it with `pinctrl`.
+- All mode transitions (A, B, C) for both Step 1 and Step 2
+- Battery lag stability checks (day vs night thresholds)
+- Lag instability forcing mode drops (A→B, B→C)
+- No-ML-prediction fallback (maintains current mode)
+- Full payload structure (all required keys present)
 
-### 6.2 Running the tester
+### 6.2 Running the test
 
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
 source venv/bin/activate
-python simulation/test_gpio_pins.py
+python simulation/test_rule_engine_mqtt.py
 ```
 
-On startup, the tool will tell you whether it detected real hardware:
+Expected output:
 
 ```
-  Hardware: REAL GPIO (Pi detected)     ← on a Raspberry Pi
-  Hardware: MOCK (virtual pins)         ← on a dev machine
+============================================================
+  Rule Engine — MQTT Payload Test Suite
+============================================================
+
+━━ 1. Mode A — energy sufficient, battery ≥80%, lag stable ━━
+  ✓ mode is A
+  ✓ relay_1 is True
+  ...
+
+============================================================
+  ALL 22 TESTS PASSED ✓
+============================================================
 ```
 
-### 6.3 Interactive commands
+### 6.3 How the ESP32 uses the payload
 
-| Command | What it does |
-|---------|-------------|
-| `A` | Apply Mode A — sets all 3 pins HIGH (all relays ON) |
-| `B` | Apply Mode B — pins 17 + 27 HIGH, pin 22 LOW |
-| `C` | Apply Mode C — only pin 17 HIGH (baseline) |
-| `1` / `2` / `3` | Toggle that relay pin ON↔OFF |
-| `on <pin>` | Force a specific pin ON (e.g. `on 17` or `on 1`) |
-| `off <pin>` | Force a specific pin OFF (e.g. `off 27` or `off 2`) |
-| `blink <pin>` | Blink a pin ON/OFF 3 times (e.g. `blink 22` or `blink 3`) |
-| `status` | Print current state table for all 3 pins |
-| `verify` | **(Pi only)** Runs `pinctrl get` to show actual hardware voltage |
-| `help` | Show the full command menu |
-| `q` | Clean up all pins and exit |
+The rule engine publishes to `room/relays/state` with `relay_1`, `relay_2`, `relay_3` boolean fields. The ESP32 subscribes to this topic and drives its GPIO pins accordingly:
 
-You can use either relay numbers (`1`, `2`, `3`) or BCM pin numbers (`17`, `27`, `22`) interchangeably for all pin commands.
-
-### 6.4 Recommended test walkthrough
-
-Here is a step-by-step sequence to verify all modes and pins work correctly:
-
-```
-> A
-  ⚡ Mode A — Peak Demand
-     Relay 1 (Pin 17): ON
-     Relay 2 (Pin 27): ON
-     Relay 3 (Pin 22): ON
-
-> verify          ← (Pi only) confirms all 3 header pins are HIGH
-
-> C
-  ⚡ Mode C — Baseline Load
-     Relay 1 (Pin 17): ON
-     Relay 2 (Pin 27): OFF
-     Relay 3 (Pin 22): OFF
-
-> verify          ← confirms only pin 17 is HIGH, 27 and 22 are LOW
-
-> B
-  ⚡ Mode B — Average Load
-     Relay 1 (Pin 17): ON
-     Relay 2 (Pin 27): ON
-     Relay 3 (Pin 22): OFF
-
-> 3               ← toggles relay 3 (pin 22) ON
-> 3               ← toggles it back OFF
-
-> blink 2         ← blinks relay 2 (pin 27) 3 times
-
-> q               ← cleans up all pins and exits
-```
-
-### 6.5 Verifying from a separate terminal (Pi only)
-
-While the tester is running, you can confirm the actual hardware pin states from another terminal session:
-
-```bash
-# Check individual pin states
-pinctrl get 17    # Should show "op dh" (output, driven high) when ON
-pinctrl get 27    # Should show "op dl" (output, driven low) when OFF
-pinctrl get 22
-
-# Or use a multimeter:
-# - Place the negative probe on a GND pin (e.g. pin 6, 9, 14, 20, 25)
-# - Place the positive probe on the BCM header pin
-# - A HIGH pin reads ~3.3V, a LOW pin reads ~0V
-```
-
-### 6.6 Pin header reference
-
-| Relay | BCM Pin | Physical Header Pin | Priority |
-|-------|---------|--------------------|-----------|
-| Relay 1 | GPIO 17 | Pin 11 | Critical (always ON in all modes) |
-| Relay 2 | GPIO 27 | Pin 13 | Medium (ON in Mode A and B) |
-| Relay 3 | GPIO 22 | Pin 15 | Luxury (ON in Mode A only) |
+| Payload field | ESP32 action |
+|--------------|-------------|
+| `relay_1: true` | GPIO pin → HIGH (relay closes, device ON) |
+| `relay_1: false` | GPIO pin → LOW (relay opens, device OFF) |
+| Same for `relay_2`, `relay_3` | — |
 
 ## 7. What to Expect When Running
 
 1. Simulator publishes sensor payloads to `room/sensors` (prediction-paced — waits for ML response before advancing).
 2. ML service receives sensor data via MQTT, runs the GRU + LightGBM model, and publishes predictions to `room/ml/predictions`.
 3. Logger buffers sensor and prediction data and writes 5-minute averages to SQLite.
-4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state`.
+4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state` (consumed by ESP32 + dashboard).
+5. ESP32 relay controller subscribes to `room/relays/state` and drives physical relay GPIO pins.
 5. Battery lag tracker (inside the rule engine) shifts T-now/T-1/T-2 every 30 seconds and publishes lightweight `battery_lag_update` payloads to the dashboard.
 6. Django API serves historical data at `/api/v1/*`.
 7. Dashboard shows live data from MQTT in the browser.
@@ -349,7 +258,10 @@ Key variables for the rule engine:
 ```bash
 DECISION_INTERVAL_MINUTES=3
 BATTERY_LAG_INTERVAL_SECONDS=30
-MAX_BATTERY_DROP_PERCENT=2
+MAX_BATTERY_DROP_PERCENT=2              # Daytime (solar) threshold
+MAX_BATTERY_DROP_NIGHT_PERCENT=8        # Nighttime (no solar) threshold
+SOLAR_HOUR_START=11                     # Solar window start (24h)
+SOLAR_HOUR_END=16                       # Solar window end (24h, exclusive)
 MODE_A_MAX_KWH=2.4
 ```
 
@@ -450,41 +362,28 @@ sudo journalctl -u rule-engine -f
      sqlite3 room_backend/db.sqlite3 "PRAGMA journal_mode;"
      ```
 
-6. GPIO not working on Pi 5
-   - **Symptom:** `RuntimeError: Cannot determine SOC peripheral base address` or `ModuleNotFoundError: No module named 'RPi'`.
-   - **Cause:** RPi.GPIO does not support the Raspberry Pi 5's RP1 GPIO chip.
-   - **Fix:** Install `lgpio` (the only GPIO library that works on Pi 5):
-     ```bash
-     sudo apt install -y python3-lgpio
-     ```
-   - `gpiozero` (used by the rule engine and test script) will automatically use `lgpio` as its backend on Pi 5. No code changes are needed.
+6. Rule engine MQTT test fails
+   - Run `python simulation/test_rule_engine_mqtt.py` and check output for which assertions failed.
+   - Verify that `.env` has all required variables.
 
-7. GPIO permission denied
-   - On the Pi, GPIO access may require root. Run the rule engine with `sudo` or add your user to the `gpio` group:
-     ```bash
-     sudo usermod -aG gpio $USER
-     # Log out and back in for the change to take effect
-     ```
-
-8. `pinctrl` command not found
-   - Install it:
-     ```bash
-     sudo apt install -y raspi-utils
-     ```
+7. ESP32 not receiving relay commands
+   - Verify the ESP32 is subscribed to `room/relays/state`.
+   - Check MQTT connectivity: `mosquitto_sub -t "room/relays/state" -v`
+   - Ensure the rule engine is running and publishing.
 
 ## 12. Quick Checklist
 
 ```text
- 1. Install lgpio on Pi 5:    sudo apt install python3-lgpio
- 2. Start Mosquitto
- 3. Start Django
- 4. Start mqtt_logger
- 5. Start rule_engine
- 6. Start ML service (ML/test_prediction_api.py)
- 7. Start simulator (or hardware publisher) and keep it running
+ 1. Start Mosquitto
+ 2. Start Django
+ 3. Start mqtt_logger
+ 4. Start rule_engine (publishes to MQTT, no local GPIO)
+ 5. Start ML service (ML/test_prediction_api.py)
+ 6. Start simulator (or hardware publisher) and keep it running
+ 7. Ensure ESP32 relay controller is powered and connected to MQTT
  8. Open dashboard (dashboard/index.html) in browser
- 9. Test GPIO pins:           python simulation/test_gpio_pins.py
-10. Verify live MQTT traffic: mosquitto_sub -t "room/#" -v
+ 9. Test rule engine:          python simulation/test_rule_engine_mqtt.py
+10. Verify live MQTT traffic:  mosquitto_sub -t "room/#" -v
 11. Verify dashboard/API responses
 ```
 
@@ -492,6 +391,6 @@ Shutdown order:
 
 1. Stop simulator/publishers
 2. Stop ML service
-3. Stop workers
+3. Stop workers (rule engine publishes Mode C on shutdown for ESP32 safety)
 4. Stop Django
 5. Stop Mosquitto

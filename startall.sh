@@ -49,7 +49,12 @@ echo "-> Starting FastAPI ML Service..."
 cd "$BASE_DIR/ML"
 ../venv/bin/python test_prediction_api.py &
 
-# 6. Start Data Simulator
+# 6. Start Hardware Bridge (Group 1 NANO/UNO → room/sensors normaliser)
+echo "-> Starting Hardware Bridge worker..."
+cd "$BASE_DIR"
+"$VENV_PYTHON" workers/hw_bridge.py &
+
+# 7. Start Data Simulator (only needed when Group 1 hardware is NOT connected)
 echo "-> Starting Data Simulator..."
 cd "$BASE_DIR"
 "$VENV_PYTHON" simulation/data_simulator.py &

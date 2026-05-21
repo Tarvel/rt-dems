@@ -10,12 +10,77 @@ QoS: `1`
 
 | Topic | Publisher | Subscribers | Description |
 |---|---|---|---|
-| `room/sensors` | Hardware or simulator | ML service, logger, rule engine, dashboard | Raw telemetry stream |
+| `room/sensors` | hw_bridge or simulator | ML service, logger, rule engine, dashboard | Normalised telemetry stream |
+| `room/hardware/nano` | Group 1 ESP32 (NANO) | hw_bridge | Raw environmental sensor data |
+| `room/hardware/uno` | Group 1 ESP32 (UNO) | hw_bridge | Raw battery/SoC data |
 | `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
 | `room/data/averaged` | logger | dashboard | 5-minute averaged values |
 | `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
 
-## 2. Sensor Payload Contract (`room/sensors`)
+## 2. Group 1 Hardware Payload Contracts
+
+Group 1's hardware publishes on two dedicated topics. The `hw_bridge.py` worker normalises these into the `room/sensors` schema (section 3) so downstream subscribers need no changes.
+
+### 2a. NANO Environmental Data (`room/hardware/nano`)
+
+```json
+{
+  "temperature": 28.5,
+  "humidity": 65.0,
+  "voltage": 220.4,
+  "current": 1.45,
+  "power": 319.5,
+  "energy": 12.345,
+  "lux": 450.0,
+  "ultrasonic_occupancy": 1,
+  "radar_motion": 0
+}
+```
+
+| Field | Type | Unit | Notes |
+|---|---|---|---|
+| `temperature` | float | °C | Room temperature |
+| `humidity` | float | % | Relative humidity |
+| `voltage` | float | V | Mains voltage |
+| `current` | float | A | Load current |
+| `power` | float | W | Instantaneous power |
+| `energy` | float | kWh | Cumulative energy (mapped to `energy_kw` in bridge) |
+| `lux` | float | lx | Ambient light level |
+| `ultrasonic_occupancy` | int | 0/1 | Ultrasonic presence (mapped to `occupancy`) |
+| `radar_motion` | int | 0/1 | Radar-based motion detection (passed through) |
+
+### 2b. UNO Battery Data (`room/hardware/uno`)
+
+```json
+{
+  "node": "DC",
+  "battery_voltage": 24.5,
+  "soc": 80
+}
+```
+
+| Field | Type | Unit | Notes |
+|---|---|---|---|
+| `node` | string | — | Always `"DC"` (identifier) |
+| `battery_voltage` | float | V | Battery terminal voltage |
+| `soc` | float | % | State of Charge (mapped to `battery_level`) |
+
+### 2c. Field mapping (hw_bridge normalisation)
+
+| Group 1 field | → `room/sensors` field | Transform |
+|---|---|---|
+| `temperature` | `temperature`, `temperature_c` | Direct copy |
+| `humidity` | `humidity` | Direct copy |
+| `voltage` | `voltage` | Direct copy |
+| `current` | `current` | Direct copy |
+| `energy` | `energy_kw` | Key rename |
+| `lux` | `lux` | Direct copy |
+| `ultrasonic_occupancy` | `occupancy` | Key rename + int cast |
+| `radar_motion` | `radar_motion` | Pass-through |
+| `soc` (UNO) | `battery_level` | Key rename |
+| `battery_voltage` (UNO) | `battery_voltage` | Pass-through |
+
+## 3. Sensor Payload Contract (`room/sensors`)
 
 ### Required fields
 
@@ -39,8 +104,9 @@ QoS: `1`
 2. `temperature_c` is the preferred name.
 3. `energy_kwh` is energy for the sample interval.
 4. `voltage` and `current` are optional (the backend logger defaults them to `0.0` if missing).
+5. When `source` is `"group1_hardware"`, the data originated from the hw_bridge (real sensors). When absent, it is from the simulator.
 
-## 3. ML Payload Contract (`room/ml/predictions`)
+## 4. ML Payload Contract (`room/ml/predictions`)
 
 Published by `ML/test_prediction_api.py` via MQTT when a sensor message arrives on `room/sensors`.
 
@@ -91,7 +157,7 @@ The dashboard and rule engine look for prediction values in this order:
 2. `predicted_energy_kw` (converted to kWh using the decision interval)
 3. `predicted_energy_range` (used as-is)
 
-## 4. Averaged Data Payload (`room/data/averaged`)
+## 5. Averaged Data Payload (`room/data/averaged`)
 
 Published every logger flush cycle:
 
@@ -109,7 +175,7 @@ Published every logger flush cycle:
 }
 ```
 
-## 5. Relay State Payload (`room/relays/state`)
+## 6. Relay State Payload (`room/relays/state`)
 
 This topic publishes two different types of payloads.
 
@@ -141,7 +207,7 @@ This topic publishes two different types of payloads.
 }
 ```
 
-## 6. Rule Threshold Contract
+## 7. Rule Threshold Contract
 
 The rule engine uses a 2-step decision hierarchy based on energy sufficiency and battery state.
 
@@ -166,7 +232,7 @@ Configurable via:
 
 The rule engine does **not** drive GPIO pins directly. It publishes the `relay_1`, `relay_2`, `relay_3` booleans to `room/relays/state`. An external **ESP32 microcontroller** subscribes to this topic and actuates the physical relay modules based on these values.
 
-## 7. REST API Contract
+## 8. REST API Contract
 
 Base URL: `http://<PI_IP>:8000/api/v1/`
 
@@ -177,7 +243,7 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 5. `GET /relays/`
 6. `GET /relays/current/`
 
-## 8. ML HTTP Test Endpoints (testing only)
+## 9. ML HTTP Test Endpoints (testing only)
 
 Base URL: `http://<PI_IP>:5000`
 
@@ -207,7 +273,7 @@ These endpoints are for manual testing only. Production predictions flow through
 
 All fields have defaults, so you can send an empty `{}` to test with default values.
 
-## 9. Dashboard Realtime Contract
+## 10. Dashboard Realtime Contract
 
 The dashboard (`dashboard/index.html`) is MQTT-driven for realtime values.
 

@@ -53,7 +53,11 @@ try {
     $mlDir = Join-Path $BASE_DIR "ML"
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "test_prediction_api.py" -WorkingDirectory $mlDir
 
-    # 6. Start Data Simulator
+    # 6. Start Hardware Bridge (Group 1 NANO/UNO → room/sensors normaliser)
+    Write-Host "-> Starting Hardware Bridge worker..."
+    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+
+    # 7. Start Data Simulator (only needed when Group 1 hardware is NOT connected)
     Write-Host "-> Starting Data Simulator..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
 

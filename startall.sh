@@ -49,15 +49,40 @@ echo "-> Starting FastAPI ML Service..."
 cd "$BASE_DIR/ML"
 ../venv/bin/python test_prediction_api.py &
 
-# 6. Start Hardware Bridge (Group 1 NANO/UNO → room/sensors normaliser)
-echo "-> Starting Hardware Bridge worker..."
-cd "$BASE_DIR"
-"$VENV_PYTHON" workers/hw_bridge.py &
+# 6. Start data source — controlled by DATA_SOURCE env var
+#    "simulator"  = CSV playback only       (default, for development/testing)
+#    "hardware"   = Group 1 live sensors    (for production with real hardware)
+#    "both"       = both at once            (debugging only — mixed data!)
+source "$BASE_DIR/.env" 2>/dev/null
+DATA_SOURCE="${DATA_SOURCE:-simulator}"
 
-# 7. Start Data Simulator (only needed when Group 1 hardware is NOT connected)
-echo "-> Starting Data Simulator..."
-cd "$BASE_DIR"
-"$VENV_PYTHON" simulation/data_simulator.py &
+echo ""
+echo "  DATA_SOURCE=$DATA_SOURCE"
+
+case "$DATA_SOURCE" in
+  hardware)
+    echo "-> Starting Hardware Bridge (Group 1 live sensors)..."
+    cd "$BASE_DIR"
+    "$VENV_PYTHON" workers/hw_bridge.py &
+    echo "   (Data Simulator skipped — using real hardware)"
+    ;;
+  both)
+    echo "-> Starting Hardware Bridge (Group 1 live sensors)..."
+    cd "$BASE_DIR"
+    "$VENV_PYTHON" workers/hw_bridge.py &
+    echo "-> Starting Data Simulator (CSV playback)..."
+    cd "$BASE_DIR"
+    "$VENV_PYTHON" simulation/data_simulator.py &
+    echo "   ⚠ WARNING: Both sources active — data will be mixed!"
+    ;;
+  *)
+    # Default: simulator only
+    echo "-> Starting Data Simulator (CSV playback)..."
+    cd "$BASE_DIR"
+    "$VENV_PYTHON" simulation/data_simulator.py &
+    echo "   (Hardware Bridge skipped — using simulated data)"
+    ;;
+esac
 
 echo "========================================================"
 echo "✅ All services are now running in the background!"

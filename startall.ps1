@@ -53,13 +53,34 @@ try {
     $mlDir = Join-Path $BASE_DIR "ML"
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "test_prediction_api.py" -WorkingDirectory $mlDir
 
-    # 6. Start Hardware Bridge (Group 1 NANO/UNO → room/sensors normaliser)
-    Write-Host "-> Starting Hardware Bridge worker..."
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+    # 6. Start data source — controlled by DATA_SOURCE env var
+    #    "simulator"  = CSV playback only       (default, for development/testing)
+    #    "hardware"   = Group 1 live sensors    (for production with real hardware)
+    #    "both"       = both at once            (debugging only — mixed data!)
+    $DATA_SOURCE = if ($env:DATA_SOURCE) { $env:DATA_SOURCE } else { "simulator" }
 
-    # 7. Start Data Simulator (only needed when Group 1 hardware is NOT connected)
-    Write-Host "-> Starting Data Simulator..."
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+    Write-Host ""
+    Write-Host "  DATA_SOURCE=$DATA_SOURCE"
+
+    switch ($DATA_SOURCE) {
+        "hardware" {
+            Write-Host "-> Starting Hardware Bridge (Group 1 live sensors)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   (Data Simulator skipped — using real hardware)"
+        }
+        "both" {
+            Write-Host "-> Starting Hardware Bridge (Group 1 live sensors)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+            Write-Host "-> Starting Data Simulator (CSV playback)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   WARNING: Both sources active — data will be mixed!"
+        }
+        default {
+            Write-Host "-> Starting Data Simulator (CSV playback)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   (Hardware Bridge skipped — using simulated data)"
+        }
+    }
 
     Write-Host "========================================================"
     Write-Host "✅ All services are now running in the background!"

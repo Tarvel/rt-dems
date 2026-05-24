@@ -11,30 +11,31 @@ QoS: `1`
 | Topic | Publisher | Subscribers | Description |
 |---|---|---|---|
 | `room/sensors` | hw_bridge or simulator | ML service, logger, rule engine, dashboard | Normalised telemetry stream |
-| `room/hardware/nano` | Group 1 ESP32 (NANO) | hw_bridge | Raw environmental sensor data |
-| `room/hardware/uno` | Group 1 ESP32 (UNO) | hw_bridge | Raw battery/SoC data |
+| `room/hardware/nano` | Group 1 ESP32 | hw_bridge | Combined environmental + battery data |
 | `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
 | `room/data/averaged` | logger | dashboard | 5-minute averaged values |
 | `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
 | `room/control/override` | dashboard | rule engine | Manual mode/relay override commands |
 
-## 2. Group 1 Hardware Payload Contracts
+## 2. Group 1 Hardware Payload Contract
 
-Group 1's hardware publishes on two dedicated topics. The `hw_bridge.py` worker normalises these into the `room/sensors` schema (section 3) so downstream subscribers need no changes.
+Group 1's ESP32 publishes a single combined payload (environmental sensors + battery) to `room/hardware/nano`. The `hw_bridge.py` worker normalises this into the `room/sensors` schema (section 3) so downstream subscribers need no changes.
 
-### 2a. NANO Environmental Data (`room/hardware/nano`)
+### 2a. Combined Payload (`room/hardware/nano`)
 
 ```json
 {
-  "temperature": 28.5,
-  "humidity": 65.0,
-  "voltage": 220.4,
-  "current": 1.45,
-  "power": 319.5,
-  "energy": 12.345,
-  "lux": 450.0,
-  "ultrasonic_occupancy": 1,
-  "radar_motion": 0
+  "temperature": 31.6,
+  "humidity": 63.2,
+  "voltage": 0.0,
+  "current": 0.00,
+  "power": 0.0,
+  "energy": 0.000,
+  "lux": 5.75,
+  "ultrasonic_occupancy": 0,
+  "radar_motion": 1,
+  "battery_voltage": 26.2,
+  "soc": 100
 }
 ```
 
@@ -49,24 +50,10 @@ Group 1's hardware publishes on two dedicated topics. The `hw_bridge.py` worker 
 | `lux` | float | lx | Ambient light level |
 | `ultrasonic_occupancy` | int | 0/1 | Ultrasonic presence (mapped to `occupancy`) |
 | `radar_motion` | int | 0/1 | Radar-based motion detection (passed through) |
-
-### 2b. UNO Battery Data (`room/hardware/uno`)
-
-```json
-{
-  "node": "DC",
-  "battery_voltage": 24.5,
-  "soc": 80
-}
-```
-
-| Field | Type | Unit | Notes |
-|---|---|---|---|
-| `node` | string | — | Always `"DC"` (identifier) |
 | `battery_voltage` | float | V | Battery terminal voltage |
 | `soc` | float | % | State of Charge (mapped to `battery_level`) |
 
-### 2c. Field mapping (hw_bridge normalisation)
+### 2b. Field mapping (hw_bridge normalisation)
 
 | Group 1 field | → `room/sensors` field | Transform |
 |---|---|---|
@@ -78,8 +65,8 @@ Group 1's hardware publishes on two dedicated topics. The `hw_bridge.py` worker 
 | `lux` | `lux` | Direct copy |
 | `ultrasonic_occupancy` | `occupancy` | Key rename + int cast |
 | `radar_motion` | `radar_motion` | Pass-through |
-| `soc` (UNO) | `battery_level` | Key rename |
-| `battery_voltage` (UNO) | `battery_voltage` | Pass-through |
+| `soc` | `battery_level` | Key rename |
+| `battery_voltage` | `battery_voltage` | Pass-through |
 
 ## 3. Sensor Payload Contract (`room/sensors`)
 

@@ -261,7 +261,10 @@ def evaluate_rules() -> tuple[str, str]:
     battery_level = latest_sensor.get("battery_level", 100.0)
 
     # Resolve predicted energy from whichever key the ML payload has.
+    # new_ML uses "predicted_energy_wh" (Wh units); old ML used kW/kWh keys.
     predicted_energy = latest_ml.get("predicted_energy_kw")
+    if predicted_energy is None:
+        predicted_energy = latest_ml.get("predicted_energy_wh")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_range")
     if predicted_energy is None:

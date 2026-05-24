@@ -190,12 +190,21 @@ def on_message(client, userdata, msg):
 
         log.info(
             "Bridge: hardware → room/sensors  "
-            "(temp=%.1f°C, occ=%d, battery=%.0f%%, energy=%.3fkW)  "
-            "[rx=%d, pub=%d]",
+            "temp=%.1f°C  hum=%.1f%%  V=%.1f  A=%.2f  "
+            "P=%.1fW  E=%.3fkWh  lux=%.1f  "
+            "occ=%d  radar=%d  bat=%.0f%%  batV=%.1f  "
+            "[rx=%d pub=%d]",
             normalised["temperature"],
-            normalised["occupancy"],
-            normalised["battery_level"],
+            normalised["humidity"],
+            normalised["voltage"],
+            normalised["current"],
+            normalised["power_w"],
             normalised["energy_kw"],
+            normalised["lux"],
+            normalised["occupancy"],
+            normalised["radar_motion"],
+            normalised["battery_level"],
+            normalised["battery_voltage"],
             stats["rx"],
             stats["published"],
         )

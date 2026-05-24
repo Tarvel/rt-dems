@@ -48,10 +48,10 @@ try {
     Write-Host "-> Starting Rule Engine worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/rule_engine.py" -WorkingDirectory $BASE_DIR
 
-    # 5. Start FastAPI ML Service
-    Write-Host "-> Starting FastAPI ML Service..."
-    $mlDir = Join-Path $BASE_DIR "ML"
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "test_prediction_api.py" -WorkingDirectory $mlDir
+    # 5. Start FastAPI ML Service (new_ML)
+    Write-Host "-> Starting FastAPI ML Service (new_ML)..."
+    $mlDir = Join-Path $BASE_DIR "new_ML"
+    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "new_prediction_api.py" -WorkingDirectory $mlDir
 
     # 6. Start data source — controlled by DATA_SOURCE env var
     #    "simulator"  = CSV playback only       (default, for development/testing)

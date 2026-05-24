@@ -96,21 +96,17 @@ Group 1's ESP32 publishes a single combined payload (environmental sensors + bat
 
 ## 4. ML Payload Contract (`room/ml/predictions`)
 
-Published by `ML/test_prediction_api.py` via MQTT when a sensor message arrives on `room/sensors`.
+Published by `new_ML/new_prediction_api.py` via MQTT when a sensor message arrives on `room/sensors`.
 
 ```json
 {
-  "predicted_energy_kw": 1.224,
-  "upper_bound_energy_kw": 1.374,
-  "predicted_energy_range": 1.374,
-  "actual_energy_kw": 1.101,
-  "base_gru_kwh": 1.052,
-  "lgbm_correction_kwh": 0.172,
-  "hybrid_final_kwh": 1.224,
-  "safety_lower_bound": 1.087,
-  "safety_upper_bound": 1.374,
+  "predicted_energy_wh": 45.2301,
+  "upper_bound_energy_wh": 52.8745,
+  "lower_bound_energy_wh": 37.5857,
+  "predicted_energy_range_wh": [37.5857, 52.8745],
+  "energy_unit": "Wh",
   "peak_demand": 2.4,
-  "timestamp": "2026-03-22T10:55:00+00:00",
+  "timestamp": "2026-05-24T17:00:00+00:00",
   "source": "fastapi-local-model"
 }
 ```
@@ -119,31 +115,23 @@ Published by `ML/test_prediction_api.py` via MQTT when a sensor message arrives 
 
 | Field | Unit | Description |
 |---|---|---|
-| `predicted_energy_kw` | kW | Hybrid model prediction (GRU + LightGBM combined) |
-| `upper_bound_energy_kw` | kW | Upper 95% confidence bound from Bayesian uncertainty |
-| `predicted_energy_range` | kW | Same as upper bound, kept for backward compatibility |
-| `actual_energy_kw` | kW | Actual energy value of the evaluated row (if available) |
-| `base_gru_kwh` | kWh | Base GRU model output before LightGBM correction |
-| `lgbm_correction_kwh` | kWh | Residual correction added by LightGBM |
-| `hybrid_final_kwh` | kWh | Final hybrid output (`base_gru_kwh + lgbm_correction_kwh`) |
-| `safety_lower_bound` | kWh | Lower safety bound from uncertainty estimator |
-| `safety_upper_bound` | kWh | Upper safety bound from uncertainty estimator |
+| `predicted_energy_wh` | Wh | Hybrid prediction (TE-GRU + LightGBM with Bayesian adaptive weighting) |
+| `upper_bound_energy_wh` | Wh | Upper confidence bound (z=1.5 × residual std) |
+| `lower_bound_energy_wh` | Wh | Lower confidence bound |
+| `predicted_energy_range_wh` | Wh | `[lower, upper]` bounds as an array |
+| `energy_unit` | string | Always `"Wh"` |
 | `peak_demand` | kW | Configurable threshold (default 2.4 kW) |
 | `timestamp` | ISO 8601 | When the prediction was made |
 | `source` | string | Always `"fastapi-local-model"` |
 
-### Extended fields compatibility note
-
-1. `predicted_energy_kw`, `predicted_energy_range`, and `peak_demand` remain the minimum stable fields for existing backend consumers.
-2. Additional fields (`actual_energy_kw`, `base_gru_kwh`, `lgbm_correction_kwh`, `hybrid_final_kwh`, `safety_lower_bound`, `safety_upper_bound`) are additive and intended for richer dashboards/analytics.
-
 ### Consumer lookup order
 
-The dashboard and rule engine look for prediction values in this order:
+The rule engine resolves predicted energy from whichever key the ML payload provides, in this order:
 
-1. `predicted_energy_kwh` (if present)
-2. `predicted_energy_kw` (converted to kWh using the decision interval)
-3. `predicted_energy_range` (used as-is)
+1. `predicted_energy_kw` (legacy)
+2. `predicted_energy_wh` (new_ML — current)
+3. `predicted_energy_range` (legacy fallback)
+4. `predicted_energy_kwh` (legacy fallback)
 
 ## 5. Averaged Data Payload (`room/data/averaged`)
 

@@ -50,10 +50,10 @@ cd "$BASE_DIR"
 echo "-> Starting Rule Engine worker..."
 "$VENV_PYTHON" workers/rule_engine.py &
 
-# 5. Start FastAPI ML Service
-echo "-> Starting FastAPI ML Service..."
-cd "$BASE_DIR/ML"
-../venv/bin/python test_prediction_api.py &
+# 5. Start FastAPI ML Service (new_ML)
+echo "-> Starting FastAPI ML Service (new_ML)..."
+cd "$BASE_DIR/new_ML"
+../venv/bin/python new_prediction_api.py &
 
 # 6. Start data source — controlled by DATA_SOURCE env var
 #    "simulator"  = CSV playback only       (default, for development/testing)

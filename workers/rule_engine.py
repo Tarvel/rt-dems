@@ -53,10 +53,10 @@ DB_PATH = os.environ.get(
 # │  TESTING DEFAULT: 1 minutes.  Change to 5 for production.       │
 # │  export DECISION_INTERVAL_MINUTES=5                             │
 # └─────────────────────────────────────────────────────────────────┘
-DECISION_INTERVAL_MINUTES = int(
+DECISION_INTERVAL_MINUTES = float(
     os.environ.get("DECISION_INTERVAL_MINUTES", 1)
 )
-DECISION_INTERVAL_SECONDS = DECISION_INTERVAL_MINUTES * 60
+DECISION_INTERVAL_SECONDS = int(DECISION_INTERVAL_MINUTES * 60)
 
 # Battery lag tracker: sample every 60 seconds (T-now, T-60s, T-120s).
 BATTERY_LAG_INTERVAL_SECONDS = int(

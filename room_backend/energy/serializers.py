@@ -8,14 +8,12 @@ class SensorLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = SensorLog
         fields = "__all__"
-        read_only_fields = fields
 
 
 class MLPredictionSerializer(serializers.ModelSerializer):
     class Meta:
         model = MLPrediction
         fields = "__all__"
-        read_only_fields = fields
 
 
 class RelayStateSerializer(serializers.ModelSerializer):
@@ -33,4 +31,3 @@ class RelayStateSerializer(serializers.ModelSerializer):
             "relay_3",
             "reason",
         ]
-        read_only_fields = fields

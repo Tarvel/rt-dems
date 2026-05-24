@@ -182,8 +182,18 @@ def on_message(client, userdata, msg):
     global latest_battery, latest_nano
 
     try:
-        payload = json.loads(msg.payload.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # Try strict UTF-8 first (normal path)
+        raw = msg.payload.decode("utf-8")
+    except UnicodeDecodeError:
+        # Group 1's Arduino sometimes sends garbled serial bytes —
+        # fall back to latin-1 (accepts any byte) and let JSON
+        # parsing decide if the content is salvageable.
+        raw = msg.payload.decode("latin-1")
+        log.debug("Non-UTF-8 bytes on %s — decoded via latin-1 fallback", msg.topic)
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
         log.warning("Bad payload on %s: %s", msg.topic, exc)
         return
 

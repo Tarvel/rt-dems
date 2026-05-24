@@ -52,13 +52,14 @@ check() {
 check "Mosquitto (MQTT broker)" \
     "timeout 3 bash -c 'echo > /dev/tcp/localhost/1883' 2>/dev/null || mosquitto_pub -h localhost -t 'healthcheck' -m 'ping' -q 0 2>/dev/null"
 
-# 2. Django API — does /api/v1/ respond?
+# 2. Django API — is port 8000 accepting connections?
+#    (We check the port, not the HTTP response, because Django may 404 on / or /api/v1/)
 check "Django API (port 8000)" \
-    "curl -sf --max-time 5 http://localhost:8000/api/v1/ > /dev/null 2>&1 || curl -sf --max-time 5 http://localhost:8000/ > /dev/null 2>&1"
+    "timeout 3 bash -c 'echo > /dev/tcp/localhost/8000' 2>/dev/null"
 
-# 3. ML FastAPI service — does /health or / respond?
+# 3. ML FastAPI service — is port 5000 accepting connections?
 check "ML Service (port 5000)" \
-    "curl -sf --max-time 5 http://localhost:5000/ > /dev/null 2>&1 || curl -sf --max-time 5 http://localhost:5000/health > /dev/null 2>&1"
+    "timeout 3 bash -c 'echo > /dev/tcp/localhost/5000' 2>/dev/null"
 
 # 4. MQTT Logger process — is it running?
 check "MQTT Logger (mqtt_logger.py)" \

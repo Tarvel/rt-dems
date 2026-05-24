@@ -139,7 +139,7 @@ def compute_ml_average(predictions: list[dict]) -> dict | None:
     n = len(predictions)
     avg = {
         "predicted_energy_range": round(
-            float(sum(p["predicted_energy_range"] for p in predictions) / n), 2
+            float(sum(p["predicted_energy_range"] for p in predictions) / n), 4
         ),
         "peak_demand": round(float(sum(p["peak_demand"] for p in predictions) / n), 2),
     }
@@ -271,6 +271,11 @@ def on_message(client, userdata, msg):
             log.debug("Buffered sensor reading (%d in buffer)", len(sensor_buffer))
 
         elif msg.topic == TOPIC_ML:
+            # Normalise new_ML key → internal storage name.
+            # new_ML sends "predicted_energy_wh"; old ML sent "predicted_energy_range".
+            if "predicted_energy_wh" in payload and "predicted_energy_range" not in payload:
+                payload["predicted_energy_range"] = payload["predicted_energy_wh"]
+
             required = {"predicted_energy_range", "peak_demand"}
             if not required.issubset(payload.keys()):
                 log.warning("ML payload missing keys: %s", required - payload.keys())

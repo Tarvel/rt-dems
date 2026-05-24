@@ -72,6 +72,15 @@ class RelayState(models.Model):
     relay_3 = models.BooleanField(help_text="Priority 3 relay state")
     reason = models.TextField(help_text="Human-readable reason for this decision")
 
+    # Sensor snapshot at the time of the decision
+    temperature = models.FloatField(help_text="Temperature (°C) at decision time", default=0.0)
+    humidity = models.FloatField(help_text="Humidity (%) at decision time", default=0.0)
+    lux = models.FloatField(help_text="Ambient light (lx) at decision time", default=0.0)
+    occupancy = models.IntegerField(help_text="Occupancy state at decision time", default=0)
+    energy_kw = models.FloatField(help_text="Energy (kWh) at decision time", default=0.0)
+    battery_level = models.FloatField(help_text="Battery SoC (%) at decision time", default=0.0)
+    battery_voltage = models.FloatField(help_text="Battery voltage (V) at decision time", default=0.0)
+
     class Meta:
         ordering = ["-timestamp"]
         verbose_name = "Relay State"

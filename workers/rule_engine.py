@@ -192,29 +192,64 @@ def ensure_relay_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS energy_relaystate (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT    NOT NULL DEFAULT (datetime('now')),
-            mode      TEXT    NOT NULL,
-            relay_1   INTEGER NOT NULL,
-            relay_2   INTEGER NOT NULL,
-            relay_3   INTEGER NOT NULL,
-            reason    TEXT    NOT NULL DEFAULT ''
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT    NOT NULL DEFAULT (datetime('now')),
+            mode            TEXT    NOT NULL,
+            relay_1         INTEGER NOT NULL,
+            relay_2         INTEGER NOT NULL,
+            relay_3         INTEGER NOT NULL,
+            reason          TEXT    NOT NULL DEFAULT '',
+            temperature     REAL    NOT NULL DEFAULT 0.0,
+            humidity        REAL    NOT NULL DEFAULT 0.0,
+            lux             REAL    NOT NULL DEFAULT 0.0,
+            occupancy       INTEGER NOT NULL DEFAULT 0,
+            energy_kw       REAL    NOT NULL DEFAULT 0.0,
+            battery_level   REAL    NOT NULL DEFAULT 0.0,
+            battery_voltage REAL    NOT NULL DEFAULT 0.0
         );
         """
     )
+    # Add columns to existing tables (safe — SQLite ignores if they exist)
+    for col, coltype in [
+        ("temperature", "REAL DEFAULT 0.0"),
+        ("humidity", "REAL DEFAULT 0.0"),
+        ("lux", "REAL DEFAULT 0.0"),
+        ("occupancy", "INTEGER DEFAULT 0"),
+        ("energy_kw", "REAL DEFAULT 0.0"),
+        ("battery_level", "REAL DEFAULT 0.0"),
+        ("battery_voltage", "REAL DEFAULT 0.0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE energy_relaystate ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     conn.commit()
 
 
 def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
-    """Write a relay-state decision to the database."""
+    """Write a relay-state decision to the database, including a sensor snapshot."""
+    # Grab sensor snapshot under lock
+    with state_lock:
+        snap = {
+            "temperature": float(latest_sensor.get("temperature", 0.0)),
+            "humidity": float(latest_sensor.get("humidity", 0.0)),
+            "lux": float(latest_sensor.get("lux", 0.0)),
+            "occupancy": int(latest_sensor.get("occupancy", 0)),
+            "energy_kw": float(latest_sensor.get("energy_kw", 0.0)),
+            "battery_level": float(latest_sensor.get("battery_level", 0.0)),
+            "battery_voltage": float(latest_sensor.get("battery_voltage", 0.0)),
+        }
+
     try:
         conn = get_db_connection()
         ensure_relay_table(conn)
         conn.execute(
             """
             INSERT INTO energy_relaystate
-                (timestamp, mode, relay_1, relay_2, relay_3, reason)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (timestamp, mode, relay_1, relay_2, relay_3, reason,
+                 temperature, humidity, lux, occupancy,
+                 energy_kw, battery_level, battery_voltage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -223,6 +258,13 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
                 int(r2),
                 int(r3),
                 reason,
+                snap["temperature"],
+                snap["humidity"],
+                snap["lux"],
+                snap["occupancy"],
+                snap["energy_kw"],
+                snap["battery_level"],
+                snap["battery_voltage"],
             ),
         )
         conn.commit()

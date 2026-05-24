@@ -342,15 +342,96 @@ All fields have defaults, so you can send an empty `{}` to test with default val
 
 The dashboard (`dashboard/index.html`) is MQTT-driven for realtime values.
 
-### 9.1 Topics consumed by dashboard
+### 10.1 Topics consumed by dashboard
 
 1. `room/sensors` (primary realtime telemetry)
 2. `room/data/averaged` (5-minute context values)
 3. `room/ml/predictions` (predicted load)
 4. `room/relays/state` (current mode and relay states)
 
-### 9.2 Battery lag display behavior
+### 10.2 Battery lag display behavior
 
 1. The dashboard battery-lag display reads `battery_t_now`, `battery_t1`, and `battery_t2` from `room/relays/state`.
 2. To ensure real-time responsiveness, the backend pushes a lightweight `type: "battery_lag_update"` message to this topic strictly every 30 seconds, entirely independent of the `DECISION_INTERVAL_MINUTES` cadence.
 3. The dashboard ignores the missing `mode` field during these updates and safely updates the lag visualization.
+
+## 11. REST API Endpoints (Django)
+
+Base URL: `http://<PI_IP>:8000/api/v1/`
+
+All endpoints are **GET-only**, paginated, and return JSON.
+
+### 11a. Sensor Logs
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/sensors/` | Paginated list of 5-minute averaged sensor readings (newest first) |
+| `GET /api/v1/sensors/latest/` | Single most recent sensor average |
+
+**Query params** for `/sensors/`: `?page=N`, `?ordering=timestamp` or `?ordering=-temperature`
+
+**Response fields:**
+```json
+{
+  "id": 42,
+  "timestamp": "2026-05-24T19:00:00Z",
+  "temperature": 31.27,
+  "humidity": 59.35,
+  "occupancy": 0,
+  "voltage": 0.0,
+  "current": 0.0,
+  "battery_level": 48.1,
+  "lux": 4.31,
+  "energy_kw": 0.0,
+  "power_w": 0.0,
+  "radar_motion": 1,
+  "battery_voltage": 22.97
+}
+```
+
+### 11b. ML Predictions
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/predictions/` | Paginated list of ML predictions (newest first) |
+| `GET /api/v1/predictions/latest/` | Single most recent ML prediction |
+
+**Response fields:**
+```json
+{
+  "id": 15,
+  "timestamp": "2026-05-24T19:00:00Z",
+  "predicted_energy_range": 7.1235,
+  "peak_demand": 2.4
+}
+```
+
+### 11c. Relay State (Mode Switch Audit Trail)
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/relays/` | Paginated audit trail of all mode decisions (newest first) |
+| `GET /api/v1/relays/current/` | Single most recent relay state (current mode) |
+
+**Response fields:**
+```json
+{
+  "id": 88,
+  "timestamp": "2026-05-24T19:05:00Z",
+  "mode": "B",
+  "mode_display": "Mode B — Average Load (P1+P2 ON)",
+  "relay_1": true,
+  "relay_2": true,
+  "relay_3": false,
+  "reason": "Step 1 PASSED → Step 2: battery stable (drop 0.50% ≤ 2.00%) → Mode B",
+  "temperature": 31.7,
+  "humidity": 60.9,
+  "lux": 4.6,
+  "occupancy": 0,
+  "energy_kw": 0.0,
+  "battery_level": 50.0,
+  "battery_voltage": 23.6
+}
+```
+
+> **Note:** Each relay decision now includes a full sensor snapshot — the exact room conditions at the moment of mode switch. This enables post-hoc analysis of how energy modes correlate with environmental state.

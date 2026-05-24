@@ -22,6 +22,11 @@ class SensorLog(models.Model):
     voltage = models.FloatField(help_text="Average voltage (V)")
     current = models.FloatField(help_text="Average current (A)")
     battery_level = models.FloatField(help_text="Average battery level (%)")
+    lux = models.FloatField(help_text="Average ambient light (lx)", default=0.0)
+    energy_kw = models.FloatField(help_text="Average energy (kWh)", default=0.0)
+    power_w = models.FloatField(help_text="Average power (W)", default=0.0)
+    radar_motion = models.IntegerField(help_text="Dominant radar motion state", default=0)
+    battery_voltage = models.FloatField(help_text="Average battery voltage (V)", default=0.0)
 
     class Meta:
         ordering = ["-timestamp"]
@@ -57,10 +62,11 @@ class RelayState(models.Model):
         ("A", "Mode A — Peak Demand (All ON)"),
         ("B", "Mode B — Average Load (P1+P2 ON)"),
         ("C", "Mode C — Baseline Load (P1 ON only)"),
+        ("MANUAL", "Manual Override"),
     ]
 
     timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
-    mode = models.CharField(max_length=1, choices=MODE_CHOICES)
+    mode = models.CharField(max_length=6, choices=MODE_CHOICES)
     relay_1 = models.BooleanField(help_text="Priority 1 relay state")
     relay_2 = models.BooleanField(help_text="Priority 2 relay state")
     relay_3 = models.BooleanField(help_text="Priority 3 relay state")

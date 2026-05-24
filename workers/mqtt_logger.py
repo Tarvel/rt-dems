@@ -122,6 +122,11 @@ def compute_sensor_average(readings: list[dict]) -> dict | None:
         "voltage": round(float(sum(r.get("voltage", 0.0) for r in readings) / n), 2),
         "current": round(float(sum(r.get("current", 0.0) for r in readings) / n), 2),
         "battery_level": round(float(sum(r["battery_level"] for r in readings) / n), 2),
+        "lux": round(float(sum(r.get("lux", 0.0) for r in readings) / n), 2),
+        "energy_kw": round(float(sum(r.get("energy_kw", 0.0) for r in readings) / n), 4),
+        "power_w": round(float(sum(r.get("power_w", 0.0) for r in readings) / n), 2),
+        "radar_motion": 1 if sum(r.get("radar_motion", 0) for r in readings) / n >= 0.5 else 0,
+        "battery_voltage": round(float(sum(r.get("battery_voltage", 0.0) for r in readings) / n), 2),
     }
     return avg
 
@@ -177,8 +182,9 @@ def flush_to_db(client: mqtt.Client) -> None:
                 """
                 INSERT INTO energy_sensorlog
                     (timestamp, temperature, humidity, occupancy,
-                     voltage, current, battery_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     voltage, current, battery_level,
+                     lux, energy_kw, power_w, radar_motion, battery_voltage)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -188,6 +194,11 @@ def flush_to_db(client: mqtt.Client) -> None:
                     sensor_avg["voltage"],
                     sensor_avg["current"],
                     sensor_avg["battery_level"],
+                    sensor_avg["lux"],
+                    sensor_avg["energy_kw"],
+                    sensor_avg["power_w"],
+                    sensor_avg["radar_motion"],
+                    sensor_avg["battery_voltage"],
                 ),
             )
             log.info("Flush: Wrote sensor average → %s", sensor_avg)

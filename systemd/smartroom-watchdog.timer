@@ -1,0 +1,12 @@
+[Unit]
+Description=Smart Room Health Check Timer (every 2 minutes)
+
+[Timer]
+# Wait 60 seconds after boot before first check (give services time to start)
+OnBootSec=60
+# Then check every 2 minutes
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

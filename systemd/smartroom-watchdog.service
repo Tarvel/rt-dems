@@ -1,0 +1,14 @@
+[Unit]
+Description=Smart Room Health Check Watchdog
+After=smartroom.service
+Requires=smartroom.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/pi/PROJECT_CODE/systemd/healthcheck.sh --fix
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smartroom-watchdog
+
+[Install]
+WantedBy=multi-user.target

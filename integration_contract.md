@@ -16,6 +16,7 @@ QoS: `1`
 | `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
 | `room/data/averaged` | logger | dashboard | 5-minute averaged values |
 | `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
+| `room/control/override` | dashboard | rule engine | Manual mode/relay override commands |
 
 ## 2. Group 1 Hardware Payload Contracts
 
@@ -177,15 +178,16 @@ Published every logger flush cycle:
 
 ## 6. Relay State Payload (`room/relays/state`)
 
-This topic publishes two different types of payloads.
+This topic publishes three different types of payloads.
 
-**A. Full Rule Evaluation Payload (every 3 to 5 minutes)**
+**A. Full Rule Evaluation Payload (every decision interval)**
 ```json
 {
   "mode": "B",
   "relay_1": true,
   "relay_2": true,
   "relay_3": false,
+  "auto": true,
   "battery_t_now": 77.3,
   "battery_t1": 77.9,
   "battery_t2": 78.4,
@@ -195,6 +197,15 @@ This topic publishes two different types of payloads.
   "timestamp": "2026-03-17T12:00:00+00:00"
 }
 ```
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | string | `"A"`, `"B"`, `"C"`, or `"MANUAL"` (when individual relays are overridden) |
+| `relay_1` | bool | Water heater state |
+| `relay_2` | bool | HVAC / A.C. state |
+| `relay_3` | bool | Freezer state |
+| `auto` | bool | `true` = AI auto-managed, `false` = manual override active |
+| `reason` | string | Human-readable explanation of why this mode was chosen |
 
 **B. Lightweight Battery Lag Update (strictly every 30 seconds)**
 ```json
@@ -207,7 +218,86 @@ This topic publishes two different types of payloads.
 }
 ```
 
+**C. Manual Override Payload (published when dashboard sends override)**
+```json
+{
+  "mode": "A",
+  "relay_1": true,
+  "relay_2": true,
+  "relay_3": true,
+  "auto": false,
+  "reason": "Manual override → Mode A",
+  "timestamp": "2026-05-24T17:00:00+00:00"
+}
+```
+
+When `"auto": false`, the dashboard should show the "Manual Override Active" indicator. When `"auto": true`, the system is AI-managed.
+
+## 6b. Manual Override Commands (`room/control/override`)
+
+Published by the **dashboard** to the rule engine. The rule engine subscribes to this topic and responds immediately.
+
+### Enable override — set a mode
+
+Disables auto-management and switches to the specified mode. Relay states are determined by the standard mode mapping (A = all on, B = R1+R2 on, C = R1 only).
+
+```json
+{"auto": false, "mode": "A"}
+```
+```json
+{"auto": false, "mode": "B"}
+```
+```json
+{"auto": false, "mode": "C"}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `auto` | bool | ✅ | Must be `false` to enable override |
+| `mode` | string | ✅ | `"A"`, `"B"`, or `"C"` |
+
+### Enable override — set individual relays
+
+Disables auto-management and sets each relay independently (ignoring mode presets). The mode field in `room/relays/state` will show `"MANUAL"`.
+
+```json
+{"auto": false, "relay_1": true, "relay_2": false, "relay_3": true}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `auto` | bool | ✅ | Must be `false` |
+| `relay_1` | bool | optional | Water heater. Defaults to current state if omitted. |
+| `relay_2` | bool | optional | HVAC / A.C. Defaults to current state if omitted. |
+| `relay_3` | bool | optional | Freezer. Defaults to current state if omitted. |
+
+### Re-enable auto management
+
+Turns off manual override and lets the AI rule engine resume automatic decisions.
+
+```json
+{"auto": true}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `auto` | bool | ✅ | Must be `true` to re-enable auto |
+
+### Testing from terminal
+
+```bash
+# Switch to Mode A manually
+mosquitto_pub -h localhost -t "room/control/override" -m '{"auto": false, "mode": "A"}'
+
+# Toggle individual relays
+mosquitto_pub -h localhost -t "room/control/override" -m '{"auto": false, "relay_1": true, "relay_2": false, "relay_3": true}'
+
+# Turn auto back on
+mosquitto_pub -h localhost -t "room/control/override" -m '{"auto": true}'
+```
+
 ## 7. Rule Threshold Contract
+
 
 The rule engine uses a 2-step decision hierarchy based on energy sufficiency and battery state.
 

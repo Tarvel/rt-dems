@@ -40,6 +40,7 @@ MQTT_CLIENT_ID = "room-rule-engine"
 TOPIC_SENSORS = "room/sensors"
 TOPIC_ML = "room/ml/predictions"
 TOPIC_RELAY_STATE = "room/relays/state"
+TOPIC_OVERRIDE = "room/control/override"
 
 # Database path
 DB_PATH = os.environ.get(
@@ -146,6 +147,13 @@ battery_t2:    float | None = None
 
 # Current mode (persists between evaluations for stability lock)
 current_mode: str = "C"  # start in safest mode
+
+# ── Manual override state ──
+# When True, the evaluation loop skips automatic decisions.
+# The dashboard controls modes/relays directly via room/control/override.
+manual_override: bool = False
+manual_mode: str = "C"
+manual_relays: tuple[bool, bool, bool] = (True, False, False)
 
 # Shutdown flag
 shutdown_event = threading.Event()
@@ -379,7 +387,13 @@ def evaluate_rules() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 def run_evaluation(client: mqtt.Client) -> None:
     """Perform one evaluation cycle: read state, decide mode, actuate, log."""
-    global current_mode
+    global current_mode, manual_override
+
+    # ── Manual override: skip automatic decision ──
+    with state_lock:
+        if manual_override:
+            log.debug("Evaluation: Manual override active — skipping auto.")
+            return
 
     with state_lock:
         if not latest_sensor:
@@ -408,11 +422,23 @@ def run_evaluation(client: mqtt.Client) -> None:
     log_decision(new_mode, r1, r2, r3, reason)
 
     # Publish relay state to MQTT for the frontend
+    _publish_relay_state(client, new_mode, r1, r2, r3, reason, auto=True)
+
+
+def _publish_relay_state(
+    client: mqtt.Client,
+    mode: str,
+    r1: bool, r2: bool, r3: bool,
+    reason: str,
+    auto: bool = True,
+) -> None:
+    """Publish current relay state to MQTT (used by both auto and manual paths)."""
     relay_payload = {
-        "mode": new_mode,
+        "mode": mode,
         "relay_1": r1,
         "relay_2": r2,
         "relay_3": r3,
+        "auto": auto,
         "battery_t_now": round(battery_t_now, 1) if battery_t_now is not None else None,
         "battery_t1":    round(battery_t1, 1)    if battery_t1 is not None else None,
         "battery_t2":    round(battery_t2, 1)    if battery_t2 is not None else None,
@@ -486,10 +512,80 @@ def battery_lag_loop(client: mqtt.Client) -> None:
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log.info("Connected to MQTT broker at %s:%d", MQTT_BROKER, MQTT_PORT)
-        client.subscribe([(TOPIC_SENSORS, 1), (TOPIC_ML, 1)])
-        log.info("Subscribed to %s, %s", TOPIC_SENSORS, TOPIC_ML)
+        client.subscribe([
+            (TOPIC_SENSORS, 1),
+            (TOPIC_ML, 1),
+            (TOPIC_OVERRIDE, 1),
+        ])
+        log.info(
+            "Subscribed to %s, %s, %s",
+            TOPIC_SENSORS, TOPIC_ML, TOPIC_OVERRIDE,
+        )
     else:
         log.error("MQTT connection failed with code %d", rc)
+
+
+def _handle_override(client, payload: dict) -> None:
+    """Handle manual override commands from the dashboard.
+
+    Expected payloads:
+
+    Enable override + set mode:
+        {"auto": false, "mode": "A"}
+        {"auto": false, "mode": "B"}
+        {"auto": false, "mode": "C"}
+
+    Enable override + set individual relays:
+        {"auto": false, "relay_1": true, "relay_2": false, "relay_3": true}
+
+    Re-enable auto management:
+        {"auto": true}
+    """
+    global manual_override, manual_mode, manual_relays, current_mode
+
+    auto = payload.get("auto", True)
+
+    with state_lock:
+        if auto:
+            # ── Re-enable auto management ──
+            manual_override = False
+            log.info("Manual override DISABLED — auto management resumed")
+            return
+
+        # ── Enable manual override ──
+        manual_override = True
+
+        # Mode-based override: {"auto": false, "mode": "A"}
+        if "mode" in payload:
+            mode = payload["mode"].upper()
+            if mode not in ("A", "B", "C"):
+                log.warning("Invalid manual mode: %s — ignoring", mode)
+                return
+            manual_mode = mode
+            manual_relays = apply_mode(mode)
+            current_mode = mode
+            reason = f"Manual override → Mode {mode}"
+
+        # Relay-based override: {"auto": false, "relay_1": true, ...}
+        elif any(k in payload for k in ("relay_1", "relay_2", "relay_3")):
+            r1 = bool(payload.get("relay_1", manual_relays[0]))
+            r2 = bool(payload.get("relay_2", manual_relays[1]))
+            r3 = bool(payload.get("relay_3", manual_relays[2]))
+            manual_relays = (r1, r2, r3)
+            manual_mode = "MANUAL"
+            current_mode = "MANUAL"
+            reason = f"Manual relay override → R1={r1}, R2={r2}, R3={r3}"
+        else:
+            reason = "Manual override enabled (no mode/relay specified)"
+
+    r1, r2, r3 = manual_relays
+    log.info("MANUAL: %s  [R1=%s R2=%s R3=%s]", reason, r1, r2, r3)
+
+    # Log to database
+    log_decision(manual_mode, r1, r2, r3, reason)
+
+    # Publish to room/relays/state so ESP32 + dashboard update
+    _publish_relay_state(client, manual_mode, r1, r2, r3, reason, auto=False)
 
 
 def on_message(client, userdata, msg):
@@ -497,6 +593,11 @@ def on_message(client, userdata, msg):
         payload = json.loads(msg.payload.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         log.warning("Bad payload on %s: %s", msg.topic, exc)
+        return
+
+    # ── Manual override commands ──
+    if msg.topic == TOPIC_OVERRIDE:
+        _handle_override(client, payload)
         return
 
     with state_lock:

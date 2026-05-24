@@ -1,11 +1,11 @@
 [Unit]
 Description=Smart Room Health Check Watchdog
 After=smartroom.service
-Requires=smartroom.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash /home/pi/PROJECT_CODE/systemd/healthcheck.sh --fix
+User=grandmaster
+ExecStart=/bin/bash /home/grandmaster/Documents/project/PROJECT_CODE_4/systemd/healthcheck.sh --fix
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=smartroom-watchdog

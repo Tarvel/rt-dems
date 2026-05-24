@@ -42,9 +42,15 @@ Every 2 minutes: healthcheck.sh --fix
 
 ## Installation (on the Raspberry Pi)
 
-### 1. Copy project to the Pi
+### 1. Verify paths in service files
 
-Make sure the project is at `/home/pi/PROJECT_CODE`. If it's at a different path, update the paths in all `.service` files.
+The service files are configured for the Pi at:
+```
+User: grandmaster
+Path: /home/grandmaster/Documents/project/PROJECT_CODE_4
+```
+
+If your setup is different, update the paths in `smartroom.service`, `smartroom-watchdog.service`, and `rule-engine.service` before copying.
 
 ### 2. Copy service files to systemd
 

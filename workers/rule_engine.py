@@ -50,35 +50,20 @@ DB_PATH = os.environ.get(
 )
 
 # Decision interval in minutes.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  TESTING DEFAULT: 1 minutes.  Change to 5 for production.       │
-# │  export DECISION_INTERVAL_MINUTES=5                             │
-# └─────────────────────────────────────────────────────────────────┘
 DECISION_INTERVAL_MINUTES = float(
-    os.environ.get("DECISION_INTERVAL_MINUTES", 1)
+    os.environ.get("DECISION_INTERVAL_MINUTES", 3)
 )
 DECISION_INTERVAL_SECONDS = int(DECISION_INTERVAL_MINUTES * 60)
 
-# Battery lag tracker: sample every 60 seconds (T-now, T-60s, T-120s).
+# Battery lag tracker: sample every 30 seconds (T-now, T-1, T-2).
 BATTERY_LAG_INTERVAL_SECONDS = int(
-    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 60)
+    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 30)
 )
 BATTERY_LAG_READINGS = 3
 
-# Max safe battery drop (%) over the lag window.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  Two profiles based on solar availability:                      │
-# │                                                                 │
-# │  DAYTIME  (11:00–15:59) — Solar is charging. A >2% drop in the │
-# │  lag window means real overconsumption → strict threshold.      │
-# │                                                                 │
-# │  NIGHTTIME (16:00–10:59) — No solar. Battery naturally drains   │
-# │  under normal loads. A wider threshold prevents false-positive  │
-# │  instability flags that force premature Mode C.                 │
-# │                                                                 │
-# │  export MAX_BATTERY_DROP_PERCENT=2       (daytime, default)     │
-# │  export MAX_BATTERY_DROP_NIGHT_PERCENT=8 (nighttime, default)   │
-# └─────────────────────────────────────────────────────────────────┘
+# Max safe battery drop (%) over the lag window (T-2 → T-now).
+# Daytime (solar window) uses a strict threshold; nighttime is wider
+# to avoid false instability flags when battery naturally drains.
 MAX_BATTERY_DROP_PERCENT = float(
     os.environ.get("MAX_BATTERY_DROP_PERCENT", 2)
 )
@@ -87,9 +72,9 @@ MAX_BATTERY_DROP_NIGHT_PERCENT = float(
 )
 
 # Solar window boundaries (24-hour format).
-# Daytime = SOLAR_START..SOLAR_END-1 (inclusive hours).
-SOLAR_HOUR_START = int(os.environ.get("SOLAR_HOUR_START", 11))   # 11:00 AM
-SOLAR_HOUR_END   = int(os.environ.get("SOLAR_HOUR_END",   16))   # 4:00 PM (exclusive)
+# Daytime = SOLAR_HOUR_START..SOLAR_HOUR_END-1 (inclusive hours).
+SOLAR_HOUR_START = int(os.environ.get("SOLAR_HOUR_START", 11))
+SOLAR_HOUR_END   = int(os.environ.get("SOLAR_HOUR_END",   16))
 
 
 def _active_battery_threshold() -> tuple[float, str]:
@@ -100,21 +85,10 @@ def _active_battery_threshold() -> tuple[float, str]:
     return MAX_BATTERY_DROP_NIGHT_PERCENT, "nighttime"
 
 
-def _format_duration(seconds: int) -> str:
-    if seconds % 60 == 0:
-        minutes = seconds // 60
-        return f"{minutes}m"
-    return f"{seconds}s"
-
-
-# Peak demand threshold in kW. Condition 1 compares predicted energy
-# against this value.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  This is the MODE_A ceiling (peak demand load).               │
-# │  export MODE_A_MAX_KWH=2.4                                   │
-# └─────────────────────────────────────────────────────────────────┘
-MODE_A_MAX_KWH = float(
-    os.environ.get("MODE_A_MAX_KWH", 2.4)
+# Peak demand threshold in Wh. The core decision compares
+# predicted_energy_wh against this value.
+PEAK_DEMAND_WH = float(
+    os.environ.get("PEAK_DEMAND_WH", 2.4)
 )
 
 # ---------------------------------------------------------------------------
@@ -281,14 +255,13 @@ def evaluate_rules() -> tuple[str, str]:
 
     Decision tree
     ─────────────
-    Step 1: predicted_energy >= MODE_A_MAX_KWH  (energy is sufficient)
+    Step 1: predicted_energy > PEAK_DEMAND_WH
         ├─ Battery >= 80%  → lag stable? → A / B
         ├─ Battery >= 50%  → lag stable? → B / C
         └─ Battery <  50%  → C
 
-    Step 2: predicted_energy <  MODE_A_MAX_KWH  (energy is tight)
-        ├─ Battery >= 80%  → lag floor ok? → A / B
-        ├─ Battery >= 60%  → lag floor ok? → B / C
+    Step 2: predicted_energy <= PEAK_DEMAND_WH  (Class A PROHIBITED)
+        ├─ Battery >= 60%  → lag stable? → B / C
         └─ Battery <  60%  → C
     """
     global current_mode
@@ -302,15 +275,12 @@ def evaluate_rules() -> tuple[str, str]:
     occupancy = latest_sensor.get("occupancy")
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    # Resolve predicted energy from whichever key the ML payload has.
-    # new_ML uses "predicted_energy_wh" (Wh units); old ML used kW/kWh keys.
-    predicted_energy = latest_ml.get("predicted_energy_kw")
+    # Resolve predicted energy from ML payload
+    predicted_energy = latest_ml.get("predicted_energy_wh")
     if predicted_energy is None:
-        predicted_energy = latest_ml.get("predicted_energy_wh")
+        predicted_energy = latest_ml.get("predicted_energy_kw")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_range")
-    if predicted_energy is None:
-        predicted_energy = latest_ml.get("predicted_energy_kwh")
 
     log.info(
         "Env snapshot: temp=%.1f°C, humidity=%s, lux=%s, "
@@ -331,99 +301,86 @@ def evaluate_rules() -> tuple[str, str]:
     predicted_energy = float(predicted_energy)
 
     # ── Lag helpers ──────────────────────────────────────────────
-    # "Full lag" means we have readings in all three slots.
     has_full_lag = (battery_t_now is not None
                     and battery_t1 is not None
                     and battery_t2 is not None)
     # Drop = T-2 minus T-now (positive means battery fell)
     lag_drop = (battery_t2 - battery_t_now) if has_full_lag else 0.0
+    lag_threshold, lag_profile = _active_battery_threshold()
+    lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
 
     def _lag_info() -> str:
-        """Short string describing the lag window state."""
         if not has_full_lag:
             return "lag window not full yet (treated as stable)"
         return (
-            f"lag drop={lag_drop:.2f}% (threshold={_active_battery_threshold()[0]}% {_active_battery_threshold()[1]}), "
+            f"drop={lag_drop:.2f}% (max={lag_threshold}% {lag_profile}), "
             f"T-now={battery_t_now:.1f}% T-1={battery_t1:.1f}% T-2={battery_t2:.1f}%"
         )
 
-    # ── STEP 1: predicted_energy >= peak demand (energy sufficient) ──
-    if predicted_energy >= MODE_A_MAX_KWH:
+    # ══════════════════════════════════════════════════════════════
+    # STEP 1: predicted_energy > PEAK_DEMAND_WH
+    # ══════════════════════════════════════════════════════════════
+    if predicted_energy > PEAK_DEMAND_WH:
         step = (
-            f"Step 1 — Predicted {predicted_energy:.4f}kW "
-            f">= peak demand {MODE_A_MAX_KWH}kW"
+            f"Step 1 — predicted {predicted_energy:.4f}Wh "
+            f"> peak demand {PEAK_DEMAND_WH}Wh"
         )
-        lag_threshold, lag_profile = _active_battery_threshold()
-        lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
 
-        # 1 — Battery >= 80%
+        # 1a — Battery >= 80%
         if battery_level >= 80.0:
             if lag_stable:
                 return "A", (
                     f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag stable ({_lag_info()}) → Mode A"
+                    f"lag stable ({_lag_info()}) → Class A"
                 )
             else:
                 return "B", (
                     f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag NOT stable ({_lag_info()}) → Mode B"
+                    f"lag NOT stable ({_lag_info()}) → Class B"
                 )
 
-        # 1 — Battery >= 50%
+        # 1b — Battery >= 50%
         if battery_level >= 50.0:
             if lag_stable:
                 return "B", (
                     f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag stable ({_lag_info()}) → Mode B"
+                    f"lag stable ({_lag_info()}) → Class B"
                 )
             else:
                 return "C", (
                     f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag NOT stable ({_lag_info()}) → Mode C"
+                    f"lag NOT stable ({_lag_info()}) → Class C"
                 )
 
-        # 1 — Battery < 50%
+        # 1bii — Battery < 50%
         return "C", (
-            f"{step}; Battery {battery_level:.1f}% < 50% → Mode C"
+            f"{step}; Battery {battery_level:.1f}% < 50% → Class C"
         )
 
-    # ── STEP 2: predicted_energy < peak demand (energy is tight) ─────
+    # ══════════════════════════════════════════════════════════════
+    # STEP 2: predicted_energy <= PEAK_DEMAND_WH  (Class A PROHIBITED)
+    # ══════════════════════════════════════════════════════════════
     step = (
-        f"Step 2 — Predicted {predicted_energy:.4f}kW "
-        f"< peak demand {MODE_A_MAX_KWH}kW"
+        f"Step 2 — predicted {predicted_energy:.4f}Wh "
+        f"<= peak demand {PEAK_DEMAND_WH}Wh (Class A prohibited)"
     )
-    lag_threshold, lag_profile = _active_battery_threshold()
-    lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
 
-    # 2a — Battery >= 80%
-    if battery_level >= 80.0:
-        if lag_stable:
-            return "A", (
-                f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                f"lag stable ({_lag_info()}) → Mode A"
-            )
-        else:
-            return "B", (
-                f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                f"lag NOT stable ({_lag_info()}) → Mode B"
-            )
-
-    # 2b — Battery >= 60%
+    # 2a — Battery >= 60%
     if battery_level >= 60.0:
         if lag_stable:
             return "B", (
                 f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag stable ({_lag_info()}) → Mode B"
+                f"lag stable ({_lag_info()}) → Class B"
             )
         else:
             return "C", (
                 f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag NOT stable ({_lag_info()}) → Mode C"
+                f"lag NOT stable ({_lag_info()}) → Class C"
             )
 
-    # 2bii — Battery < 60%
+    # 2b — Battery < 60%
     return "C", (
-        f"{step}; Battery {battery_level:.1f}% < 60% → Mode C"
+        f"{step}; Battery {battery_level:.1f}% < 60% → Class C"
     )
 
 
@@ -447,6 +404,11 @@ def run_evaluation(client: mqtt.Client) -> None:
 
         new_mode, reason = evaluate_rules()
 
+        # Grab ML data for logging
+        ml_predicted = latest_ml.get("predicted_energy_wh", "n/a")
+        ml_upper = latest_ml.get("upper_bound_energy_wh", "n/a")
+        ml_lower = latest_ml.get("lower_bound_energy_wh", "n/a")
+
     # Compute relay states (published via MQTT — ESP32 actuates)
     r1, r2, r3 = apply_mode(new_mode)
 
@@ -455,13 +417,22 @@ def run_evaluation(client: mqtt.Client) -> None:
         mode_changed = new_mode != current_mode
         current_mode = new_mode
 
-    change_str = "MODE CHANGED" if mode_changed else "mode unchanged"
+    change_str = "⚡ CLASS CHANGED" if mode_changed else "class unchanged"
     log.info(
-        "Evaluation result: Mode %s (%s) — %s",
-        new_mode,
-        change_str,
-        reason,
+        "━━━ Decision: Class %s (%s)  R1=%s R2=%s R3=%s",
+        new_mode, change_str,
+        "ON" if r1 else "OFF",
+        "ON" if r2 else "OFF",
+        "ON" if r3 else "OFF",
     )
+    log.info(
+        "    ML prediction: %.4f Wh  [lower=%.4f, upper=%.4f]  peak_demand=%.1f Wh",
+        float(ml_predicted) if ml_predicted != "n/a" else 0.0,
+        float(ml_lower) if ml_lower != "n/a" else 0.0,
+        float(ml_upper) if ml_upper != "n/a" else 0.0,
+        PEAK_DEMAND_WH,
+    )
+    log.info("    Reason: %s", reason)
 
     # Log decision to database
     log_decision(new_mode, r1, r2, r3, reason)
@@ -686,9 +657,9 @@ def main() -> None:
 
     log.info("Starting Rule Engine")
     log.info(
-        "Decision interval: %ds (%s)",
+        "Decision interval: %ds (%.0fm)",
         DECISION_INTERVAL_SECONDS,
-        _format_duration(DECISION_INTERVAL_SECONDS),
+        DECISION_INTERVAL_MINUTES,
     )
     log.info(
         "Battery lag tracker: %ds interval (%d readings)",
@@ -696,12 +667,14 @@ def main() -> None:
         BATTERY_LAG_READINGS,
     )
     log.info(
-        "Peak demand threshold (MODE_A_MAX_KWH): %.1f kW",
-        MODE_A_MAX_KWH,
+        "Peak demand threshold (PEAK_DEMAND_WH): %.1f Wh",
+        PEAK_DEMAND_WH,
     )
     log.info(
-        "Max battery drop threshold: %.1f%% (day) / %.1f%% (night)",
+        "Max battery drop: %.1f%% (day %d:00-%d:00) / %.1f%% (night)",
         MAX_BATTERY_DROP_PERCENT,
+        SOLAR_HOUR_START,
+        SOLAR_HOUR_END,
         MAX_BATTERY_DROP_NIGHT_PERCENT,
     )
     log.info("Database: %s", os.path.abspath(DB_PATH))

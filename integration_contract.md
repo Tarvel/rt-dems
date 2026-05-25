@@ -13,7 +13,6 @@ QoS: `1`
 | `room/sensors` | hw_bridge or simulator | ML service, logger, rule engine, dashboard | Normalised telemetry stream |
 | `room/hardware/nano` | Group 1 ESP32 | hw_bridge | Combined environmental + battery data |
 | `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
-| `room/data/averaged` | logger | dashboard | 5-minute averaged values |
 | `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
 | `room/control/override` | dashboard | rule engine | Manual mode/relay override commands |
 
@@ -133,25 +132,7 @@ The rule engine resolves predicted energy from whichever key the ML payload prov
 3. `predicted_energy_range` (legacy fallback)
 4. `predicted_energy_kwh` (legacy fallback)
 
-## 5. Averaged Data Payload (`room/data/averaged`)
-
-Published every logger flush cycle:
-
-```json
-{
-  "temperature": 31.8,
-  "humidity": 58.9,
-  "occupancy": 1,
-  "voltage": 219.7,
-  "current": 5.6,
-  "battery_level": 77.3,
-  "predicted_energy_range": 1.37,
-  "peak_demand": 2.4,
-  "timestamp": "2026-03-17T12:00:00+00:00"
-}
-```
-
-## 6. Relay State Payload (`room/relays/state`)
+## 5. Relay State Payload (`room/relays/state`)
 
 This topic publishes three different types of payloads.
 
@@ -345,9 +326,8 @@ The dashboard (`dashboard/index.html`) is MQTT-driven for realtime values.
 ### 10.1 Topics consumed by dashboard
 
 1. `room/sensors` (primary realtime telemetry)
-2. `room/data/averaged` (5-minute context values)
-3. `room/ml/predictions` (predicted load)
-4. `room/relays/state` (current mode and relay states)
+2. `room/ml/predictions` (predicted load)
+3. `room/relays/state` (current mode and relay states)
 
 ### 10.2 Battery lag display behavior
 

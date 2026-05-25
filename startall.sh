@@ -24,6 +24,13 @@ echo "Starting Smart Room Energy Management System from: $BASE_DIR"
 # Navigate to the base directory (exit if it fails)
 cd "$BASE_DIR" || { echo "Error: Could not access $BASE_DIR"; exit 1; }
 
+# Load .env and export all variables so child processes inherit them
+if [ -f "$BASE_DIR/.env" ]; then
+    set -a
+    source "$BASE_DIR/.env"
+    set +a
+fi
+
 # 1. Stop any existing Mosquitto (system service or stray process)
 echo "-> Stopping any existing Mosquitto..."
 sudo systemctl stop mosquitto 2>/dev/null || true
@@ -32,7 +39,7 @@ sleep 1
 
 # 2. Start our Mosquitto with our config
 echo "-> Starting Mosquitto broker..."
-mosquitto -c systemd/mosquitto.conf -v &
+mosquitto -c systemd/mosquitto.conf -d
 # Give the broker 2 seconds to fully initialize
 sleep 2 
 

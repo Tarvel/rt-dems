@@ -84,14 +84,30 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
-    """Create tables if they don't exist yet (mirrors Django models)."""
+    """Create tables if they don't exist yet (mirrors Django models).
+
+    If the table has the old schema (predicted_energy_range + peak_demand),
+    drop it and recreate with the new schema.
+    """
+    # Check if old schema exists and migrate
+    try:
+        cur = conn.execute("PRAGMA table_info(energy_mlprediction)")
+        cols = {row[1] for row in cur.fetchall()}
+        if cols and "predicted_energy_wh" not in cols:
+            # Old schema — drop and recreate
+            conn.execute("DROP TABLE energy_mlprediction")
+            log.info("Dropped old energy_mlprediction table (schema migration)")
+    except sqlite3.OperationalError:
+        pass
+
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS energy_mlprediction (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp               TEXT    NOT NULL DEFAULT (datetime('now')),
-            predicted_energy_range  REAL    NOT NULL,
-            peak_demand             REAL    NOT NULL
+            predicted_energy_wh     REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_wh          REAL    NOT NULL DEFAULT 0.0,
+            lower_bound_wh          REAL    NOT NULL DEFAULT 0.0
         );
         """
     )
@@ -108,10 +124,15 @@ def compute_ml_average(predictions: list[dict]) -> dict | None:
 
     n = len(predictions)
     avg = {
-        "predicted_energy_range": round(
-            float(sum(p["predicted_energy_range"] for p in predictions) / n), 4
+        "predicted_energy_wh": round(
+            float(sum(p.get("predicted_energy_wh", 0) for p in predictions) / n), 4
         ),
-        "peak_demand": round(float(sum(p["peak_demand"] for p in predictions) / n), 2),
+        "upper_bound_wh": round(
+            float(sum(p.get("upper_bound_wh", 0) for p in predictions) / n), 4
+        ),
+        "lower_bound_wh": round(
+            float(sum(p.get("lower_bound_wh", 0) for p in predictions) / n), 4
+        ),
     }
     return avg
 
@@ -142,10 +163,10 @@ def flush_to_db(client: mqtt.Client) -> None:
         conn.execute(
             """
             INSERT INTO energy_mlprediction
-                (timestamp, predicted_energy_range, peak_demand)
-            VALUES (?, ?, ?)
+                (timestamp, predicted_energy_wh, upper_bound_wh, lower_bound_wh)
+            VALUES (?, ?, ?, ?)
             """,
-            (now, ml_avg["predicted_energy_range"], ml_avg["peak_demand"]),
+            (now, ml_avg["predicted_energy_wh"], ml_avg["upper_bound_wh"], ml_avg["lower_bound_wh"]),
         )
         log.info("Flush: Wrote ML average → %s", ml_avg)
 
@@ -189,17 +210,21 @@ def on_message(client, userdata, msg):
         log.debug("Sensor reading received (pass-through, not stored)")
 
     elif msg.topic == TOPIC_ML:
-        # Normalise new_ML key → internal storage name.
-        # new_ML sends "predicted_energy_wh"; old ML sent "predicted_energy_range".
-        if "predicted_energy_wh" in payload and "predicted_energy_range" not in payload:
-            payload["predicted_energy_range"] = payload["predicted_energy_wh"]
+        # Normalise ML keys for internal storage
+        norm = {
+            "predicted_energy_wh": float(payload.get(
+                "predicted_energy_wh",
+                payload.get("predicted_energy_range", payload.get("predicted_energy_kw", 0))
+            )),
+            "upper_bound_wh": float(payload.get("upper_bound_energy_wh", 0)),
+            "lower_bound_wh": float(payload.get("lower_bound_energy_wh", 0)),
+        }
 
-        required = {"predicted_energy_range", "peak_demand"}
-        if not required.issubset(payload.keys()):
-            log.warning("ML payload missing keys: %s", required - payload.keys())
+        if norm["predicted_energy_wh"] == 0:
+            log.warning("ML payload missing predicted energy value")
             return
         with buffer_lock:
-            ml_buffer.append(payload)
+            ml_buffer.append(norm)
         log.debug("Buffered ML prediction (%d in buffer)", len(ml_buffer))
 
 

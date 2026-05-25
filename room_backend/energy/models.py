@@ -41,10 +41,15 @@ class MLPrediction(models.Model):
     """Predictions published by the ML team."""
 
     timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
-    predicted_energy_range = models.FloatField(
-        help_text="Predicted energy consumption range (kWh)"
+    predicted_energy_wh = models.FloatField(
+        help_text="Predicted energy consumption (Wh)", default=0.0
     )
-    peak_demand = models.FloatField(help_text="Peak demand threshold (kWh)")
+    upper_bound_wh = models.FloatField(
+        help_text="Upper bound of prediction (Wh)", default=0.0
+    )
+    lower_bound_wh = models.FloatField(
+        help_text="Lower bound of prediction (Wh)", default=0.0
+    )
 
     class Meta:
         ordering = ["-timestamp"]
@@ -59,9 +64,10 @@ class RelayState(models.Model):
     """Audit log of every relay-mode decision made by the rule engine."""
 
     MODE_CHOICES = [
-        ("A", "Mode A — Peak Demand (All ON)"),
-        ("B", "Mode B — Average Load (P1+P2 ON)"),
-        ("C", "Mode C — Baseline Load (P1 ON only)"),
+        ("A", "Smart A — Peak Load (All ON)"),
+        ("B", "Smart B — Moderate Load (R1+R2 ON)"),
+        ("C", "Smart C — Baseline Load (R1 ON only)"),
+        ("OFF", "Very Low Load (All OFF)"),
         ("MANUAL", "Manual Override"),
     ]
 

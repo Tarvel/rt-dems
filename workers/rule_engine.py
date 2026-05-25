@@ -25,6 +25,8 @@ import signal
 import sqlite3
 import sys
 import threading
+import urllib.request
+import urllib.error
 
 from datetime import datetime, timezone
 
@@ -38,9 +40,14 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_CLIENT_ID = "room-rule-engine"
 
 TOPIC_SENSORS = "room/sensors"
-TOPIC_ML = "room/ml/predictions"
+TOPIC_ML = "room/ml/predictions"  # Published TO (for logger/frontend)
 TOPIC_RELAY_STATE = "room/relays/state"
 TOPIC_OVERRIDE = "room/control/override"
+
+# ML Service HTTP endpoint (single-timer: rule engine calls ML directly)
+ML_SERVICE_URL = os.environ.get(
+    "ML_SERVICE_URL", "http://localhost:5000/predict"
+)
 
 # Database path
 DB_PATH = os.environ.get(
@@ -61,35 +68,30 @@ BATTERY_LAG_INTERVAL_SECONDS = int(
 )
 BATTERY_LAG_READINGS = 3
 
-# Max safe battery drop (%) over the lag window (T-2 → T-now).
-# Daytime (solar window) uses a strict threshold; nighttime is wider
-# to avoid false instability flags when battery naturally drains.
-MAX_BATTERY_DROP_PERCENT = float(
-    os.environ.get("MAX_BATTERY_DROP_PERCENT", 2)
-)
-MAX_BATTERY_DROP_NIGHT_PERCENT = float(
-    os.environ.get("MAX_BATTERY_DROP_NIGHT_PERCENT", 8)
-)
-
-# Solar window boundaries (24-hour format).
-# Daytime = SOLAR_HOUR_START..SOLAR_HOUR_END-1 (inclusive hours).
-SOLAR_HOUR_START = int(os.environ.get("SOLAR_HOUR_START", 11))
-SOLAR_HOUR_END   = int(os.environ.get("SOLAR_HOUR_END",   16))
+# ── EDFI Load Thresholds (Wh) ──
+# The predicted energy (EDFI) is compared against these to classify load.
+#   EDFI >= PEAK       → Peak Load
+#   MODERATE <= EDFI   → Moderate Load
+#   BASELINE <= EDFI   → Baseline Load
+#   EDFI < BASELINE    → Very Low Load
+PEAK_THRESHOLD = float(os.environ.get("PEAK_THRESHOLD", 80))
+MODERATE_THRESHOLD = float(os.environ.get("MODERATE_THRESHOLD", 50))
+BASELINE_THRESHOLD = float(os.environ.get("BASELINE_THRESHOLD", 30))
 
 
-def _active_battery_threshold() -> tuple[float, str]:
-    """Return (threshold_pct, profile_name) based on current hour."""
-    hour = datetime.now().hour
-    if SOLAR_HOUR_START <= hour < SOLAR_HOUR_END:
-        return MAX_BATTERY_DROP_PERCENT, "daytime"
-    return MAX_BATTERY_DROP_NIGHT_PERCENT, "nighttime"
+# ---------------------------------------------------------------------------
+# Battery stability check
+# ---------------------------------------------------------------------------
+def battery_stable(levels: list[float | None], threshold: float) -> bool:
+    """Return True if ALL battery lag readings are >= threshold.
 
-
-# Peak demand threshold in Wh. The core decision compares
-# predicted_energy_wh against this value.
-PEAK_DEMAND_WH = float(
-    os.environ.get("PEAK_DEMAND_WH", 2.4)
-)
+    If any reading is None (lag window not full), that slot is
+    treated as meeting the threshold so early decisions aren't blocked.
+    """
+    for level in levels:
+        if level is not None and level < threshold:
+            return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -148,8 +150,10 @@ def apply_mode(mode: str) -> tuple[bool, bool, bool]:
         return (True, True, True)
     elif mode == "B":
         return (True, True, False)
-    else:  # "C"
+    elif mode == "C":
         return (True, False, False)
+    else:  # "OFF" — very low load, all relays off
+        return (False, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +257,25 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
 def evaluate_rules() -> tuple[str, str]:
     """Evaluate the decision pipeline and return (mode, reason).
 
+    EDFI = predicted energy (Energy Demand Forecast Interval).
+    Battery stability = ALL 3 lag readings (T-now, T-1, T-2) >= threshold.
+
     Decision tree
     ─────────────
-    Step 1: predicted_energy > PEAK_DEMAND_WH
-        ├─ Battery >= 80%  → lag stable? → A / B
-        ├─ Battery >= 50%  → lag stable? → B / C
-        └─ Battery <  50%  → C
+    PEAK LOAD:     EDFI >= 80
+        ├─ battery_stable(80%) → Smart A
+        ├─ battery_stable(60%) → Smart B
+        └─ else               → Smart C
 
-    Step 2: predicted_energy <= PEAK_DEMAND_WH  (Class A PROHIBITED)
-        ├─ Battery >= 60%  → lag stable? → B / C
-        └─ Battery <  60%  → C
+    MODERATE LOAD: 50 <= EDFI < 80
+        ├─ battery_stable(60%) → Smart B
+        └─ else               → Smart C
+
+    BASELINE LOAD: 30 <= EDFI < 50
+        └─ Always Smart C
+
+    VERY LOW LOAD: EDFI < 30
+        └─ All relays OFF
     """
     global current_mode
 
@@ -275,7 +288,7 @@ def evaluate_rules() -> tuple[str, str]:
     occupancy = latest_sensor.get("occupancy")
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    # Resolve predicted energy from ML payload
+    # Resolve predicted energy (EDFI) from ML payload
     predicted_energy = latest_ml.get("predicted_energy_wh")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_kw")
@@ -298,97 +311,125 @@ def evaluate_rules() -> tuple[str, str]:
             "→ maintaining current mode"
         )
 
-    predicted_energy = float(predicted_energy)
+    edfi = float(predicted_energy)
 
-    # ── Lag helpers ──────────────────────────────────────────────
-    has_full_lag = (battery_t_now is not None
-                    and battery_t1 is not None
-                    and battery_t2 is not None)
-    # Drop = T-2 minus T-now (positive means battery fell)
-    lag_drop = (battery_t2 - battery_t_now) if has_full_lag else 0.0
-    lag_threshold, lag_profile = _active_battery_threshold()
-    lag_stable = (not has_full_lag) or (lag_drop <= lag_threshold)
+    # ── Battery lag levels for stability check ───────────────────
+    bat_levels = [battery_t_now, battery_t1, battery_t2]
 
-    def _lag_info() -> str:
-        if not has_full_lag:
-            return "lag window not full yet (treated as stable)"
-        return (
-            f"drop={lag_drop:.2f}% (max={lag_threshold}% {lag_profile}), "
-            f"T-now={battery_t_now:.1f}% T-1={battery_t1:.1f}% T-2={battery_t2:.1f}%"
-        )
+    def _bat_info() -> str:
+        vals = [
+            f"T-now={battery_t_now:.1f}%" if battery_t_now is not None else "T-now=--",
+            f"T-1={battery_t1:.1f}%" if battery_t1 is not None else "T-1=--",
+            f"T-2={battery_t2:.1f}%" if battery_t2 is not None else "T-2=--",
+        ]
+        return ", ".join(vals)
 
     # ══════════════════════════════════════════════════════════════
-    # STEP 1: predicted_energy > PEAK_DEMAND_WH
+    # PEAK LOAD: EDFI >= PEAK_THRESHOLD
     # ══════════════════════════════════════════════════════════════
-    if predicted_energy > PEAK_DEMAND_WH:
-        step = (
-            f"Step 1 — predicted {predicted_energy:.4f}Wh "
-            f"> peak demand {PEAK_DEMAND_WH}Wh"
-        )
+    if edfi >= PEAK_THRESHOLD:
+        load = f"PEAK LOAD (EDFI {edfi:.2f} >= {PEAK_THRESHOLD})"
 
-        # 1a — Battery >= 80%
-        if battery_level >= 80.0:
-            if lag_stable:
-                return "A", (
-                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag stable ({_lag_info()}) → Class A"
-                )
-            else:
-                return "B", (
-                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag NOT stable ({_lag_info()}) → Class B"
-                )
-
-        # 1b — Battery >= 50%
-        if battery_level >= 50.0:
-            if lag_stable:
-                return "B", (
-                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag stable ({_lag_info()}) → Class B"
-                )
-            else:
-                return "C", (
-                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag NOT stable ({_lag_info()}) → Class C"
-                )
-
-        # 1bii — Battery < 50%
-        return "C", (
-            f"{step}; Battery {battery_level:.1f}% < 50% → Class C"
-        )
-
-    # ══════════════════════════════════════════════════════════════
-    # STEP 2: predicted_energy <= PEAK_DEMAND_WH  (Class A PROHIBITED)
-    # ══════════════════════════════════════════════════════════════
-    step = (
-        f"Step 2 — predicted {predicted_energy:.4f}Wh "
-        f"<= peak demand {PEAK_DEMAND_WH}Wh (Class A prohibited)"
-    )
-
-    # 2a — Battery >= 60%
-    if battery_level >= 60.0:
-        if lag_stable:
+        if battery_stable(bat_levels, 80):
+            return "A", (
+                f"{load}; battery_stable(80%) = True ({_bat_info()}) → Smart A"
+            )
+        elif battery_stable(bat_levels, 60):
             return "B", (
-                f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag stable ({_lag_info()}) → Class B"
+                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
             )
         else:
             return "C", (
-                f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag NOT stable ({_lag_info()}) → Class C"
+                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
             )
 
-    # 2b — Battery < 60%
-    return "C", (
-        f"{step}; Battery {battery_level:.1f}% < 60% → Class C"
+    # ══════════════════════════════════════════════════════════════
+    # MODERATE LOAD: MODERATE_THRESHOLD <= EDFI < PEAK_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    if edfi >= MODERATE_THRESHOLD:
+        load = f"MODERATE LOAD (EDFI {edfi:.2f}, {MODERATE_THRESHOLD} <= x < {PEAK_THRESHOLD})"
+
+        if battery_stable(bat_levels, 60):
+            return "B", (
+                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
+            )
+        else:
+            return "C", (
+                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
+            )
+
+    # ══════════════════════════════════════════════════════════════
+    # BASELINE LOAD: BASELINE_THRESHOLD <= EDFI < MODERATE_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    if edfi >= BASELINE_THRESHOLD:
+        return "C", (
+            f"BASELINE LOAD (EDFI {edfi:.2f}, {BASELINE_THRESHOLD} <= x < {MODERATE_THRESHOLD}) → Smart C"
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    # VERY LOW LOAD: EDFI < BASELINE_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    return "OFF", (
+        f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → All relays OFF"
     )
 
 
 # ---------------------------------------------------------------------------
-# Decision cycle (runs every DECISION_INTERVAL_SECONDS)
+# ML prediction fetcher (HTTP call to FastAPI ML service)
 # ---------------------------------------------------------------------------
+def _fetch_prediction(sensor: dict) -> dict | None:
+    """Call the ML service and return the prediction payload.
+
+    Returns a dict with predicted_energy_wh, upper/lower bounds,
+    or None if the service is unreachable.
+    """
+    ts = sensor.get("timestamp")
+    body = json.dumps({
+        "temperature_c": float(sensor.get("temperature", sensor.get("temperature_c", 25.0))),
+        "humidity": float(sensor.get("humidity", 50.0)),
+        "lux": float(sensor.get("lux", 0.0)),
+        "occupancy": int(sensor.get("occupancy", 0)),
+        "datetime_str": ts,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        ML_SERVICE_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        pred = result.get("predictions", {})
+        ml_payload = {
+            "predicted_energy_wh": pred.get("hybrid_final_wh", 0.0),
+            "upper_bound_energy_wh": pred.get("safety_upper_bound_wh", 0.0),
+            "lower_bound_energy_wh": pred.get("safety_lower_bound_wh", 0.0),
+            "energy_unit": "Wh",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "rule-engine-http-call",
+        }
+        log.info(
+            "ML prediction fetched: EDFI=%.4f Wh  [%.4f, %.4f]",
+            ml_payload["predicted_energy_wh"],
+            ml_payload["lower_bound_energy_wh"],
+            ml_payload["upper_bound_energy_wh"],
+        )
+        return ml_payload
+
+    except urllib.error.URLError as exc:
+        log.warning("ML service unreachable (%s) — decision will use cached data", exc.reason)
+        return None
+    except Exception as exc:
+        log.warning("ML prediction fetch error: %s", exc)
+        return None
+
+
 def run_evaluation(client: mqtt.Client) -> None:
-    """Perform one evaluation cycle: read state, decide mode, actuate, log."""
+    """Perform one evaluation cycle: fetch prediction, decide mode, actuate, log."""
     global current_mode, manual_override
 
     # ── Manual override: skip automatic decision ──
@@ -401,7 +442,19 @@ def run_evaluation(client: mqtt.Client) -> None:
         if not latest_sensor:
             log.info("Evaluation: No sensor data yet — skipping.")
             return
+        sensor_snapshot = dict(latest_sensor)
 
+    # ── Step 1: Fetch fresh prediction from ML service ──
+    ml_result = _fetch_prediction(sensor_snapshot)
+    if ml_result:
+        with state_lock:
+            latest_ml.clear()
+            latest_ml.update(ml_result)
+        # Publish prediction to MQTT for logger/frontend
+        client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
+
+    # ── Step 2: Run decision logic ──
+    with state_lock:
         new_mode, reason = evaluate_rules()
 
         # Grab ML data for logging
@@ -426,11 +479,13 @@ def run_evaluation(client: mqtt.Client) -> None:
         "ON" if r3 else "OFF",
     )
     log.info(
-        "    ML prediction: %.4f Wh  [lower=%.4f, upper=%.4f]  peak_demand=%.1f Wh",
+        "    EDFI: %.4f Wh  [lower=%.4f, upper=%.4f]  thresholds: Peak=%.0f / Mod=%.0f / Base=%.0f",
         float(ml_predicted) if ml_predicted != "n/a" else 0.0,
         float(ml_lower) if ml_lower != "n/a" else 0.0,
         float(ml_upper) if ml_upper != "n/a" else 0.0,
-        PEAK_DEMAND_WH,
+        PEAK_THRESHOLD,
+        MODERATE_THRESHOLD,
+        BASELINE_THRESHOLD,
     )
     log.info("    Reason: %s", reason)
 
@@ -530,12 +585,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
         log.info("Connected to MQTT broker at %s:%d", MQTT_BROKER, MQTT_PORT)
         client.subscribe([
             (TOPIC_SENSORS, 1),
-            (TOPIC_ML, 1),
             (TOPIC_OVERRIDE, 1),
         ])
         log.info(
-            "Subscribed to %s, %s, %s",
-            TOPIC_SENSORS, TOPIC_ML, TOPIC_OVERRIDE,
+            "Subscribed to %s, %s",
+            TOPIC_SENSORS, TOPIC_OVERRIDE,
         )
     else:
         log.error("MQTT connection failed with code %d", rc)
@@ -622,12 +676,6 @@ def on_message(client, userdata, msg):
                 payload["temperature"] = payload["temperature_c"]
             latest_sensor.update(payload)
             log.debug("Updated latest sensor data")
-        elif msg.topic == TOPIC_ML:
-            latest_ml.update(payload)
-            log.debug(
-                "ML prediction received: keys=%s",
-                sorted(payload.keys()),
-            )
 
 
 def on_disconnect(client, userdata, *args, **kwargs):
@@ -667,15 +715,10 @@ def main() -> None:
         BATTERY_LAG_READINGS,
     )
     log.info(
-        "Peak demand threshold (PEAK_DEMAND_WH): %.1f Wh",
-        PEAK_DEMAND_WH,
-    )
-    log.info(
-        "Max battery drop: %.1f%% (day %d:00-%d:00) / %.1f%% (night)",
-        MAX_BATTERY_DROP_PERCENT,
-        SOLAR_HOUR_START,
-        SOLAR_HOUR_END,
-        MAX_BATTERY_DROP_NIGHT_PERCENT,
+        "EDFI thresholds: Peak=%.0f, Moderate=%.0f, Baseline=%.0f Wh",
+        PEAK_THRESHOLD,
+        MODERATE_THRESHOLD,
+        BASELINE_THRESHOLD,
     )
     log.info("Database: %s", os.path.abspath(DB_PATH))
     log.info("GPIO: disabled (ESP32 handles relay actuation via MQTT)")

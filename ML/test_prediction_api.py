@@ -47,9 +47,6 @@ MQTT_CLIENT_ID = "ml-prediction-service"
 TOPIC_SENSORS = "room/sensors"
 TOPIC_ML_PREDICTIONS = "room/ml/predictions"
 
-# Energy thresholds (for contract compatibility)
-PEAK_DEMAND_KW = float(os.environ.get("PEAK_DEMAND_KW", 2.4))
-
 # Simulation index (CSV row pointer)
 current_sim_index = WINDOW_SIZE
 
@@ -256,16 +253,11 @@ def build_mqtt_payload(result: dict) -> dict:
     """
     pred = result["predictions"]
     return {
-        "predicted_energy_kw": pred["hybrid_final_kwh"],
-        "upper_bound_energy_kw": pred["safety_upper_bound"],
-        "predicted_energy_range": pred["safety_upper_bound"],
-        "actual_energy_kw": pred.get("actual_energy_kw"),
-        "base_gru_kwh": pred.get("base_gru_kwh"),
-        "lgbm_correction_kwh": pred.get("lgbm_correction_kwh"),
-        "hybrid_final_kwh": pred.get("hybrid_final_kwh"),
-        "safety_lower_bound": pred.get("safety_lower_bound"),
-        "safety_upper_bound": pred.get("safety_upper_bound"),
-        "peak_demand": PEAK_DEMAND_KW,
+        "predicted_energy_wh": pred["hybrid_final_kwh"],
+        "upper_bound_energy_wh": pred["safety_upper_bound"],
+        "lower_bound_energy_wh": pred["safety_lower_bound"],
+        "predicted_energy_range_wh": [pred["safety_lower_bound"], pred["safety_upper_bound"]],
+        "energy_unit": "Wh",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": "fastapi-local-model",
     }

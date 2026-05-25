@@ -19,7 +19,7 @@ class SensorLogAdmin(admin.ModelAdmin):
 
 @admin.register(MLPrediction)
 class MLPredictionAdmin(admin.ModelAdmin):
-    list_display = ("timestamp", "predicted_energy_range", "peak_demand")
+    list_display = ("timestamp", "predicted_energy_wh", "upper_bound_wh", "lower_bound_wh")
     readonly_fields = ("timestamp",)
 
 

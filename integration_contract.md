@@ -95,7 +95,7 @@ Group 1's ESP32 publishes a single combined payload (environmental sensors + bat
 
 ## 4. ML Payload Contract (`room/ml/predictions`)
 
-Published by the **rule engine** after calling `POST /predict` on the ML service (`new_ml_model/new_prediction_api.py`). The ML service is HTTP-only — it does not subscribe to MQTT topics.
+Published by the **rule engine** after calling `POST /predict` on the ML service (`workers/ml_service.py`). The ML service is HTTP-only — it does not subscribe to MQTT topics.
 
 ```json
 {
@@ -294,7 +294,7 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 
 Base URL: `http://<PI_IP>:5000`
 
-The ML service (`new_ml_model/new_prediction_api.py`) is HTTP-only. The rule engine calls `POST /predict` every decision interval. The test dashboard and manual testing also use these endpoints.
+The ML service (`workers/ml_service.py`) is HTTP-only and model-agnostic. The model directory is configured via `MODEL_ASSET_DIR` in `.env` — to swap models, change that path and restart. The rule engine calls `POST /predict` every decision interval.
 
 | Method | Path | Description |
 |---|---|---|

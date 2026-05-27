@@ -10,9 +10,9 @@ QoS: `1`
 
 | Topic | Publisher | Subscribers | Description |
 |---|---|---|---|
-| `room/sensors` | hw_bridge or simulator | ML service, logger, rule engine, dashboard | Normalised telemetry stream |
+| `room/sensors` | hw_bridge or simulator | logger, rule engine, dashboard | Normalised telemetry stream |
 | `room/hardware/nano` | Group 1 ESP32 | hw_bridge | Combined environmental + battery data |
-| `room/ml/predictions` | ML service | logger, rule engine, dashboard | Model predictions |
+| `room/ml/predictions` | rule engine | logger, dashboard | Model predictions (published by rule engine after HTTP call to ML) |
 | `room/relays/state` | rule engine | **ESP32 relay controller**, dashboard | Current mode and relay states |
 | `room/control/override` | dashboard | rule engine | Manual mode/relay override commands |
 
@@ -95,7 +95,7 @@ Group 1's ESP32 publishes a single combined payload (environmental sensors + bat
 
 ## 4. ML Payload Contract (`room/ml/predictions`)
 
-Published by `new_ML/new_prediction_api.py` via MQTT when a sensor message arrives on `room/sensors`.
+Published by the **rule engine** after calling `POST /predict` on the ML service (`new_ml_model/new_prediction_api.py`). The ML service is HTTP-only — it does not subscribe to MQTT topics.
 
 ```json
 {
@@ -104,9 +104,8 @@ Published by `new_ML/new_prediction_api.py` via MQTT when a sensor message arriv
   "lower_bound_energy_wh": 37.5857,
   "predicted_energy_range_wh": [37.5857, 52.8745],
   "energy_unit": "Wh",
-  "peak_demand": 2.4,
   "timestamp": "2026-05-24T17:00:00+00:00",
-  "source": "fastapi-local-model"
+  "source": "rule-engine-http-call"
 }
 ```
 
@@ -114,23 +113,17 @@ Published by `new_ML/new_prediction_api.py` via MQTT when a sensor message arriv
 
 | Field | Unit | Description |
 |---|---|---|
-| `predicted_energy_wh` | Wh | Hybrid prediction (TE-GRU + LightGBM with Bayesian adaptive weighting) |
-| `upper_bound_energy_wh` | Wh | Upper confidence bound (z=1.5 × residual std) |
+| `predicted_energy_wh` | Wh | Hybrid prediction (TE-GRU + LightGBM + XGBoost residual correction) |
+| `upper_bound_energy_wh` | Wh | Upper confidence bound (z × uncertainty) |
 | `lower_bound_energy_wh` | Wh | Lower confidence bound |
 | `predicted_energy_range_wh` | Wh | `[lower, upper]` bounds as an array |
 | `energy_unit` | string | Always `"Wh"` |
-| `peak_demand` | kW | Configurable threshold (default 2.4 kW) |
 | `timestamp` | ISO 8601 | When the prediction was made |
-| `source` | string | Always `"fastapi-local-model"` |
+| `source` | string | Always `"rule-engine-http-call"` |
 
-### Consumer lookup order
+### Prediction flow
 
-The rule engine resolves predicted energy from whichever key the ML payload provides, in this order:
-
-1. `predicted_energy_kw` (legacy)
-2. `predicted_energy_wh` (new_ML — current)
-3. `predicted_energy_range` (legacy fallback)
-4. `predicted_energy_kwh` (legacy fallback)
+The rule engine averages 5 minutes of sensor readings (matching the ML model's training interval), then sends the averaged values to the ML service via HTTP. The ML service returns a prediction, which the rule engine uses for the EDFI decision and then publishes to MQTT.
 
 ## 5. Relay State Payload (`room/relays/state`)
 
@@ -157,9 +150,9 @@ This topic publishes three different types of payloads.
 | Field | Type | Notes |
 |---|---|---|
 | `mode` | string | `"A"`, `"B"`, `"C"`, or `"MANUAL"` (when individual relays are overridden) |
-| `relay_1` | bool | Water heater state |
-| `relay_2` | bool | HVAC / A.C. state |
-| `relay_3` | bool | Freezer state |
+| `relay_1` | bool | Priority 1 relay state |
+| `relay_2` | bool | Priority 2 relay state |
+| `relay_3` | bool | Priority 3 relay state |
 | `auto` | bool | `true` = AI auto-managed, `false` = manual override active |
 | `reason` | string | Human-readable explanation of why this mode was chosen |
 
@@ -254,25 +247,33 @@ mosquitto_pub -h localhost -t "room/control/override" -m '{"auto": true}'
 
 ## 7. Rule Threshold Contract
 
+The rule engine uses EDFI (Energy Demand Forecast Interval) thresholds to classify predicted load, combined with battery stability checks.
 
-The rule engine uses a 2-step decision hierarchy based on energy sufficiency and battery state.
+### EDFI Load Thresholds (Wh)
 
-### Energy threshold
+The predicted energy from the ML model is compared against these thresholds:
 
-1. `MODE_A_MAX_KWH=2.4` — Peak demand ceiling. Determines Step 1 (≥ threshold) vs Step 2 (< threshold).
+| Load Class | Condition | Battery ≥ 80% | Battery ≥ 60% | Battery < 60% |
+|---|---|---|---|---|
+| **Peak** | EDFI ≥ `PEAK_THRESHOLD` | Smart A | Smart B | Smart C |
+| **Moderate** | EDFI ≥ `MODERATE_THRESHOLD` | Smart B | Smart B | Smart C |
+| **Baseline** | EDFI ≥ `BASELINE_THRESHOLD` | Smart C | Smart C | Smart C |
+| **Very Low** | EDFI < `BASELINE_THRESHOLD` | Smart C | Smart C | Smart C |
 
-### Battery lag thresholds (time-of-day dynamic)
+Configurable via `.env`:
+- `PEAK_THRESHOLD` (default 60)
+- `MODERATE_THRESHOLD` (default 20)
+- `BASELINE_THRESHOLD` (default 5)
 
-The "stable" check compares the 3-time battery lag drop against a **dynamic threshold** based on solar availability:
+### Battery Stability
 
-| Profile | Hours | Threshold | Rationale |
-|---------|-------|-----------|----------|
-| **Daytime** | 11:00 AM – 3:59 PM | `MAX_BATTERY_DROP_PERCENT` (default 2%) | Solar is charging. A >2% drop = real overconsumption. |
-| **Nighttime** | 4:00 PM – 10:59 AM | `MAX_BATTERY_DROP_NIGHT_PERCENT` (default 8%) | No solar. Normal drain shouldn't trigger Mode C. |
+Battery stability requires ALL 3 lag readings (T-now, T-1, T-2) to meet the threshold:
+- `BATTERY_LAG_INTERVAL_SECONDS` (default 30) — how often battery is sampled
+- 3 consecutive readings must all be ≥ the required level for the mode to apply
 
-Configurable via:
-- `SOLAR_HOUR_START` (default `11`)
-- `SOLAR_HOUR_END` (default `16`, exclusive)
+### Sensor Averaging
+
+Before calling the ML model, the rule engine averages sensor readings over `SENSOR_AVG_WINDOW_SECONDS` (default 300 = 5 minutes), matching the ML model's training data interval.
 
 ### Hardware actuation
 
@@ -289,18 +290,17 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 5. `GET /relays/`
 6. `GET /relays/current/`
 
-## 9. ML HTTP Test Endpoints (testing only)
+## 9. ML HTTP Endpoints
 
 Base URL: `http://<PI_IP>:5000`
 
-These endpoints are for manual testing only. Production predictions flow through MQTT.
+The ML service (`new_ml_model/new_prediction_api.py`) is HTTP-only. The rule engine calls `POST /predict` every decision interval. The test dashboard and manual testing also use these endpoints.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/predict` | Send manual sensor values, get prediction back |
+| `POST` | `/predict` | Send sensor values, get prediction back (used by rule engine + dashboard) |
 | `GET` | `/predict_next` | Step through CSV dataset, get next prediction |
-| `GET` | `/csv_data` | Returns CSV file used by the ML test dashboard |
-| `POST` | `/reset` | Resets ML internal CSV index for simulator sync |
+| `GET` | `/metadata` | Returns model info, CSV, features, readiness status |
 | `GET` | `/` | Serves test_dashboard.html |
 
 ### POST /predict request body
@@ -381,8 +381,9 @@ All endpoints are **GET-only**, paginated, and return JSON.
 {
   "id": 15,
   "timestamp": "2026-05-24T19:00:00Z",
-  "predicted_energy_range": 7.1235,
-  "peak_demand": 2.4
+  "predicted_energy_wh": 7.1235,
+  "upper_bound_wh": 8.4501,
+  "lower_bound_wh": 5.7969
 }
 ```
 

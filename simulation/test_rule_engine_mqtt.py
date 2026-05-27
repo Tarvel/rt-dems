@@ -212,15 +212,15 @@ def main():
     assert_eq("reason contains 'BASELINE LOAD'", "BASELINE LOAD" in payload.get("reason", ""), True)
 
     # ------------------------------------------------------------------
-    section("7. VERY LOW LOAD → All relays OFF")
+    section("7. VERY LOW LOAD → Smart C")
     # ------------------------------------------------------------------
     sensor = {**base_sensor, "battery_level": 90.0}
     payload = inject_and_evaluate(
         sensor, ml_very_low,
         t_now=90.0, t1=90.0, t2=90.0,
     )
-    assert_eq("mode is OFF", payload.get("mode"), "OFF")
-    assert_eq("relay_1 is False", payload.get("relay_1"), False)
+    assert_eq("mode is C", payload.get("mode"), "C")
+    assert_eq("relay_1 is True", payload.get("relay_1"), True)
     assert_eq("relay_2 is False", payload.get("relay_2"), False)
     assert_eq("relay_3 is False", payload.get("relay_3"), False)
     assert_eq("reason contains 'VERY LOW'", "VERY LOW" in payload.get("reason", ""), True)

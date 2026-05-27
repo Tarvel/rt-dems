@@ -67,7 +67,6 @@ class RelayState(models.Model):
         ("A", "Smart A — Peak Load (All ON)"),
         ("B", "Smart B — Moderate Load (R1+R2 ON)"),
         ("C", "Smart C — Baseline Load (R1 ON only)"),
-        ("OFF", "Very Low Load (All OFF)"),
         ("MANUAL", "Manual Override"),
     ]
 

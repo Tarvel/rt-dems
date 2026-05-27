@@ -78,6 +78,10 @@ PEAK_THRESHOLD = float(os.environ.get("PEAK_THRESHOLD", 80))
 MODERATE_THRESHOLD = float(os.environ.get("MODERATE_THRESHOLD", 50))
 BASELINE_THRESHOLD = float(os.environ.get("BASELINE_THRESHOLD", 30))
 
+# Sensor averaging window (seconds).
+# Group 2 trained the new model on 5-minute averaged readings.
+SENSOR_AVG_WINDOW_SECONDS = int(os.environ.get("SENSOR_AVG_WINDOW_SECONDS", 300))
+
 
 # ---------------------------------------------------------------------------
 # Battery stability check
@@ -111,6 +115,11 @@ state_lock = threading.Lock()
 latest_sensor: dict = {}
 # Latest ML prediction
 latest_ml: dict = {}
+
+# 20-minute rolling sensor buffer for averaging.
+# Each entry is a dict with a "_ts" key (epoch float) + sensor values.
+import time as _time_mod
+sensor_buffer: list[dict] = []
 
 # Rolling battery lag: three explicit time slots.
 # T-now  = current reading (updated every 60s)
@@ -152,17 +161,15 @@ def apply_mode(mode: str) -> tuple[bool, bool, bool]:
         return (True, True, False)
     elif mode == "C":
         return (True, False, False)
-    else:  # "OFF" — very low load, all relays off
-        return (False, False, False)
 
 
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -248,7 +255,29 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
         conn.commit()
         conn.close()
     except sqlite3.Error as exc:
-        log.error("SQLite error logging decision: %s", exc)
+        log.warning("SQLite error logging decision (attempt 1): %s — retrying", exc)
+        import time as _time
+        _time.sleep(0.5)
+        try:
+            conn = get_db_connection()
+            ensure_relay_table(conn)
+            conn.execute(
+                "INSERT INTO energy_relaystate "
+                "(mode, relay_1, relay_2, relay_3, reason, "
+                " temperature, humidity, lux, occupancy, energy_kw, "
+                " battery_level, battery_voltage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mode, int(r1), int(r2), int(r3), reason,
+                    snap["temperature"], snap["humidity"],
+                    snap["lux"], snap["occupancy"], snap["energy_kw"],
+                    snap["battery_level"], snap["battery_voltage"],
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as exc2:
+            log.error("SQLite error logging decision (attempt 2): %s", exc2)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +304,7 @@ def evaluate_rules() -> tuple[str, str]:
         └─ Always Smart C
 
     VERY LOW LOAD: EDFI < 30
-        └─ All relays OFF
+        └─ Smart C
     """
     global current_mode
 
@@ -369,8 +398,8 @@ def evaluate_rules() -> tuple[str, str]:
     # ══════════════════════════════════════════════════════════════
     # VERY LOW LOAD: EDFI < BASELINE_THRESHOLD
     # ══════════════════════════════════════════════════════════════
-    return "OFF", (
-        f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → All relays OFF"
+    return "C", (
+        f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → Smart C"
     )
 
 
@@ -428,6 +457,38 @@ def _fetch_prediction(sensor: dict) -> dict | None:
         return None
 
 
+def _compute_sensor_average() -> dict | None:
+    """Average sensor readings from the last SENSOR_AVG_WINDOW_SECONDS.
+
+    Returns a dict with averaged temperature, humidity, lux, occupancy,
+    and the latest battery_level (battery is NOT averaged — we want the
+    current SoC, not a smoothed version).
+    Returns None if the buffer is empty.
+    """
+    cutoff = _time_mod.time() - SENSOR_AVG_WINDOW_SECONDS
+    # Only keep readings within the window
+    recent = [s for s in sensor_buffer if s.get("_ts", 0) >= cutoff]
+    if not recent:
+        return None
+
+    n = len(recent)
+    avg = {
+        "temperature": round(sum(s.get("temperature", s.get("temperature_c", 0)) for s in recent) / n, 2),
+        "humidity": round(sum(s.get("humidity", 0) for s in recent) / n, 2),
+        "lux": round(sum(s.get("lux", 0) for s in recent) / n, 2),
+        "occupancy": round(sum(s.get("occupancy", 0) for s in recent) / n),
+        # Battery: use latest value, not average
+        "battery_level": recent[-1].get("battery_level", 0),
+        "timestamp": recent[-1].get("timestamp", datetime.now(timezone.utc).isoformat()),
+    }
+    log.info(
+        "Sensor average (%d readings, %ds window): temp=%.1f°C, hum=%.1f, lux=%.1f, occ=%d",
+        n, SENSOR_AVG_WINDOW_SECONDS,
+        avg["temperature"], avg["humidity"], avg["lux"], avg["occupancy"],
+    )
+    return avg
+
+
 def run_evaluation(client: mqtt.Client) -> None:
     """Perform one evaluation cycle: fetch prediction, decide mode, actuate, log."""
     global current_mode, manual_override
@@ -442,7 +503,11 @@ def run_evaluation(client: mqtt.Client) -> None:
         if not latest_sensor:
             log.info("Evaluation: No sensor data yet — skipping.")
             return
-        sensor_snapshot = dict(latest_sensor)
+
+        # Compute 20-minute average of buffered sensor readings
+        sensor_snapshot = _compute_sensor_average()
+        if sensor_snapshot is None:
+            sensor_snapshot = dict(latest_sensor)  # fallback to latest
 
     # ── Step 1: Fetch fresh prediction from ML service ──
     ml_result = _fetch_prediction(sensor_snapshot)
@@ -675,7 +740,16 @@ def on_message(client, userdata, msg):
             if "temperature" not in payload and "temperature_c" in payload:
                 payload["temperature"] = payload["temperature_c"]
             latest_sensor.update(payload)
-            log.debug("Updated latest sensor data")
+
+            # Buffer reading for 20-minute averaging
+            payload["_ts"] = _time_mod.time()
+            sensor_buffer.append(payload)
+            # Trim old entries beyond the averaging window
+            cutoff = _time_mod.time() - SENSOR_AVG_WINDOW_SECONDS - 60
+            while sensor_buffer and sensor_buffer[0].get("_ts", 0) < cutoff:
+                sensor_buffer.pop(0)
+
+            log.debug("Updated latest sensor data (buffer: %d readings)", len(sensor_buffer))
 
 
 def on_disconnect(client, userdata, *args, **kwargs):

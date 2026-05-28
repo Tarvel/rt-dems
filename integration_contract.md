@@ -102,8 +102,13 @@ Published by the **rule engine** after calling `POST /predict` on the ML service
   "predicted_energy_wh": 45.2301,
   "upper_bound_energy_wh": 52.8745,
   "lower_bound_energy_wh": 37.5857,
-  "predicted_energy_range_wh": [37.5857, 52.8745],
   "energy_unit": "Wh",
+  "avg_sensors": {
+    "temperature_c": 31.4,
+    "humidity": 60.9,
+    "lux": 5.5,
+    "occupancy": 4
+  },
   "timestamp": "2026-05-24T17:00:00+00:00",
   "source": "rule-engine-http-call"
 }
@@ -116,8 +121,12 @@ Published by the **rule engine** after calling `POST /predict` on the ML service
 | `predicted_energy_wh` | Wh | Hybrid prediction (TE-GRU + LightGBM + XGBoost residual correction) |
 | `upper_bound_energy_wh` | Wh | Upper confidence bound (z × uncertainty) |
 | `lower_bound_energy_wh` | Wh | Lower confidence bound |
-| `predicted_energy_range_wh` | Wh | `[lower, upper]` bounds as an array |
 | `energy_unit` | string | Always `"Wh"` |
+| `avg_sensors` | object | The 5-minute averaged sensor values used as model input |
+| `avg_sensors.temperature_c` | °C | Average temperature over 5-min window |
+| `avg_sensors.humidity` | % | Average humidity |
+| `avg_sensors.lux` | lx | Average light level |
+| `avg_sensors.occupancy` | int | Average occupancy count |
 | `timestamp` | ISO 8601 | When the prediction was made |
 | `source` | string | Always `"rule-engine-http-call"` |
 

@@ -42,6 +42,11 @@ warnings.filterwarnings(
     message="'force_all_finite' was renamed to 'ensure_all_finite'.*",
     category=FutureWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names.*",
+    category=UserWarning,
+)
 
 
 # =============================================================================

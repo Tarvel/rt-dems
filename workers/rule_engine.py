@@ -82,6 +82,14 @@ BASELINE_THRESHOLD = float(os.environ.get("BASELINE_THRESHOLD", 30))
 # Group 2 trained the new model on 5-minute averaged readings.
 SENSOR_AVG_WINDOW_SECONDS = int(os.environ.get("SENSOR_AVG_WINDOW_SECONDS", 300))
 
+# How often to run a prediction when sensor data arrives (seconds).
+# Group 2 wants "real-time" predictions, but calling the ML service on
+# every single sensor message (~2 Hz) would overload it.  This throttle
+# ensures we predict at most once per PREDICTION_RATE_LIMIT_SECONDS.
+PREDICTION_RATE_LIMIT_SECONDS = float(
+    os.environ.get("PREDICTION_RATE_LIMIT_SECONDS", 5)
+)
+
 
 # ---------------------------------------------------------------------------
 # Battery stability check
@@ -120,6 +128,9 @@ latest_ml: dict = {}
 # Each entry is a dict with a "_ts" key (epoch float) + sensor values.
 import time as _time_mod
 sensor_buffer: list[dict] = []
+
+# Timestamp of last continuous prediction (for rate limiting).
+_last_prediction_epoch: float = 0.0
 
 # Rolling battery lag: three explicit time slots.
 # T-now  = current reading (updated every 60s)
@@ -324,15 +335,6 @@ def evaluate_rules() -> tuple[str, str]:
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_range")
 
-    log.info(
-        "Env snapshot: temp=%.1f°C, humidity=%s, lux=%s, "
-        "occupancy=%s, battery=%.1f%%",
-        float(temperature),
-        "n/a" if humidity is None else f"{humidity}",
-        "n/a" if lux is None else f"{lux}",
-        "n/a" if occupancy is None else f"{occupancy}",
-        float(battery_level),
-    )
 
     if predicted_energy is None:
         return current_mode, (
@@ -413,11 +415,21 @@ def _fetch_prediction(sensor: dict) -> dict | None:
     or None if the service is unreachable.
     """
     ts = sensor.get("timestamp")
+    temp = float(sensor.get("temperature", sensor.get("temperature_c", 25.0)))
+    hum = float(sensor.get("humidity", 50.0))
+    lux = float(sensor.get("lux", 0.0))
+    occ = int(sensor.get("occupancy", 0))
+
+    log.info(
+        "→ Model input (5-min avg): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
+        temp, hum, lux, occ,
+    )
+
     body = json.dumps({
-        "temperature_c": float(sensor.get("temperature", sensor.get("temperature_c", 25.0))),
-        "humidity": float(sensor.get("humidity", 50.0)),
-        "lux": float(sensor.get("lux", 0.0)),
-        "occupancy": int(sensor.get("occupancy", 0)),
+        "temperature_c": temp,
+        "humidity": hum,
+        "lux": lux,
+        "occupancy": occ,
         "datetime_str": ts,
     }).encode("utf-8")
 
@@ -438,11 +450,17 @@ def _fetch_prediction(sensor: dict) -> dict | None:
             "upper_bound_energy_wh": pred.get("safety_upper_bound_wh", 0.0),
             "lower_bound_energy_wh": pred.get("safety_lower_bound_wh", 0.0),
             "energy_unit": "Wh",
+            "avg_sensors": {
+                "temperature_c": temp,
+                "humidity": hum,
+                "lux": lux,
+                "occupancy": occ,
+            },
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "rule-engine-http-call",
         }
         log.info(
-            "ML prediction fetched: EDFI=%.4f Wh  [%.4f, %.4f]",
+            "← Model output: EDFI=%.4f Wh  [%.4f – %.4f]",
             ml_payload["predicted_energy_wh"],
             ml_payload["lower_bound_energy_wh"],
             ml_payload["upper_bound_energy_wh"],
@@ -481,7 +499,7 @@ def _compute_sensor_average() -> dict | None:
         "battery_level": recent[-1].get("battery_level", 0),
         "timestamp": recent[-1].get("timestamp", datetime.now(timezone.utc).isoformat()),
     }
-    log.info(
+    log.debug(
         "Sensor average (%d readings, %ds window): temp=%.1f°C, hum=%.1f, lux=%.1f, occ=%d",
         n, SENSOR_AVG_WINDOW_SECONDS,
         avg["temperature"], avg["humidity"], avg["lux"], avg["occupancy"],
@@ -504,19 +522,20 @@ def run_evaluation(client: mqtt.Client) -> None:
             log.info("Evaluation: No sensor data yet — skipping.")
             return
 
-        # Compute 20-minute average of buffered sensor readings
-        sensor_snapshot = _compute_sensor_average()
-        if sensor_snapshot is None:
-            sensor_snapshot = dict(latest_sensor)  # fallback to latest
+    # Use the latest continuous prediction if available, otherwise fetch fresh.
+    with state_lock:
+        # Grab current sensor average for logging in the decision box
+        decision_avg = _compute_sensor_average() or dict(latest_sensor)
+        if not latest_ml:
+            sensor_snapshot = decision_avg
 
-    # ── Step 1: Fetch fresh prediction from ML service ──
-    ml_result = _fetch_prediction(sensor_snapshot)
-    if ml_result:
-        with state_lock:
-            latest_ml.clear()
-            latest_ml.update(ml_result)
-        # Publish prediction to MQTT for logger/frontend
-        client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
+    if not latest_ml:
+        ml_result = _fetch_prediction(sensor_snapshot)
+        if ml_result:
+            with state_lock:
+                latest_ml.clear()
+                latest_ml.update(ml_result)
+            client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
 
     # ── Step 2: Run decision logic ──
     with state_lock:
@@ -535,24 +554,31 @@ def run_evaluation(client: mqtt.Client) -> None:
         mode_changed = new_mode != current_mode
         current_mode = new_mode
 
-    change_str = "⚡ CLASS CHANGED" if mode_changed else "class unchanged"
-    log.info(
-        "━━━ Decision: Class %s (%s)  R1=%s R2=%s R3=%s",
+    change_str = "⚡ CLASS CHANGED" if mode_changed else "unchanged"
+
+    log.info("")
+    log.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
+    log.info("┃  DECISION: Class %s (%s)  →  R1=%s  R2=%s  R3=%s",
         new_mode, change_str,
         "ON" if r1 else "OFF",
         "ON" if r2 else "OFF",
         "ON" if r3 else "OFF",
     )
-    log.info(
-        "    EDFI: %.4f Wh  [lower=%.4f, upper=%.4f]  thresholds: Peak=%.0f / Mod=%.0f / Base=%.0f",
+    log.info("┃  Avg sensors: temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
+        float(decision_avg.get("temperature", decision_avg.get("temperature_c", 0))),
+        float(decision_avg.get("humidity", 0)),
+        float(decision_avg.get("lux", 0)),
+        int(decision_avg.get("occupancy", 0)),
+    )
+    log.info("┃  EDFI: %.4f Wh  [%.4f – %.4f]  bat=%.0f%%",
         float(ml_predicted) if ml_predicted != "n/a" else 0.0,
         float(ml_lower) if ml_lower != "n/a" else 0.0,
         float(ml_upper) if ml_upper != "n/a" else 0.0,
-        PEAK_THRESHOLD,
-        MODERATE_THRESHOLD,
-        BASELINE_THRESHOLD,
+        float(latest_sensor.get("battery_level", 0)),
     )
-    log.info("    Reason: %s", reason)
+    log.info("┃  Reason: %s", reason)
+    log.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    log.info("")
 
     # Log decision to database
     log_decision(new_mode, r1, r2, r3, reason)
@@ -588,6 +614,41 @@ def _publish_relay_state(
         "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
     }
     client.publish(TOPIC_RELAY_STATE, json.dumps(relay_payload), qos=1)
+
+
+def _run_continuous_prediction(client: mqtt.Client) -> None:
+    """Run a rate-limited prediction triggered by new sensor data.
+
+    Called from on_message when new sensor data arrives.  Computes the
+    rolling 5-minute average and sends it to the ML service.  The result
+    is cached in latest_ml and published to MQTT so the dashboard gets
+    near-real-time EDFI updates.
+    """
+    global _last_prediction_epoch
+
+    now = _time_mod.time()
+    if now - _last_prediction_epoch < PREDICTION_RATE_LIMIT_SECONDS:
+        return  # throttled
+    _last_prediction_epoch = now
+
+    with state_lock:
+        if manual_override:
+            return
+        sensor_snapshot = _compute_sensor_average()
+        if sensor_snapshot is None:
+            return
+
+    ml_result = _fetch_prediction(sensor_snapshot)
+    if ml_result:
+        with state_lock:
+            latest_ml.clear()
+            latest_ml.update(ml_result)
+        # Publish to MQTT so dashboard gets real-time prediction updates
+        client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
+        log.debug(
+            "Continuous prediction: EDFI=%.4f Wh",
+            ml_result.get("predicted_energy_wh", 0),
+        )
 
 
 def evaluation_loop(client: mqtt.Client) -> None:
@@ -741,7 +802,7 @@ def on_message(client, userdata, msg):
                 payload["temperature"] = payload["temperature_c"]
             latest_sensor.update(payload)
 
-            # Buffer reading for 20-minute averaging
+            # Buffer reading for 5-minute rolling average
             payload["_ts"] = _time_mod.time()
             sensor_buffer.append(payload)
             # Trim old entries beyond the averaging window
@@ -750,6 +811,10 @@ def on_message(client, userdata, msg):
                 sensor_buffer.pop(0)
 
             log.debug("Updated latest sensor data (buffer: %d readings)", len(sensor_buffer))
+
+    # Run continuous prediction outside the lock (Group 2 real-time stage)
+    if msg.topic == TOPIC_SENSORS:
+        _run_continuous_prediction(client)
 
 
 def on_disconnect(client, userdata, *args, **kwargs):

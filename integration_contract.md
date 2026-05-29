@@ -298,6 +298,27 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 4. `GET /predictions/latest/`
 5. `GET /relays/`
 6. `GET /relays/current/`
+7. `GET /download/csv/` — Download historical data as CSV
+
+### CSV Download (`GET /download/csv/`)
+
+Returns a CSV file with sensor averages, predictions, and relay decisions.
+
+**Query parameters (pick one):**
+
+| Param | Example | Description |
+|---|---|---|
+| `start` + `end` | `?start=2026-05-28T00:00&end=2026-05-29T23:59` | Custom date range (ISO 8601) |
+| `days` | `?days=7` | Last N days from now |
+| *(none)* | | Defaults to last 24 hours |
+
+**CSV columns:**
+
+```
+Timestamp, Avg Temp (°C), Avg Humidity (%), Avg Lux, Avg Occupancy,
+Battery (%), Predicted Energy (Wh), Upper Bound (Wh), Lower Bound (Wh),
+Mode, R1, R2, R3, Reason
+```
 
 ## 9. ML HTTP Endpoints
 

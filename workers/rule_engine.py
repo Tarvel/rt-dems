@@ -535,7 +535,11 @@ def run_evaluation(client: mqtt.Client) -> None:
             with state_lock:
                 latest_ml.clear()
                 latest_ml.update(ml_result)
-            client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
+
+    # Publish prediction to MQTT at decision time (dashboard only sees this)
+    with state_lock:
+        if latest_ml:
+            client.publish(TOPIC_ML, json.dumps(dict(latest_ml)), qos=1)
 
     # ── Step 2: Run decision logic ──
     with state_lock:
@@ -621,8 +625,9 @@ def _run_continuous_prediction(client: mqtt.Client) -> None:
 
     Called from on_message when new sensor data arrives.  Computes the
     rolling 5-minute average and sends it to the ML service.  The result
-    is cached in latest_ml and published to MQTT so the dashboard gets
-    near-real-time EDFI updates.
+    is cached in latest_ml so the decision timer always has a fresh
+    prediction ready.  NOT published to MQTT — only the decision-time
+    prediction is published (see run_evaluation).
     """
     global _last_prediction_epoch
 
@@ -643,10 +648,8 @@ def _run_continuous_prediction(client: mqtt.Client) -> None:
         with state_lock:
             latest_ml.clear()
             latest_ml.update(ml_result)
-        # Publish to MQTT so dashboard gets real-time prediction updates
-        client.publish(TOPIC_ML, json.dumps(ml_result), qos=1)
         log.debug(
-            "Continuous prediction: EDFI=%.4f Wh",
+            "Continuous prediction cached: EDFI=%.4f Wh",
             ml_result.get("predicted_energy_wh", 0),
         )
 

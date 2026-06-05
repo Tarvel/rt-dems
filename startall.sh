@@ -57,9 +57,10 @@ cd "$BASE_DIR"
 echo "-> Starting Rule Engine worker..."
 "$VENV_PYTHON" workers/rule_engine.py &
 
-# 5. Start FastAPI ML Service (model-agnostic — configured via MODEL_ASSET_DIR in .env)
-echo "-> Starting FastAPI ML Service..."
-PYTHONUNBUFFERED=1 "$VENV_PYTHON" workers/ml_service.py &
+# 5. Start FastAPI ML Service (configured via ML_SERVICE_SCRIPT in .env)
+ML_SCRIPT="${ML_SERVICE_SCRIPT:-workers/ml_service.py}"
+echo "-> Starting FastAPI ML Service ($ML_SCRIPT)..."
+PYTHONUNBUFFERED=1 "$VENV_PYTHON" "$ML_SCRIPT" &
 
 # 6. Start data source — controlled by DATA_SOURCE env var
 #    "simulator"  = CSV playback only       (default, for development/testing)

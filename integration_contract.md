@@ -324,7 +324,10 @@ Mode, R1, R2, R3, Reason
 
 Base URL: `http://<PI_IP>:5000`
 
-The ML service (`workers/ml_service.py`) is HTTP-only and model-agnostic. The model directory is configured via `MODEL_ASSET_DIR` in `.env` — to swap models, change that path and restart. The rule engine calls `POST /predict` every decision interval.
+The ML service is HTTP-only and configured via `.env`. To swap models, change `MODEL_ASSET_DIR` and `ML_SERVICE_SCRIPT`, then restart. The rule engine calls `POST /predict` every ~5 seconds (continuous) and uses the cached result for 5-minute decisions. Both model services expose the same API contract.
+
+**Current model:** `LIGHT_ML_MODEL/main.py` (LightGBM + XGBoost + MH Blend)
+**Previous model:** `workers/ml_service.py` (TE-GRU + LightGBM)
 
 | Method | Path | Description |
 |---|---|---|

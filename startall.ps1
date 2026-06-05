@@ -48,9 +48,10 @@ try {
     Write-Host "-> Starting Rule Engine worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/rule_engine.py" -WorkingDirectory $BASE_DIR
 
-    # 5. Start FastAPI ML Service (model-agnostic — configured via MODEL_ASSET_DIR in .env)
-    Write-Host "-> Starting FastAPI ML Service..."
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/ml_service.py" -WorkingDirectory $BASE_DIR
+    # 5. Start FastAPI ML Service (configured via ML_SERVICE_SCRIPT in .env)
+    $ML_SCRIPT = if ($env:ML_SERVICE_SCRIPT) { $env:ML_SERVICE_SCRIPT } else { "workers/ml_service.py" }
+    Write-Host "-> Starting FastAPI ML Service ($ML_SCRIPT)..."
+    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList $ML_SCRIPT -WorkingDirectory $BASE_DIR
 
     # 6. Start data source — controlled by DATA_SOURCE env var
     #    "simulator"  = CSV playback only       (default, for development/testing)

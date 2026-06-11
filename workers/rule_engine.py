@@ -421,7 +421,7 @@ def _fetch_prediction(sensor: dict) -> dict | None:
     occ = int(sensor.get("occupancy", 0))
 
     log.info(
-        "→ Model input (5-min avg): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
+        "→ Model input (live): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
         temp, hum, lux, occ,
     )
 
@@ -524,10 +524,10 @@ def run_evaluation(client: mqtt.Client) -> None:
 
     # Use the latest continuous prediction if available, otherwise fetch fresh.
     with state_lock:
-        # Grab current sensor average for logging in the decision box
-        decision_avg = _compute_sensor_average() or dict(latest_sensor)
+        # Use real-time reading for logging in the decision box
+        decision_sensor = dict(latest_sensor)
         if not latest_ml:
-            sensor_snapshot = decision_avg
+            sensor_snapshot = decision_sensor
 
     if not latest_ml:
         ml_result = _fetch_prediction(sensor_snapshot)
@@ -568,11 +568,11 @@ def run_evaluation(client: mqtt.Client) -> None:
         "ON" if r2 else "OFF",
         "ON" if r3 else "OFF",
     )
-    log.info("┃  Avg sensors: temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
-        float(decision_avg.get("temperature", decision_avg.get("temperature_c", 0))),
-        float(decision_avg.get("humidity", 0)),
-        float(decision_avg.get("lux", 0)),
-        int(decision_avg.get("occupancy", 0)),
+    log.info("┃  Sensors: temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
+        float(decision_sensor.get("temperature", decision_sensor.get("temperature_c", 0))),
+        float(decision_sensor.get("humidity", 0)),
+        float(decision_sensor.get("lux", 0)),
+        int(decision_sensor.get("occupancy", 0)),
     )
     log.info("┃  EDFI: %.4f Wh  [%.4f – %.4f]  bat=%.0f%%",
         float(ml_predicted) if ml_predicted != "n/a" else 0.0,
@@ -623,11 +623,13 @@ def _publish_relay_state(
 def _run_continuous_prediction(client: mqtt.Client) -> None:
     """Run a rate-limited prediction triggered by new sensor data.
 
-    Called from on_message when new sensor data arrives.  Computes the
-    rolling 5-minute average and sends it to the ML service.  The result
-    is cached in latest_ml so the decision timer always has a fresh
-    prediction ready.  NOT published to MQTT — only the decision-time
-    prediction is published (see run_evaluation).
+    Called from on_message when new sensor data arrives.  Sends the
+    latest real-time sensor reading (not averaged) to the ML service,
+    as the model was trained on individual timestep readings with CSV
+    providing the energy lag memory.  The result is cached in latest_ml
+    so the decision timer always has a fresh prediction ready.
+    NOT published to MQTT — only the decision-time prediction is
+    published (see run_evaluation).
     """
     global _last_prediction_epoch
 
@@ -639,9 +641,17 @@ def _run_continuous_prediction(client: mqtt.Client) -> None:
     with state_lock:
         if manual_override:
             return
-        sensor_snapshot = _compute_sensor_average()
-        if sensor_snapshot is None:
+        if not latest_sensor:
             return
+        # Send the latest real-time reading (not averaged)
+        sensor_snapshot = {
+            "temperature": float(latest_sensor.get("temperature", latest_sensor.get("temperature_c", 25.0))),
+            "humidity": float(latest_sensor.get("humidity", 50.0)),
+            "lux": float(latest_sensor.get("lux", 0.0)),
+            "occupancy": int(latest_sensor.get("occupancy", 0)),
+            "battery_level": latest_sensor.get("battery_level", 0),
+            "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        }
 
     ml_result = _fetch_prediction(sensor_snapshot)
     if ml_result:

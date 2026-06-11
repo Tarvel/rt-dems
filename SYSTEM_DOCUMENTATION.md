@@ -39,17 +39,18 @@ This is a group project split between three teams:
 
 | Team                     | Responsibility                                                                     | What they give us                             | What they take from us               |
 | ------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------- | ------------------------------------ |
-| **Hardware (Group A)**   | Physical sensors (temperature, humidity, motion, voltage, current, battery)        | Sensor data published to MQTT                 | Nothing — they just publish          |
-| **ML Team<br>(Group B)** | Machine learning model that predicts energy usage                                  | Predictions published to MQTT via `ML/test_prediction_api.py` | Nothing — they just publish          |
-| **Us<br>(Group C)**      | The Raspberry Pi server, database, MQTT broker, API endpoints, relay control logic | REST API endpoints, MQTT topics for live data | We receive sensor + ML data via MQTT |
+| **Hardware (Group 1)**   | Physical sensors (temperature, humidity, motion, lux, battery) + ESP32 relay controller | Sensor data published to `room/hardware/nano` via MQTT; relay actuation on `room/relays/state` | Relay mode decisions via MQTT        |
+| **ML Team (Group 2)**    | Machine learning models (LightGBM + XGBoost + MH Blend) that predict energy usage | Trained model artifacts (`.pkl` files + CSV)  | We call their model via HTTP `POST /predict` |
+| **Us (Group 3)**         | The Raspberry Pi server, database, MQTT broker, API endpoints, rule engine, hardware bridge, dashboard | REST API endpoints, MQTT topics for live data | We receive sensor data via MQTT and run ML predictions via HTTP |
 
 ### What the Raspberry Pi does (our responsibility)
 
-The Raspberry Pi (4 or 5) acts as three things at once:
+The Raspberry Pi (4 or 5) acts as four things at once:
 
 1. **MQTT Broker** — It runs Mosquitto, which is the message post office. Every team sends and receives messages through it.
 2. **Database Server** — It stores the 5-minute averaged historical data in SQLite.
-3. **Control Hub** — It runs the rule engine that makes decisions about which relays to turn ON or OFF.
+3. **ML Inference Server** — It runs the LightGBM + XGBoost prediction model as a FastAPI service, called by the rule engine via HTTP.
+4. **Control Hub** — It runs the rule engine that makes EDFI-based decisions about which relays to turn ON or OFF, publishing decisions via MQTT for the ESP32 to actuate.
 
 ---
 
@@ -150,29 +151,78 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **What it is:** Another standalone Python script that runs in the background forever.
 
-**What it does:** Every `DECISION_INTERVAL_MINUTES` (default 1 for testing, 5 for production), it looks at the latest sensor data and ML predictions, runs them through the 2-step decision hierarchy, decides which mode (A, B, or C) to use, and **publishes the decision to MQTT** (`room/relays/state`). An external ESP32 microcontroller subscribes to this topic and actuates the physical relay modules. A separate background thread shifts the battery lag readings (T-now, T-1, T-2) every 30 seconds and publishes them to the dashboard in real-time.
+**What it does:** It operates on two timescales:
+
+1. **Continuous prediction (~every 5 seconds):** Every time new sensor data arrives on MQTT, the rule engine sends the **real-time sensor reading** (not averaged) to the ML service via `POST /predict`. The result is cached in memory so a fresh prediction is always available.
+
+2. **Decision interval (every 5 minutes):** A background timer fires and uses the cached ML prediction to evaluate the EDFI-based threshold rules. It decides which mode (A, B, or C) to use and **publishes the decision to MQTT** (`room/relays/state`). An external ESP32 microcontroller subscribes to this topic and actuates the physical relay modules.
+
+3. **Battery lag tracking (every 30 seconds):** A separate background thread shifts the battery lag readings (T-now, T-1, T-2) and publishes lightweight `battery_lag_update` payloads to the dashboard.
+
+**EDFI threshold logic:** The rule engine uses three configurable thresholds from `.env` (`PEAK_THRESHOLD`, `MODERATE_THRESHOLD`, `BASELINE_THRESHOLD`) to classify predicted energy into load tiers, then factors in battery stability to select a mode. See Section 8 for the full decision hierarchy.
 
 **Why it exists:** This is the core intelligence of the system. Without it, the sensors just collect data but nothing happens. The rule engine is what turns data into action.
 
 **Important architecture note:** The rule engine does **not** drive any local GPIO pins. All hardware actuation is handled by the ESP32 over MQTT. This decouples the decision logic from the physical hardware, allowing the Pi to focus on computation while the ESP32 handles electrical switching.
 
-### 3.6 ML Prediction Service (FastAPI)
+### 3.6 ML Prediction Service (FastAPI) — LIGHT_ML_MODEL
 
-**File:** `ML/test_prediction_api.py`
+**File:** `LIGHT_ML_MODEL/main.py` (configurable via `ML_SERVICE_SCRIPT` in `.env`)
 
-**What it is:** A FastAPI server that runs the hybrid GRU + LightGBM machine learning model.
+**What it is:** A FastAPI server that runs the **LightGBM + XGBoost + Metropolis-Hastings (MH) blend** energy prediction model. This replaced the earlier TE-GRU + LightGBM model.
 
-**What it does:** It uses two protocols:
+**What it does:** It operates in **HTTP-only mode**. The rule engine calls `POST /predict` with live sensor values, and the service returns a prediction. MQTT auto-prediction is disabled to prevent duplicate predictions — the rule engine controls the prediction frequency.
 
-1. **MQTT (primary workflow):** When it starts, it connects to the Mosquitto broker and subscribes to `room/sensors`. Every time a sensor message arrives, it runs the full prediction pipeline (GRU neural network + LightGBM correction) and publishes the result to `room/ml/predictions`. This is how the rule engine and dashboard get predictions during normal operation.
+**How predictions work:**
 
-2. **HTTP (testing only):** It provides `POST /predict` and `GET /predict_next` endpoints so that the team can manually input sensor values and compare the model output against expected calculations. This is used during supervisor demonstrations via `test.py` (CLI) or `test_dashboard.html` (browser).
+1. The rule engine sends real-time sensor values (`temperature_c`, `humidity`, `lux`, `occupancy`, `datetime_str`) via `POST /predict`.
+2. The service uses `datetime_str` to find the closest matching row in a historical CSV file (`mydatanew.csv`, 42,240 rows). This CSV provides the **energy context window** — the last 30 rows of energy history needed for lag features.
+3. The service injects the live sensor values into the last row of the context window.
+4. It engineers 14 features: 4 sensor values + 4 energy lag features (`lag1`, `lag24`, `rolling3`, `rolling24`) + 4 cyclical time features (`hour_sin`, `hour_cos`, `dow_sin`, `dow_cos`) + `hour` + `day_of_week`.
+5. LightGBM and XGBoost each produce a raw prediction. A Metropolis-Hastings adaptive blend combines them.
+6. An XGBoost residual correction model adjusts the blended output.
+7. LightGBM quantile models produce upper and lower confidence bounds.
 
-**Why the dual protocol:** MQTT is the right choice for the main data flow because it is event-driven — every sensor reading automatically triggers a prediction. HTTP is added separately for manual testing only, so the team can type specific inputs and verify the model behaves correctly.
+**Why the CSV context window exists:** The model was trained with energy-based lag features (`lag1` = energy 5 min ago, `lag24` = energy 2 hours ago). Since our hardware does not measure actual energy consumption (`E=0.000 kWh` in sensor data), the CSV provides historical energy values to compute these lags. Without it, the model has no "memory" and cannot produce meaningful predictions. The CSV pointer advances with each call so that successive predictions draw from different energy history.
 
-**MQTT retry:** If the MQTT broker is not running when the ML service starts, it retries the connection every 5 seconds in the background. This means you can start Mosquitto and the ML service in any order.
+**Model assets required** (in `LIGHT_ML_MODEL/model_assets/`):
+
+| File | Purpose |
+|------|---------|
+| `xgb.pkl` | XGBoost base model |
+| `lgb.pkl` | LightGBM base model |
+| `beta.pkl` | MH blend weights |
+| `scaler.pkl` | Feature scaler |
+| `res_model.pkl` | XGBoost residual correction model |
+| `lgb_lower.pkl` | LightGBM lower quantile model |
+| `lgb_upper.pkl` | LightGBM upper quantile model |
+| `residual_std.pkl` | Residual standard deviation |
+| `mydatanew.csv` | Historical energy context (42,240 rows) |
+
+**How to swap models:** Change two lines in `.env` and restart:
+
+```bash
+# Old model (TE-GRU + LightGBM):
+MODEL_ASSET_DIR=new_ml_model/New folder
+ML_SERVICE_SCRIPT=workers/ml_service.py
+
+# New model (LightGBM + XGBoost + MH Blend) — current:
+MODEL_ASSET_DIR=LIGHT_ML_MODEL/model_assets
+ML_SERVICE_SCRIPT=LIGHT_ML_MODEL/main.py
+```
+
+**MQTT retry:** If the MQTT broker is not running when the ML service starts, it retries the connection every 5 seconds in the background.
 
 **Port:** The ML service runs on port `5000`.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST /predict` | Accept live sensor values → return energy prediction | Primary endpoint (called by rule engine) |
+| `GET /predict_next` | Advance CSV pointer by one row → return prediction | Simulation/testing |
+| `GET /metadata` | Show loaded models, CSV status, config | Debugging |
+| `GET /reset` | Reset CSV pointer to beginning | Testing |
 
 ### 3.7 data_simulator.py (Testing Tool)
 
@@ -200,7 +250,26 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **Why they exist:** For supervisor demonstrations. The team can manually input specific values and compare the model output against their own manual calculations to verify the model works correctly.
 
-### 3.9 dashboard/index.html (Browser Dashboard)
+### 3.9 hw_bridge.py (Hardware Bridge)
+
+**File:** `workers/hw_bridge.py`
+
+**What it is:** A lightweight MQTT translator that bridges Group 1's raw hardware data format into the system's standard `room/sensors` format.
+
+**What it does:**
+1. Subscribes to `room/hardware/nano` (the topic Group 1's ESP32/Arduino publishes to).
+2. Parses the incoming JSON payload which contains combined environmental + battery fields.
+3. Normalizes field names (e.g., maps hardware field names to `temperature_c`, `humidity`, `lux`, `occupancy`, `battery_level`, etc.).
+4. Re-publishes the cleaned payload to `room/sensors` for all other services to consume.
+
+**Why it exists:** Group 1's hardware sends data in their own format. Rather than modifying every other component to understand their format, the bridge acts as a single translation layer. If Group 1 changes their JSON structure, only `hw_bridge.py` needs updating.
+
+**Controlled by:** The `DATA_SOURCE` variable in `.env`:
+- `hardware` — Only hw_bridge runs (production with real sensors)
+- `simulator` — Only data_simulator runs (development/testing)
+- `both` — Both run simultaneously (debugging only)
+
+### 3.10 dashboard/index.html (Browser Dashboard)
 
 **What it is:** A single HTML file with CSS and JavaScript embedded.
 
@@ -208,7 +277,7 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 
 **Why it exists:** It gives a visual way to monitor the system. It also proves that the MQTT data flow works end-to-end.
 
-### 3.10 test_rule_engine_mqtt.py (MQTT Integration Test)
+### 3.11 test_rule_engine_mqtt.py (MQTT Integration Test)
 
 **File:** `simulation/test_rule_engine_mqtt.py`
 
@@ -225,74 +294,62 @@ allow_anonymous true      ← No username/password needed (okay for local networ
 This is the most important section. Here is the complete journey of data through the system, step by step:
 
 ```
-STEP 1: Sensors measure  →  STEP 2: Hardware publishes  →  STEP 3: Mosquitto delivers
-                                                                       │
-                           ┌───────────────────────────────────────────┤
-                           │                                           │
-                           ▼                                           ▼
-                    STEP 4a: Logger                            STEP 4b: Rule Engine
-                    receives & buffers                         receives & stores latest
-                           │                                           │
-                            │ (every 5 min)                             │ (every DECISION_INTERVAL)
-                           ▼                                           ▼
-                    STEP 5a: Computes average               STEP 5b: Evaluates rules
-                    and writes to SQLite                    and publishes relay state
-                           │                                           │
-                           ▼                                           ▼
-                    STEP 6a: Republishes averaged           STEP 6b: Publishes mode to
-                    data to MQTT for dashboard              room/relays/state (MQTT)
-                           │                                           │
-                           ▼                                           ▼
-                    STEP 7: Django serves                   STEP 7: ESP32 receives
-                    historical data via API                 and drives GPIO relays
-                                                                       │
-                                                                       ▼
-                                                           STEP 8: Dashboard shows
-                                                           live data in browser
+STEP 1: Physical sensors  →  STEP 2: Hardware publishes  →  STEP 3: hw_bridge translates
+                                      to room/hardware/nano         to room/sensors
+                                                                           │
+                            ┌──────────────────────────────────────────────┤
+                            │                     │                        │
+                            ▼                     ▼                        ▼
+                     STEP 4a: Logger        STEP 4b: Rule Engine    STEP 4c: Dashboard
+                     receives & buffers     receives latest          shows live data
+                            │                     │
+                            │ (every 5 min)       │ (every ~5s, rate-limited)
+                            ▼                     ▼
+                     STEP 5a: Computes avg  STEP 5b: Calls ML service
+                     and writes to SQLite   via POST /predict (HTTP)
+                            │                     │
+                            ▼                     │ (every 5 min decision)
+                     STEP 6a: Republishes   STEP 5c: Evaluates EDFI
+                     averaged data to MQTT  threshold rules
+                            │                     │
+                            ▼                     ▼
+                     STEP 7: Django serves  STEP 6b: Publishes mode
+                     historical data via    to room/relays/state +
+                     REST API               prediction to room/ml/predictions
+                                                  │
+                                                  ▼
+                                           STEP 7: ESP32 receives
+                                           and drives GPIO relays
 ```
 
 ### Detailed walkthrough:
 
 **Step 1: Physical measurement.**
-The hardware team's sensors physically measure the room's temperature, humidity, light level (lux), whether someone is present (occupancy), and the battery percentage. Voltage and current may also be included but are optional.
+The hardware team's sensors physically measure the room's temperature, humidity, light level (lux), whether someone is present (occupancy via radar), and the battery percentage/voltage.
 
 **Step 2: Hardware team publishes to MQTT.**
-Their microcontroller (like an ESP32 or Arduino) packages the readings into a JSON message and publishes it to the MQTT topic `room/sensors`. Similarly, the ML team publishes energy predictions to `room/ml/predictions`.
+Their microcontroller (ESP32/Arduino) packages the readings into a JSON message and publishes it to `room/hardware/nano`.
 
-**Step 3: Mosquitto delivers.**
-The Mosquitto broker on the Pi receives the message and immediately forwards it to every client that has subscribed to that topic. In our case, three subscribers get the sensor data:
-- `mqtt_logger.py` (for storing)
-- `rule_engine.py` (for decision making)
-- `dashboard/index.html` (for live display)
+**Step 3: Hardware Bridge translates.**
+The `hw_bridge.py` worker subscribes to `room/hardware/nano`, parses the raw hardware payload, normalizes the field names, and re-publishes as a clean JSON payload to `room/sensors`. This decouples the hardware team's format from the rest of the system.
 
 **Step 4a: The Logger receives and buffers.**
-When `mqtt_logger.py` receives a sensor message, it does NOT write it to the database immediately. Instead, it adds it to an in-memory list (a Python list). This list acts as a buffer.
+When `mqtt_logger.py` receives a sensor message on `room/sensors`, it adds it to an in-memory buffer (a Python list).
 
-**Step 4b: The Rule Engine receives and stores the latest.**
-When `rule_engine.py` receives a sensor message, it overwrites its `latest_sensor` dictionary with the new values. It always keeps only the most recent reading.
+**Step 4b: The Rule Engine receives and caches.**
+When `rule_engine.py` receives a sensor message, it overwrites its `latest_sensor` dictionary. It then immediately sends the real-time reading to the ML service via `POST /predict` (HTTP, rate-limited to every ~5 seconds). The ML result is cached in `latest_ml`.
 
 **Step 5a: Logger computes averages (every 5 minutes).**
-A background timer fires every 5 minutes. When it fires, the logger:
-1. Takes all the readings collected in the buffer (could be 60+ readings if sensors publish every 5 seconds).
-2. Computes the arithmetic average of each field (temperature, humidity, voltage, current, battery).
-3. For occupancy, it uses majority vote — if more than half the readings say "occupied", the average is 1, otherwise 0.
-4. Writes one single row to the `energy_sensorlog` table in SQLite.
-5. Clears the buffer and starts collecting again.
+A background timer fires every 5 minutes. The logger computes the arithmetic average of each field, writes one row to `energy_sensorlog`, and publishes the averaged data to `room/data/averaged`.
 
-**Step 5b: Rule Engine evaluates rules (every `DECISION_INTERVAL_MINUTES`).**
-A background timer fires at the configured interval (default 1 minute for testing, 5 for production). When it fires, the rule engine:
-1. Reads the latest sensor values and ML predictions.
-2. Reads the current battery lag values (T-now, T-1, T-2) which are maintained by a separate 30-second background loop.
-3. Runs the 2-step decision hierarchy comparing predicted energy against peak demand, factoring in battery level and stability.
-4. Determines the correct mode (A, B, or C).
-5. Drives the `gpiozero.LED` objects to physically switch the relays via GPIO.
-6. Writes the decision (mode, relay states, reason) to the `energy_relaystate` table.
+**Step 5b: Rule Engine calls ML service (continuous).**
+The rule engine sends the latest real-time sensor reading to the ML service via HTTP `POST /predict`. The ML service uses the sensor values + a CSV-based energy context window to compute a prediction with confidence bounds.
 
-**Step 6a: Logger republishes averaged data.**
-After writing to the database, the logger also publishes the averaged data to the MQTT topic `room/data/averaged`. This lets the dashboard show the averaged values too.
+**Step 5c: Rule Engine evaluates (every 5 minutes).**
+The decision timer fires and uses the cached ML prediction (`latest_ml`) to evaluate EDFI threshold rules. It classifies the predicted energy into Peak/Moderate/Baseline/Very Low tiers, checks battery stability, and determines the mode (A, B, or C).
 
-**Step 6b: Rule Engine publishes relay state.**
-After switching the relays, the rule engine publishes the current mode and relay states to `room/relays/state`. The dashboard subscribes to this topic so it can show the user which mode is active.
+**Step 6b: Rule Engine publishes.**
+After deciding a mode, the rule engine publishes the relay states to `room/relays/state` (for the ESP32 and dashboard) and the ML prediction to `room/ml/predictions` (for the logger and dashboard).
 
 **Step 7: Data is available two ways.**
 - **Live (real-time):** The dashboard gets instant updates via MQTT. No delay.
@@ -331,14 +388,13 @@ MQTT works the same way:
 
 ### Our MQTT Topics
 
-A topic is like an address. Here are all the topics in our system:
-
 | Topic | Who publishes | Who subscribes | What data | How often |
-|-------|--------------|----------------|-----------|-----------|
-| `room/sensors` | Hardware team (or simulator) | ML service, Logger, Rule Engine, Dashboard | Temperature, humidity, lux, occupancy, energy_kw, battery_level (voltage/current optional) | Every few seconds (prediction-paced when using simulator) |
-| `room/ml/predictions` | ML service (`test_prediction_api.py`) | Logger, Rule Engine, Dashboard | Predicted energy (kW), upper/lower bounds, peak demand, actual energy | Each time a sensor message arrives |
+|-------|--------------|----------------|-----------|-----------| 
+| `room/sensors` | Hardware Bridge (`hw_bridge.py`) or simulator | Logger, Rule Engine, Dashboard, ML Service (passive listener) | Temperature, humidity, lux, occupancy, energy_kw, battery_level (voltage/current optional) | Every ~2 seconds (hardware) or prediction-paced (simulator) |
+| `room/ml/predictions` | Rule Engine (after calling ML via HTTP) | Logger, Dashboard | Predicted energy (Wh), upper/lower bounds, sensor snapshot | At each 5-minute decision interval |
 | `room/data/averaged` | Logger | Dashboard | 5-minute averaged sensor data | Every 5 minutes |
-| `room/relays/state` | Rule Engine | Dashboard | Current mode (A/B/C), relay states, battery lag (T-now/T-1/T-2), reason | Full payload at decision interval + lightweight battery_lag_update every 30s |
+| `room/relays/state` | Rule Engine | Dashboard, ESP32 | Current mode (A/B/C), relay states, battery lag (T-now/T-1/T-2), reason | Full payload at decision interval + lightweight battery_lag_update every 30s |
+| `room/hardware/nano` | Group 1 hardware (ESP32/Arduino) | Hardware Bridge | Raw combined sensor + battery JSON | Every ~2 seconds |
 
 ### QoS (Quality of Service)
 
@@ -371,23 +427,25 @@ Every MQTT message in our system carries a JSON payload. JSON is a text format t
 - `energy_kw` is the actual measured energy — shown on the dashboard as "Actual Load".
 - `voltage` and `current` are **optional**. If missing, the logger defaults them to `0.0` for averaging.
 
-**ML payload** (published by `test_prediction_api.py` to `room/ml/predictions`):
+**ML payload** (published by rule engine to `room/ml/predictions` after calling the ML service via HTTP):
 ```json
 {
-    "predicted_energy_kw": 1.224,
-    "upper_bound_energy_kw": 1.374,
-    "predicted_energy_range": 1.374,
-    "actual_energy_kw": 1.2345,
-    "base_gru_kwh": 1.18,
-    "lgbm_correction_kwh": 0.044,
-    "hybrid_final_kwh": 1.224,
-    "safety_lower_bound": 1.074,
-    "safety_upper_bound": 1.374,
-    "peak_demand": 2.4,
-    "timestamp": "2026-03-22T10:55:00+00:00",
-    "source": "fastapi-local-model"
+    "predicted_energy_wh": 45.23,
+    "upper_bound_energy_wh": 52.87,
+    "lower_bound_energy_wh": 37.59,
+    "energy_unit": "Wh",
+    "avg_sensors": {
+        "temperature_c": 31.4,
+        "humidity": 60.9,
+        "lux": 5.5,
+        "occupancy": 4
+    },
+    "timestamp": "2026-05-24T17:00:00+00:00",
+    "source": "rule-engine-http-call"
 }
 ```
+
+**Note:** The ML service itself (LIGHT_ML_MODEL) returns a richer payload including `hybrid_final_wh`, `safety_lower_bound_wh`, `safety_upper_bound_wh`, `lgb_raw_wh`, `xgb_raw_wh`, and blend weights. The rule engine extracts the key fields and re-publishes them in the simplified format above.
 
 **Relay state payload — full decision** (published by rule engine to `room/relays/state`):
 ```json
@@ -401,7 +459,7 @@ Every MQTT message in our system carries a JSON payload. JSON is a text format t
     "battery_t2": 74.5,
     "battery_lag_drop": 1.0,
     "battery_lag_interval_seconds": 30,
-    "reason": "Phase 3 — Temperature Bias: 29.5°C > 28°C and battery 73.5% > 40% → Mode B",
+    "reason": "MODERATE LOAD (EDFI 22.50, 15 <= x < 30); battery_stable(60%) = True → Smart B",
     "timestamp": "2026-03-04T12:30:00+00:00"
 }
 ```
@@ -578,11 +636,11 @@ This is the most complex and important part of the system. It is the component t
 ### What it does step by step:
 
 1. **Starts up** and defaults to **Mode C** (the safest mode — only critical devices on). No GPIO initialization is needed.
-2. **Connects to MQTT** and subscribes to `room/sensors` and `room/ml/predictions`.
-3. **When messages arrive**, it updates its internal state variables (`latest_sensor`, `latest_ml`).
-4. **Every `DECISION_INTERVAL_MINUTES`** (default 1 minute for testing, 5 for production), it runs the full rule evaluation.
+2. **Connects to MQTT** and subscribes to `room/sensors` and `room/control/override`.
+3. **When sensor messages arrive**, it updates `latest_sensor` and triggers a **continuous prediction**: the latest real-time sensor reading is sent to the ML service via `POST /predict` (rate-limited to once every 5 seconds). The result is cached in `latest_ml`.
+4. **Every 5 minutes** (`DECISION_INTERVAL_MINUTES`), the decision timer fires. It uses the cached ML prediction to evaluate the EDFI threshold rules and determine the mode.
 5. **A separate 30-second background loop** shifts the battery lag readings (T-now, T-1, T-2) and publishes lightweight `battery_lag_update` payloads to the dashboard.
-6. **After evaluation**, it publishes the mode decision and relay booleans to `room/relays/state` for the ESP32 and dashboard to consume, and logs the decision to the database.
+6. **After evaluation**, it publishes the mode decision and relay booleans to `room/relays/state` for the ESP32 and dashboard to consume, publishes the ML prediction to `room/ml/predictions` for the logger and dashboard, and logs the decision to the database.
 7. **On shutdown**, it publishes Mode C to MQTT (so the ESP32 drops to safe state) and disconnects.
 
 ### The ESP32 Relay Controller Architecture
@@ -600,64 +658,63 @@ This is the most complex and important part of the system. It is the component t
 - **No GPIO dependencies:** No need for `lgpio`, `gpiozero`, `RPi.GPIO`, or root access on the Pi.
 - **Testable:** The rule engine can be fully tested by mocking the MQTT client (see `test_rule_engine_mqtt.py`).
 
-### The 2-Step Decision Hierarchy — Complete Explanation
+### The EDFI Threshold Decision Hierarchy — Complete Explanation
 
-The rules are evaluated in two main steps based on whether the predicted energy consumption exceeds the allowed peak demand. Note that **occupancy and temperature are only used for dashboard visualization and logging**, they do not override the energy-based decisions.
+The rule engine uses the **Energy Demand Forecast Index (EDFI)** — the predicted energy in Wh from the ML model — to classify the current load level. Three configurable thresholds in `.env` define the boundaries:
+
+```
+PEAK_THRESHOLD=30       # EDFI >= 30 Wh → Peak Load (Smart A territory)
+MODERATE_THRESHOLD=15   # EDFI >= 15 Wh → Moderate Load (Smart B territory)
+BASELINE_THRESHOLD=1    # EDFI >= 1 Wh  → Baseline Load (Smart C)
+```
+
+**Note:** Occupancy and temperature are only used for dashboard visualization and logging — they do not override the energy-based decisions.
 
 #### Battery Stability Lock — The "3-Time Lag" Check
 
 Before making a decision, the engine checks if the battery is rapidly draining.
 
-**The independent background loop:** We maintain three variables (`battery_t_now`, `battery_t1`, `battery_t2`) to represent the exact battery percentage over the last 90 seconds. To keep this updated in real-time, the rule engine runs a separate background thread that wakes up every 30 seconds (`BATTERY_LAG_INTERVAL_SECONDS`):
+**The independent background loop:** We maintain three variables (`battery_t_now`, `battery_t1`, `battery_t2`) to represent the exact battery percentage over the last 90 seconds. A separate background thread wakes up every 30 seconds (`BATTERY_LAG_INTERVAL_SECONDS`):
 
 1. The old `battery_t1` moves to `battery_t2`.
 2. The old `battery_t_now` moves to `battery_t1`.
 3. The latest sensor battery reading becomes the new `battery_t_now`.
-4. It publishes a lightweight `battery_lag_update` to MQTT so the dashboard updates instantly relative to the rule engine's cadence.
+4. It publishes a lightweight `battery_lag_update` to MQTT so the dashboard updates instantly.
 
 So we always have a perfectly spaced 90-second view: `[T-2 (60s ago), T-1 (30s ago), T-Now]`
 
-**The drop calculation:**
-```python
-lag_drop = battery_t2 - battery_t_now   # oldest minus newest
-```
+**The stability check:** `battery_stable(levels, min_percent)` returns `True` if all three readings are at or above `min_percent`. If any lag reading is `None` (not yet populated), the battery is assumed stable.
 
-Example: If `battery_t2` is `85.0` and `battery_t_now` is `82.0`, then `lag_drop = 85.0 - 82.0 = 3.0%`.
+#### Tier 1: Peak Load (EDFI ≥ PEAK_THRESHOLD)
 
-**The rule:** If the drop is **≤ threshold** (2% daytime, 8% nighttime), the battery is considered **stable**. The threshold is dynamic based on solar availability:
+High predicted energy — the room needs maximum power.
 
-| Profile | Hours | Threshold | Rationale |
-|---------|-------|-----------|----------|
-| **Daytime** | 11:00–15:59 | 2% (`MAX_BATTERY_DROP_PERCENT`) | Solar is charging. A >2% drop = real overconsumption. |
-| **Nighttime** | 16:00–10:59 | 8% (`MAX_BATTERY_DROP_NIGHT_PERCENT`) | No solar. Normal drain shouldn't trigger Mode C. |
+| Battery Stable at 80%? | Battery Stable at 60%? | Result |
+|:-:|:-:|--------|
+| ✅ Yes | — | **Smart A** — Everything on |
+| ❌ No | ✅ Yes | **Smart B** — Reduce heavy loads |
+| ❌ No | ❌ No | **Smart C** — Survival mode |
 
-This stability flag is used in the main decision steps below to determine if we can safely run higher loads. (If we don't have a full 90-second lag window yet, we assume the battery is stable.)
+#### Tier 2: Moderate Load (MODERATE_THRESHOLD ≤ EDFI < PEAK_THRESHOLD)
 
-#### Step 1: Energy ≥ Peak Demand (We have enough energy)
+Moderate predicted energy — fans and lights but not AC.
 
-**The question:** Is the predicted energy available enough to meet peak demand?
-If `predicted_energy >= peak_demand`, we have enough energy. The mode depends on battery tier and stability:
+| Battery Stable at 60%? | Result |
+|:-:|--------|
+| ✅ Yes | **Smart B** — Comfort loads on |
+| ❌ No | **Smart C** — Survival mode |
 
-| Battery Level | Battery Lag Stable? | Result |
-|--------------|-------------------|--------|
-| ≥ 80% | Yes (≤2% drop) | **Mode A** — Full energy, everything on |
-| ≥ 80% | No (>2% drop) | **Mode B** — Have battery but it's draining fast, reduce load |
-| 50% – 79% | Yes (≤2% drop) | **Mode B** — Moderate battery, run fans but not heavy loads |
-| 50% – 79% | No (>2% drop) | **Mode C** — Battery draining, survival mode |
-| Below 50% | Any | **Mode C** — Battery too low, survival mode |
+#### Tier 3: Baseline Load (BASELINE_THRESHOLD ≤ EDFI < MODERATE_THRESHOLD)
 
-#### Step 2: Energy < Peak Demand (Energy is tight)
+Low predicted energy — only critical devices needed.
 
-**The question:** Is the predicted energy NOT enough for peak demand?
-If `predicted_energy < peak_demand`, energy is tight.
+→ Always **Smart C** (critical loads only).
 
-| Battery Level | Battery Lag Stable? | Result |
-|--------------|-------------------|--------|
-| ≥ 80% | Yes (≤2% drop) | **Mode A** — Full energy, compensate with deep battery |
-| ≥ 80% | No (>2% drop) | **Mode B** — Compensate with battery, but reduce load |
-| ≥ 60% | Yes (≤2% drop) | **Mode B** — Moderate battery, compensate partially |
-| ≥ 60% | No (>2% drop) | **Mode C** — Battery draining, survival mode |
-| Below 60% | Any | **Mode C** — Battery too low to compensate, survival mode |
+#### Tier 4: Very Low Load (EDFI < BASELINE_THRESHOLD)
+
+Negligible energy demand.
+
+→ Always **Smart C**.
 
 ### How mode decisions are published
 
@@ -682,27 +739,26 @@ The returned booleans are packaged into a JSON payload and published to `room/re
 ```
 START EVALUATION
     │
-    ├── Shift battery lag: T-2←T-1, T-1←T-now, T-now←latest battery (every 30s)
+    ├── Battery lag maintained by 30s background thread
     │
-    ╔══ ENERGY vs PEAK DEMAND ════════╗
-    ║ predicted_energy ≥ peak_demand? ║
-    ╚════════╤════════════╤═══════════╝
-         YES │            │ NO
-             ▼            ▼
-      ┌──────────┐   ┌──────────┐
-      │ Bat ≥80% │   │ Bat ≥80% │
-      │  stable? │   │  stable? │
-      │ Y→MODE A │   │ Y→MODE A │
-      │ N→MODE B │   │ N→MODE B │
-      ├──────────┤   ├──────────┤
-      │ 50%-79%  │   │ 60%-79%  │
-      │  stable? │   │  stable? │
-      │ Y→MODE B │   │ Y→MODE B │
-      │ N→MODE C │   │ N→MODE C │
-      ├──────────┤   ├──────────┤
-      │  <50%    │   │  <60%    │
-      │ → MODE C │   │ → MODE C │
-      └──────────┘   └──────────┘
+    ╔══ EDFI THRESHOLD CHECK ══════════════════════╗
+    ║  EDFI = predicted_energy_wh from ML model    ║
+    ╚═══════╤═══════════╤═══════════╤══════════════╝
+            │           │           │
+    ≥ PEAK  │  ≥ MODERATE │  ≥ BASELINE │  < BASELINE
+    (≥30Wh) │  (15–29Wh)  │  (1–14Wh)   │  (<1Wh)
+            ▼           ▼           ▼        ▼
+     ┌──────────┐  ┌──────────┐  ┌─────┐  ┌─────┐
+     │ bat≥80%  │  │ bat≥60%  │  │     │  │     │
+     │ stable?  │  │ stable?  │  │ C   │  │ C   │
+     │ Y→ A     │  │ Y→ B     │  │     │  │     │
+     │ N→check↓ │  │ N→ C     │  └─────┘  └─────┘
+     ├──────────┤  └──────────┘
+     │ bat≥60%  │
+     │ stable?  │
+     │ Y→ B     │
+     │ N→ C     │
+     └──────────┘
 ```
 
 ---
@@ -899,38 +955,54 @@ On the final deployed Raspberry Pi, you want:
 - Services to **restart automatically if they crash**.
 - Easy commands to check status, view logs, start/stop services.
 
-### Our service files
+### startall.sh — The Unified Launcher
 
-**mqtt-logger.service:**
+**File:** `startall.sh` (Linux/Mac) / `startall.ps1` (Windows)
+
+In production, all services are launched by a single script: `startall.sh`. This script:
+
+1. Loads all environment variables from `.env`
+2. Stops any existing Mosquitto and starts a fresh instance with our config
+3. Starts Django API (`manage.py runserver`)
+4. Starts MQTT Logger (`workers/mqtt_logger.py`)
+5. Starts Rule Engine (`workers/rule_engine.py`)
+6. Starts the ML service (**dynamically** — reads `ML_SERVICE_SCRIPT` from `.env`)
+7. Starts the data source (**dynamically** — reads `DATA_SOURCE` from `.env`):
+   - `hardware` → `workers/hw_bridge.py` (production)
+   - `simulator` → `simulation/data_simulator.py` (testing)
+   - `both` → both (debugging only)
+
+The script traps `SIGINT` (Ctrl+C) to cleanly shut down all background processes.
+
+### systemd — Running as a System Service
+
+For fully automated boot-up, the system uses a single systemd service (`smartroom.service`) that calls `startall.sh`:
+
 ```ini
 [Unit]
-Description=Smart Room MQTT Logger
-After=mosquitto.service     ← Start after Mosquitto is running
-Wants=mosquitto.service     ← Prefer Mosquitto to be active
+Description=Smart Room Energy Management System (all services)
+After=network.target
 
 [Service]
 Type=simple
-User=pi                     ← Run as the "pi" user
-ExecStart=/path/to/python /path/to/mqtt_logger.py
-Restart=on-failure          ← If it crashes, restart it
-RestartSec=5                ← Wait 5 seconds before restarting
+User=grandmaster
+WorkingDirectory=/home/grandmaster/Documents/project/PROJECT_CODE_4
+ExecStart=/bin/bash startall.sh
+Restart=on-failure
+RestartSec=5
 
 [Install]
-WantedBy=multi-user.target  ← Start when the system reaches multi-user mode (normal boot)
+WantedBy=multi-user.target
 ```
 
-**rule-engine.service:**
-Same structure. No longer requires root because GPIO is handled by the ESP32.
-
-### Useful systemd commands
+### Useful commands
 
 ```bash
-sudo systemctl start mqtt-logger       # Start the service
-sudo systemctl stop mqtt-logger        # Stop the service
-sudo systemctl restart mqtt-logger     # Restart the service
-sudo systemctl status mqtt-logger      # Check if it's running
-sudo systemctl enable mqtt-logger      # Start automatically on boot
-sudo journalctl -u mqtt-logger -f      # View live logs
+sudo systemctl start smartroom         # Start all services
+sudo systemctl stop smartroom          # Stop all services
+sudo systemctl restart smartroom       # Restart everything
+sudo systemctl status smartroom        # Check status
+sudo journalctl -u smartroom -f        # View live logs (all services interleaved)
 ```
 
 ---
@@ -1022,11 +1094,12 @@ The ML team provides predictions, but the **actual relay control uses determinis
 
 This system is a complete **IoT edge computing** solution that:
 
-1. **Collects** real-time data from sensors via MQTT
-2. **Stores** 5-minute averaged historical data in SQLite
-3. **Decides** which electrical devices to energize using a 3-phase rule hierarchy
-4. **Controls** physical relays via GPIO pins
-5. **Serves** historical data via a REST API
-6. **Displays** live data in a browser dashboard
+1. **Collects** real-time data from sensors via MQTT (hardware bridge translates Group 1 hardware → `room/sensors`)
+2. **Predicts** energy consumption using a LightGBM + XGBoost hybrid ML model (called via HTTP by the rule engine)
+3. **Stores** 5-minute averaged historical data in SQLite
+4. **Decides** which electrical devices to energize using EDFI threshold-based rules with battery stability checks
+5. **Controls** physical relays via MQTT → ESP32 (no direct GPIO on the Pi)
+6. **Serves** historical data via a Django REST API
+7. **Displays** live data in a browser dashboard via MQTT WebSockets
 
-Everything runs on a single Raspberry Pi (4 or 5) with no cloud dependency, no external database server, and no complex infrastructure. The entire system is designed to be simple, reliable, and explainable.
+Everything runs on a single Raspberry Pi (4 or 5) with no cloud dependency, no external database server, and no complex infrastructure. The ML model is plug-and-play — swappable via two lines in `.env`. The entire system is designed to be simple, reliable, and explainable.

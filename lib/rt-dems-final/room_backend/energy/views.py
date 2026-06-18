@@ -229,7 +229,7 @@ class CSVDownloadView(APIView):
                 last_relay = relay
 
             rows.append({
-                "Timestamp": s["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                "Timestamp": tz.localtime(s["timestamp"]).strftime("%Y-%m-%d %H:%M:%S") if s.get("timestamp") and tz.is_aware(s["timestamp"]) else s["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
                 "Temperature (°C)": round(s["temperature"], 2) if s["temperature"] is not None else "",
                 "Humidity (%)": round(s["humidity"], 2) if s["humidity"] is not None else "",
                 "Lux": round(s["lux"], 2) if s["lux"] is not None else "",

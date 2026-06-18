@@ -419,10 +419,11 @@ def _fetch_prediction(sensor: dict) -> dict | None:
     hum = float(sensor.get("humidity", 50.0))
     lux = float(sensor.get("lux", 0.0))
     occ = int(sensor.get("occupancy", 0))
+    energy = float(sensor.get("energy_kw", sensor.get("energy", 0.0)))
 
     log.info(
-        "→ Model input (live): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
-        temp, hum, lux, occ,
+        "→ Model input (live): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d  energy=%.4f",
+        temp, hum, lux, occ, energy,
     )
 
     body = json.dumps({
@@ -444,11 +445,17 @@ def _fetch_prediction(sensor: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode("utf-8"))
 
-        pred = result.get("predictions", {})
+        # Support both response formats:
+        #   Old (LIGHT_ML_MODEL): { "predictions": { "hybrid_final_wh": ... } }
+        #   New (TE-GRU):         { "predicted_energy_wh": ... }
+        pred = result.get("predictions", result)
         ml_payload = {
-            "predicted_energy_wh": pred.get("hybrid_final_wh", 0.0),
-            "upper_bound_energy_wh": pred.get("safety_upper_bound_wh", 0.0),
-            "lower_bound_energy_wh": pred.get("safety_lower_bound_wh", 0.0),
+            "predicted_energy_wh": pred.get("predicted_energy_wh",
+                                            pred.get("hybrid_final_wh", 0.0)),
+            "upper_bound_energy_wh": pred.get("upper_bound_energy_wh",
+                                              pred.get("safety_upper_bound_wh", 0.0)),
+            "lower_bound_energy_wh": pred.get("lower_bound_energy_wh",
+                                              pred.get("safety_lower_bound_wh", 0.0)),
             "energy_unit": "Wh",
             "avg_sensors": {
                 "temperature_c": temp,

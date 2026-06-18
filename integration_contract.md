@@ -302,39 +302,62 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 
 ### CSV Download (`GET /download/csv/`)
 
-Returns a CSV file with sensor averages, predictions, and relay decisions.
+Returns a CSV file with sensor readings, predictions, and relay decisions aligned by minute.
 
-**Query parameters (pick one):**
+**Query parameters:**
 
 | Param | Example | Description |
 |---|---|---|
-| `start` + `end` | `?start=2026-05-28T00:00&end=2026-05-29T23:59` | Custom date range (ISO 8601) |
-| `days` | `?days=7` | Last N days from now |
+| `start` | `?start=today` or `?start=2026-06-18T00:00` | Start of date range (ISO 8601, or "today" for midnight today) |
+| `end` | `?end=today` or `?end=2026-06-18T12:00` | End of date range (ISO 8601, or "today" for current time) |
+| `days` | `?days=7` | Alternative: last N days from now (ignored if start/end given) |
 | *(none)* | | Defaults to last 24 hours |
+
+*If only `start` is provided, `end` defaults to now. If only `end` is provided, `start` defaults to 7 days before.*
 
 **CSV columns:**
 
 ```
-Timestamp, Avg Temp (°C), Avg Humidity (%), Avg Lux, Avg Occupancy,
-Battery (%), Predicted Energy (Wh), Upper Bound (Wh), Lower Bound (Wh),
-Mode, R1, R2, R3, Reason
+Timestamp, Temperature (°C), Humidity (%), Lux, Occupancy, Battery (%),
+Predicted Energy (Wh), Upper Bound (Wh), Lower Bound (Wh), Mode, R1, R2, R3, Reason
 ```
 
 ## 9. ML HTTP Endpoints
 
 Base URL: `http://<PI_IP>:5000`
 
-The ML service is HTTP-only and configured via `.env`. To swap models, change `MODEL_ASSET_DIR` and `ML_SERVICE_SCRIPT`, then restart. The rule engine calls `POST /predict` every ~5 seconds (continuous) and uses the cached result for 5-minute decisions. Both model services expose the same API contract.
+The ML service is HTTP-only and configured via `.env`. To swap models, change `MODEL_ASSET_DIR` and `ML_SERVICE_SCRIPT`, then restart. The rule engine calls `POST /predict` every ~5 seconds (continuous) and uses the cached result for 5-minute decisions.
 
-**Current model:** `LIGHT_ML_MODEL/main.py` (LightGBM + XGBoost + MH Blend)
-**Previous model:** `workers/ml_service.py` (TE-GRU + LightGBM)
+**Active model (current):** `model_new_unsure/main.py` (TE-GRU + XGBoost + MH)
+**Alternative models:** 
+- `LIGHT_ML_MODEL/main.py` (LightGBM + XGBoost + MH Blend)
+- `workers/ml_service.py` (TE-GRU + LightGBM)
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/predict` | Send sensor values, get prediction back (used by rule engine + dashboard) |
-| `GET` | `/predict_next` | Step through CSV dataset, get next prediction |
 | `GET` | `/metadata` | Returns model info, CSV, features, readiness status |
-| `GET` | `/` | Serves test_dashboard.html |
+| `GET` | `/` | Serves status page |
+
+### POST /predict Response Payload (Flat Structure)
+
+Unlike older models that wrapped predictions under a `"predictions"` key, the TE-GRU service returns keys directly at the root:
+
+```json
+{
+  "predicted_energy_wh": 11.0740,
+  "upper_bound_energy_wh": 13.1317,
+  "lower_bound_energy_wh": 9.0163,
+  "predicted_energy_range_wh": [9.0163, 13.1317],
+  "energy_unit": "Wh",
+  "tegru_raw_wh": 10.9521,
+  "xgb_residual_wh": 0.1116,
+  "peak_demand": 5.0,
+  "buffer_size": 60,
+  "timestamp": "2026-06-18T13:58:16.485123Z",
+  "source": "fastapi-tegru-xgb-mh"
+}
+```
 
 ### POST /predict request body
 

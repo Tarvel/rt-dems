@@ -143,6 +143,7 @@ try:
     MODEL_READY    = True
     print(f"  Model loaded: TEGRU + XGB + MH  (window={WINDOW}, features={len(feature_columns)})")
     print(f"  Alpha={alpha:.6f}  Beta={beta:.6f}  Q95={q95:.4f}  Q80={q80:.4f}")
+    print(f"  Feature columns (first 10): {feature_columns[:10]}")
 except Exception as exc:
     print(f"  [ERROR] Failed to load model: {exc}")
 
@@ -226,6 +227,10 @@ def engineer_features(df):
     """Compute all features the model expects."""
     df = df.copy()
 
+    # The model was trained with "real time energy" as the energy column name.
+    # Ensure both aliases exist so feature_columns always finds a match.
+    df["real time energy"] = df[ENERGY_COL]
+
     df["hour"] = df["timestamp"].dt.hour
     df["minute"] = df["timestamp"].dt.minute
     df["dayofweek"] = df["timestamp"].dt.dayofweek
@@ -245,28 +250,20 @@ def engineer_features(df):
     df["lux_x_occupancy"] = df["lux"] * df["occupancy"]
     df["hour_x_occupancy"] = df["hour"] * df["occupancy"]
 
-    # Energy lag features
-    df["energy_lag1"] = df[ENERGY_COL].shift(1)
-    df["energy_lag2"] = df[ENERGY_COL].shift(2)
-    df["energy_lag3"] = df[ENERGY_COL].shift(3)
-    df["energy_roll3"] = df[ENERGY_COL].shift(1).rolling(3).mean()
-    df["energy_roll6"] = df[ENERGY_COL].shift(1).rolling(6).mean()
-    df["energy_roll12"] = df[ENERGY_COL].shift(1).rolling(12).mean()
-    df["energy_std6"] = df[ENERGY_COL].shift(1).rolling(6).std()
-    df["energy_std12"] = df[ENERGY_COL].shift(1).rolling(12).std()
-    df["energy_trend3"] = df[ENERGY_COL].shift(1) - df[ENERGY_COL].shift(3)
-    df["energy_trend6"] = df[ENERGY_COL].shift(1) - df[ENERGY_COL].shift(6)
-    df["energy_trend12"] = df[ENERGY_COL].shift(1) - df[ENERGY_COL].shift(12)
-
-    # Duplicate under "real time energy_*" names (model may use either)
-    for suffix in ["lag1", "lag2", "lag3"]:
-        df[f"real time energy_{suffix}"] = df[f"energy_{suffix}"]
-    for suffix in ["roll3", "roll6", "roll12"]:
-        df[f"real time energy_{suffix}"] = df[f"energy_{suffix}"]
-    for suffix in ["std6", "std12"]:
-        df[f"real time energy_{suffix}"] = df[f"energy_{suffix}"]
-    for suffix in ["trend3", "trend6", "trend12"]:
-        df[f"real time energy_{suffix}"] = df[f"energy_{suffix}"]
+    # Energy lag features (computed from both aliases)
+    for ecol in [ENERGY_COL, "real time energy"]:
+        prefix = "energy" if ecol == ENERGY_COL else "real time energy"
+        df[f"{prefix}_lag1"] = df[ecol].shift(1)
+        df[f"{prefix}_lag2"] = df[ecol].shift(2)
+        df[f"{prefix}_lag3"] = df[ecol].shift(3)
+        df[f"{prefix}_roll3"] = df[ecol].shift(1).rolling(3).mean()
+        df[f"{prefix}_roll6"] = df[ecol].shift(1).rolling(6).mean()
+        df[f"{prefix}_roll12"] = df[ecol].shift(1).rolling(12).mean()
+        df[f"{prefix}_std6"] = df[ecol].shift(1).rolling(6).std()
+        df[f"{prefix}_std12"] = df[ecol].shift(1).rolling(12).std()
+        df[f"{prefix}_trend3"] = df[ecol].shift(1) - df[ecol].shift(3)
+        df[f"{prefix}_trend6"] = df[ecol].shift(1) - df[ecol].shift(6)
+        df[f"{prefix}_trend12"] = df[ecol].shift(1) - df[ecol].shift(12)
 
     # Sensor lag features (temperature, humidity, lux, occupancy)
     for col in ["temperature", "humidity", "lux", "occupancy"]:
@@ -351,9 +348,9 @@ def run_prediction(temperature, humidity, lux, occupancy, energy_value,
 
     for key, value in forced.items():
         feature_df.loc[current_idx, key] = value
+        # Always force both "energy_*" and "real time energy_*" variants
         alt_key = f"real time energy_{key.replace('energy_', '')}"
-        if alt_key in feature_df.columns:
-            feature_df.loc[current_idx, alt_key] = value
+        feature_df.loc[current_idx, alt_key] = value
 
     # 6. Select feature columns (fill missing with 0)
     X_all = feature_df.reindex(columns=feature_columns, fill_value=0)

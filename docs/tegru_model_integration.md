@@ -1,179 +1,87 @@
 # TE-GRU + XGBoost + MH Model Integration
 
-## Overview
-
-The system uses a hybrid AI model for energy consumption prediction:
-
-- **TE-GRU** (Temporal Encoding GRU) — a neural network that processes a **sequence of 8 timesteps** to capture temporal patterns
-- **XGBoost** — a gradient boosting model that corrects the residual error of the TE-GRU
-- **Metropolis-Hastings (MH)** — Bayesian calibration that combines both predictions with learned weights (`alpha`, `beta`)
-
-**Final prediction:** `tegru_pred + (alpha × xgb_residual) + beta`
+This document explains in plain English how the machine learning model is integrated into the Smart Room system, how the feature history buffer works, and what each sensor value contributes to the final energy predictions.
 
 ---
 
-## What the Model Needs
+## 1. Overview of the Model
 
-The model takes **25 engineered features** as input, not just raw sensor data.
+The prediction system is a hybrid pipeline combining three parts:
+1. **TE-GRU (Temporal Encoding Gated Recurrent Unit):** A neural network that looks back at a sequence of **8 timesteps** (readings) to capture patterns in energy consumption over time.
+2. **XGBoost:** A tree-based model that looks at the current single timestep to predict and correct the residual error of the TE-GRU's forecast.
+3. **Metropolis-Hastings (MH):** A Bayesian blending layer that weights the two models together and calculates safety bounds (prediction intervals).
 
-### Raw Inputs (from Group 1 sensors)
-
-| Feature       | Source              |
-|---------------|---------------------|
-| temperature   | DHT22 sensor        |
-| humidity      | DHT22 sensor        |
-| lux           | BH1750 / LDR        |
-| occupancy     | Ultrasonic / Radar   |
-
-### Engineered Features (computed at prediction time)
-
-| Feature            | Description                              |
-|--------------------|------------------------------------------|
-| hour               | Hour of day (0–23)                       |
-| dayofweek          | Day of week (0=Mon, 6=Sun)               |
-| month              | Month number (1–12)                      |
-| day                | Day of month                             |
-| is_weekend         | 1 if Saturday/Sunday, else 0             |
-| hour_sin, hour_cos | Cyclical encoding of hour                |
-| month_sin, month_cos | Cyclical encoding of month             |
-| temp_x_humidity    | Temperature × Humidity interaction       |
-| temp_x_occupancy   | Temperature × Occupancy interaction      |
-| humidity_x_occupancy | Humidity × Occupancy interaction       |
-| lux_x_occupancy    | Lux × Occupancy interaction              |
-| hour_x_occupancy   | Hour × Occupancy interaction             |
-
-Plus lag/rolling/trend features for energy and sensors (computed from history buffer).
+**Final Predicted Energy (EDFI) =** `TE-GRU base prediction` + `(alpha × XGBoost correction)` + `beta`
 
 ---
 
-## The 8-Row Window
+## 2. The 8-Row Window & The 12 Lag History Rows
 
-The TE-GRU is a **sequence model** — it doesn't just see a single snapshot, it needs a sliding window of **8 consecutive timesteps**.
+Because the model uses a recurrent neural network (TE-GRU), it cannot make a prediction using only a single snapshot of data. It expects an input window of **8 consecutive rows** of fully engineered features.
 
-```
-Timestep:    t-7   t-6   t-5   t-4   t-3   t-2   t-1   t-now
-              │     │     │     │     │     │     │     │
-              └─────┴─────┴─────┴─────┴─────┴─────┴─────┘
-                        8 rows × 25 features
-                         ↓
-                     TE-GRU model
-                         ↓
-                    Base prediction
-```
+To build these 8 rows, the model needs to calculate rolling statistics and differences over the last **12 intervals** of data. These are called **lag history features**:
 
-Each of these 8 rows is a fully-engineered feature vector (25 values). To build them, we need historical sensor + energy data.
+* **Lag 1, 2, and 3:** The values from 1, 2, and 3 steps ago.
+* **Roll 3, 6, and 12:** The average value over the last 3, 6, and 12 steps.
+* **Std 6 and 12:** The standard deviation (variation) over the last 6 and 12 steps.
+* **Trend 3, 6, and 12:** The change in values between the previous step and the step 3, 6, or 12 intervals ago.
 
----
-
-## Where the History Comes From
-
-### Cold Start (first boot)
-
-When the system starts for the first time, it has no live history. The CSV file (`mydatanew.csv`, 42,240 rows of training data) provides the initial context:
-
-```
-Buffer seeded from CSV: 60 rows
-```
-
-The last 60 rows from the CSV are loaded into a rolling in-memory buffer.
-
-### Live Data (after boot)
-
-As Group 1 sends sensor data every ~2 seconds via MQTT, the ML service listens on `room/sensors` and adds each reading to the buffer:
-
-```
-[Group 1 ESP32] → room/hardware/nano → [hw_bridge] → room/sensors → [ML Service buffer]
-```
-
-Each reading includes:
-- temperature, humidity, lux, occupancy (from sensors)
-- energy (from INA219 power monitor)
-
-Over time, live data pushes out the CSV-seeded rows. After ~2 minutes (60 readings × 2s), the entire buffer contains only real data.
-
-### Energy Lag Features
-
-The model was trained with energy lag features:
-- `energy_lag1` = energy value 1 reading ago
-- `energy_lag2` = energy value 2 readings ago
-- `energy_lag3` = energy value 3 readings ago
-- `energy_roll3/6/12` = rolling average over last 3/6/12 readings
-- `energy_std6/12` = rolling standard deviation
-- `energy_trend3/6/12` = trend (current − N steps ago)
-
-These are computed from the **actual energy values in the buffer** — either CSV historical energy (cold start) or live energy from Group 1's INA219 sensor.
+### How this works under the hood:
+The FastAPI service maintains an in-memory queue (the `history_buffer`) with a maximum capacity of 60 records.
+1. When a prediction is requested, the service copies the history buffer.
+2. It appends the current sensor readings (the new row) to the end of the history.
+3. It runs the feature engineering script to calculate the lags, rolling averages, and trends over the 12-interval history.
+4. It extracts the last 8 fully engineered rows as a sequence to feed into the TE-GRU model.
 
 ---
 
-## Prediction Flow
+## 3. Where the History Data Comes From
 
-```
-Rule Engine (every ~5s)
-     │
-     ├── POST /predict { temperature_c, humidity, lux, occupancy }
-     │
-     ▼
-ML Service (model_new_unsure/main.py)
-     │
-     ├── 1. Snapshot the rolling buffer (last 60 readings)
-     ├── 2. Append current sensor values as a new row (energy = NaN)
-     ├── 3. Run engineer_features() → compute all 25+ features
-     ├── 4. Force energy lag features from actual buffer values
-     ├── 5. Extract X_sequence (last 8 rows) for TE-GRU
-     ├── 6. Extract X_current (last 1 row) for XGBoost
-     ├── 7. tegru_pred = TE-GRU(X_sequence)
-     ├── 8. residual_pred = XGBoost(X_current)
-     ├── 9. final = tegru_pred + alpha × residual_pred + beta
-     └── 10. Return { predicted_energy_wh, lower_bound, upper_bound }
-```
+### Cold Start (First Boot)
+When you first start the system, the history buffer is empty. To prevent the model from failing or outputting garbage, the service loads the last 60 records from `mydatanew.csv` (the training dataset) into the buffer at boot.
+
+### Live Ingestion (During Run)
+The FastAPI service runs an MQTT bridge client that subscribes to the `room/sensors` topic. Every time a new telemetry payload is published:
+* The service extracts: `temperature`, `humidity`, `lux`, `occupancy`, and the cumulative `energy_kw` (provided by Group 1's hardware).
+* These live values are appended to the in-memory buffer.
+* The oldest reading is evicted. Within 2 minutes of continuous operation, the CSV data decays out, and the buffer is composed entirely of live hardware readings.
 
 ---
 
-## Confidence Bounds
+## 4. Role of Live Sensors vs. Live Energy
 
-The model provides prediction intervals:
-- **95% interval:** `prediction ± Q95` (Q95 = 2.0577 Wh)
-- **80% interval:** `prediction ± Q80` (Q80 = 0.8464 Wh)
+The features in the model are split into two categories:
 
-Example: If EDFI = 11.07 Wh → range is [9.01 – 13.13] Wh (95%).
+### A. Live Environmental Sensors (DHT22, BH1750, Presence)
+* **What they are:** Temperature, humidity, lux (light level), and occupancy.
+* **What they do:** These represent the **drivers** of energy consumption. If the temperature is high (hot day) or occupancy is high (many people in the room), energy consumption increases. Lux levels tell the model if it is daytime or nighttime.
+* **How they enter the model:** The rule engine reads these from the sensors and sends them via HTTP POST to `/predict`.
 
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `model_new_unsure/main.py` | FastAPI service (prediction endpoint) |
-| `model_new_unsure/model_assets/tegru_xgb_mh_pipeline.joblib` | Trained model bundle |
-| `model_new_unsure/model_assets/mydatanew.csv` | CSV for cold-start buffer seeding |
-| `model_new_unsure/applastvalues.py` | Original Streamlit app (reference only) |
+### B. Live Energy (INA219 Power Monitor)
+* **What it is:** The cumulative energy reading (`energy_kw` normalized from Group 1's hardware).
+* **What it does:** This is the feedback loop. The model needs to know how much energy was *actually* consumed in the previous steps to forecast what will be consumed next.
+* **How they enter the model:** The FastAPI service listens to `room/sensors` on MQTT. It extracts the real energy value and stores it in the history buffer. When you call `/predict`, the model uses these buffered energy values to calculate the **energy lag, trend, and rolling features** (like `energy_lag1`, `energy_roll3`, etc.).
 
 ---
 
-## Dependencies
+## 5. What the Predicted Energy Does
 
-```
-tensorflow        # TE-GRU Keras model
-xgboost           # Residual correction model
-catboost           # Required by the joblib bundle
-scikit-learn      # Scaler inside SequenceRegressorPipeline
-joblib            # Model serialisation
-fastapi + uvicorn # HTTP service
-pandas + numpy    # Feature engineering
-paho-mqtt         # Buffer population from live sensors
-```
+The rule engine gets the prediction (`predicted_energy_wh`) from the model and uses it to manage the smart room's power grid:
+
+1. **Anomaly and Range Checks:** The Metropolis-Hastings layer returns an upper and lower safety bound. If the upper bound exceeds critical demand thresholds, the system can trigger alarms or prevent additional loads from turning on.
+2. **Dynamic Mode Selection:** The predicted value (EDFI) is evaluated alongside the battery state of charge (SoC) to select the room's operational mode:
+   * **Mode A (All Loads ON):** Only active when predicted demand is high and the battery is full ($\ge 80\%$).
+   * **Mode B (Average Load - HVAC + Freezer ON):** Used during moderate demand, or during peak demand when the battery is at medium charge ($\ge 60\%$).
+   * **Mode C (Baseline Load - Freezer Only ON):** Enforced when predicted demand is very low, or when the battery is depleted ($< 60\%$), keeping only critical appliances running.
 
 ---
 
-## Configuration (.env)
+## 6. How it was Integrated (Step-by-Step)
 
-```env
-MODEL_ASSET_DIR=model_new_unsure/model_assets
-ML_SERVICE_SCRIPT=model_new_unsure/main.py
-```
+1. **Streamlit to FastAPI:** Converted the Streamlit code into a fast, headless FastAPI endpoint (`model_new_unsure/main.py`) running on Port 5000.
+2. **Virtual Environment Setup:** Installed the deep learning dependency (`tensorflow`), the tree model dependencies (`xgboost`, `catboost`), and standard library tools (`scikit-learn`, `joblib`) on the Raspberry Pi.
+3. **Column Mapping Alignment:** Fixed a critical bug where the model expected `"real time energy"` but the database used `"energy"`. We added an aliasing step in `engineer_features()` so that both names are populated.
+4. **Rule Engine Response Adaptor:** The old model wrapped its output in a `predictions` key. The new model returned flat keys. We updated `rule_engine.py` to support both formats.
+5. **CSV Download Upgrade:** Updated Django's `CSVDownloadView` to support date filters (`start=today`, `end=today`) and output every sensor reading aligned by minute.
 
-To switch back to the LightGBM model, change these to:
-```env
-MODEL_ASSET_DIR=LIGHT_ML_MODEL/model_assets
-ML_SERVICE_SCRIPT=LIGHT_ML_MODEL/main.py
-```
+

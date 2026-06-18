@@ -31,8 +31,17 @@ cd ..
 On Raspberry Pi only:
 
 ```bash
-pip install RPi.GPIO
+# No GPIO libraries needed on the Pi anymore — the rule engine
+# publishes relay decisions via MQTT. An ESP32 handles physical
+# relay actuation. lgpio/gpiozero are only needed if you run
+# the GPIO test script separately (now removed).
 ```
+
+### 1.3 Important: ESP32 relay controller
+
+The rule engine no longer drives GPIO pins on the Raspberry Pi. Instead, it publishes mode decisions to `room/relays/state` via MQTT. A separate **ESP32 microcontroller** subscribes to this topic and actuates the physical relay modules using the `relay_1`, `relay_2`, `relay_3` booleans in the payload.
+
+This means you do **not** need `lgpio`, `gpiozero`, or any GPIO-related Python packages on the Pi for normal operation.
 
 ## 2. Initial Setup
 
@@ -90,6 +99,8 @@ python workers/mqtt_logger.py
 
 ### Terminal 4 - Rule engine
 
+The rule engine evaluates energy/battery rules and publishes relay state decisions via MQTT. It does **not** drive local GPIO pins — an ESP32 subscribes to the published topic and handles physical relay actuation.
+
 ```bash
 cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
 source venv/bin/activate
@@ -125,6 +136,19 @@ python simulation/data_simulator.py
 
 Keep this terminal running. If it stops, sensor values stop and ML predictions stop.
 
+**Battery drain modes:** The simulator supports two battery simulation profiles, controlled by the `BATTERY_DRAIN_MODE` environment variable:
+
+```bash
+# Default (set in example.env) — randomised fluctuations to stress-test
+# the rule engine's 3-time battery lag:
+BATTERY_DRAIN_MODE=inconsistent python simulation/data_simulator.py
+
+# Linear drain — deterministic -0.1% per row (for baseline/predictable testing):
+BATTERY_DRAIN_MODE=consistent python simulation/data_simulator.py
+```
+
+The inconsistent mode produces a mix of normal drain (70%), sharp drops of 2-5% (15%), flat periods (10%), and small recoveries (5%). This ensures the rule engine's lag stability check (`MAX_BATTERY_DROP_PERCENT`) is properly exercised.
+
 ### Terminal 7 - Open dashboard in browser (optional)
 
 Open this file in your browser:
@@ -159,18 +183,69 @@ Open `http://127.0.0.1:5000` in your browser (the ML service serves the page). F
 
 Both test tools use HTTP only and do not connect to MQTT.
 
-## 6. What to Expect When Running
+## 6. Testing the Rule Engine (MQTT-Based)
 
-1. Simulator publishes sensor payloads to `room/sensors` every 5 seconds.
+**File:** `simulation/test_rule_engine_mqtt.py`
+
+This test script validates that the rule engine publishes the correct JSON payloads for every mode transition, without requiring any hardware or a real MQTT broker.
+
+### 6.1 What it tests
+
+- All mode transitions (A, B, C) for both Step 1 and Step 2
+- Battery lag stability checks (day vs night thresholds)
+- Lag instability forcing mode drops (A→B, B→C)
+- No-ML-prediction fallback (maintains current mode)
+- Full payload structure (all required keys present)
+
+### 6.2 Running the test
+
+```bash
+cd /home/tai/Downloads/PEOJECT\ RESEARCH\ REFERENCES/PROJECT_CODE
+source venv/bin/activate
+python simulation/test_rule_engine_mqtt.py
+```
+
+Expected output:
+
+```
+============================================================
+  Rule Engine — MQTT Payload Test Suite
+============================================================
+
+━━ 1. Mode A — energy sufficient, battery ≥80%, lag stable ━━
+  ✓ mode is A
+  ✓ relay_1 is True
+  ...
+
+============================================================
+  ALL 22 TESTS PASSED ✓
+============================================================
+```
+
+### 6.3 How the ESP32 uses the payload
+
+The rule engine publishes to `room/relays/state` with `relay_1`, `relay_2`, `relay_3` boolean fields. The ESP32 subscribes to this topic and drives its GPIO pins accordingly:
+
+| Payload field | ESP32 action |
+|--------------|-------------|
+| `relay_1: true` | GPIO pin → HIGH (relay closes, device ON) |
+| `relay_1: false` | GPIO pin → LOW (relay opens, device OFF) |
+| Same for `relay_2`, `relay_3` | — |
+
+## 7. What to Expect When Running
+
+1. Simulator publishes sensor payloads to `room/sensors` (prediction-paced — waits for ML response before advancing).
 2. ML service receives sensor data via MQTT, runs the GRU + LightGBM model, and publishes predictions to `room/ml/predictions`.
 3. Logger buffers sensor and prediction data and writes 5-minute averages to SQLite.
-4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state`.
-5. Django API serves historical data at `/api/v1/*`.
-6. Dashboard shows live data from MQTT in the browser.
+4. Rule engine evaluates every configured interval and publishes mode decisions to `room/relays/state` (consumed by ESP32 + dashboard).
+5. ESP32 relay controller subscribes to `room/relays/state` and drives physical relay GPIO pins.
+5. Battery lag tracker (inside the rule engine) shifts T-now/T-1/T-2 every 30 seconds and publishes lightweight `battery_lag_update` payloads to the dashboard.
+6. Django API serves historical data at `/api/v1/*`.
+7. Dashboard shows live data from MQTT in the browser.
 
-## 7. Configuration
+## 8. Configuration
 
-### 7.1 Environment variables (`.env`)
+### 8.1 Environment variables (`.env`)
 
 Copy the provided example file to configure all services:
 
@@ -183,8 +258,22 @@ Key variables for the rule engine:
 ```bash
 DECISION_INTERVAL_MINUTES=3
 BATTERY_LAG_INTERVAL_SECONDS=30
-MAX_BATTERY_DROP_PERCENT=2
+MAX_BATTERY_DROP_PERCENT=2              # Daytime (solar) threshold
+MAX_BATTERY_DROP_NIGHT_PERCENT=8        # Nighttime (no solar) threshold
+SOLAR_HOUR_START=11                     # Solar window start (24h)
+SOLAR_HOUR_END=16                       # Solar window end (24h, exclusive)
 MODE_A_MAX_KWH=2.4
+```
+
+Key variables for the data simulator:
+
+```bash
+BATTERY_DRAIN_MODE=inconsistent    # "consistent" (linear) or "inconsistent" (randomised)
+BATTERY_START=85.0                 # Initial battery % at simulation start
+BATTERY_FLOOR=20.0                 # Minimum battery % (drain stops here)
+ML_API_BASE=http://127.0.0.1:5000  # ML service URL (for /reset call)
+PREDICTION_TIMEOUT=30              # Max seconds to wait for ML prediction per row
+MIN_ROW_DELAY=3                    # Min seconds between rows
 ```
 
 Production interval example in `.env`:
@@ -200,7 +289,7 @@ DECISION_INTERVAL_MINUTES=5
 3. Sensor topic: `room/sensors`
 4. Prediction topic: `room/ml/predictions`
 
-## 8. Verification Commands
+## 9. Verification Commands
 
 ### 8.1 Subscribe to all MQTT messages
 
@@ -232,7 +321,7 @@ curl -s http://127.0.0.1:5000/predict -X POST \
   -d '{"temperature_c":32.5,"humidity":60.0,"lux":450.0,"occupancy":1,"energy_kw":1.5}'
 ```
 
-## 9. systemd Deployment
+## 10. systemd Deployment
 
 ```bash
 sudo cp systemd/mqtt-logger.service /etc/systemd/system/
@@ -249,7 +338,7 @@ sudo journalctl -u mqtt-logger -f
 sudo journalctl -u rule-engine -f
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 1. MQTT disconnected
    - Make sure the broker is running with `systemd/mosquitto.conf`.
@@ -273,24 +362,35 @@ sudo journalctl -u rule-engine -f
      sqlite3 room_backend/db.sqlite3 "PRAGMA journal_mode;"
      ```
 
-## 11. Quick Checklist
+6. Rule engine MQTT test fails
+   - Run `python simulation/test_rule_engine_mqtt.py` and check output for which assertions failed.
+   - Verify that `.env` has all required variables.
+
+7. ESP32 not receiving relay commands
+   - Verify the ESP32 is subscribed to `room/relays/state`.
+   - Check MQTT connectivity: `mosquitto_sub -t "room/relays/state" -v`
+   - Ensure the rule engine is running and publishing.
+
+## 12. Quick Checklist
 
 ```text
-1. Start Mosquitto
-2. Start Django
-3. Start mqtt_logger
-4. Start rule_engine
-5. Start ML service (ML/test_prediction_api.py)
-6. Start simulator (or hardware publisher) and keep it running
-7. Open dashboard (dashboard/index.html) in browser
-8. Verify live MQTT traffic with: mosquitto_sub -t "room/#" -v
-9. Verify dashboard/API responses
+ 1. Start Mosquitto
+ 2. Start Django
+ 3. Start mqtt_logger
+ 4. Start rule_engine (publishes to MQTT, no local GPIO)
+ 5. Start ML service (ML/test_prediction_api.py)
+ 6. Start simulator (or hardware publisher) and keep it running
+ 7. Ensure ESP32 relay controller is powered and connected to MQTT
+ 8. Open dashboard (dashboard/index.html) in browser
+ 9. Test rule engine:          python simulation/test_rule_engine_mqtt.py
+10. Verify live MQTT traffic:  mosquitto_sub -t "room/#" -v
+11. Verify dashboard/API responses
 ```
 
 Shutdown order:
 
 1. Stop simulator/publishers
 2. Stop ML service
-3. Stop workers
+3. Stop workers (rule engine publishes Mode C on shutdown for ESP32 safety)
 4. Stop Django
 5. Stop Mosquitto

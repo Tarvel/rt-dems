@@ -1,12 +1,13 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
 class ApiService {
   final String baseUrl;
   final http.Client client;
 
   ApiService({
-    this.baseUrl = 'http://localhost:8000/api/v1',
+    this.baseUrl = 'http://192.168.0.182:8000/api/v1',
     http.Client? client,
   }) : client = client ?? http.Client();
 
@@ -66,9 +67,9 @@ class ApiService {
     }
   }
 
-  Future<List<dynamic>> getSensorHistory() async {
+  Future<List<dynamic>> getRelayHistory() async {
     try {
-      final response = await client.get(Uri.parse('$baseUrl/sensors/'));
+      final response = await client.get(Uri.parse('$baseUrl/relays/'));
       if (response.statusCode == 200) {
         final body = json.decode(response.body);
         // DRF pagination wraps results in a 'results' key
@@ -79,7 +80,7 @@ class ApiService {
       }
       return [];
     } catch (e) {
-      print('Error fetching sensor history: $e');
+      print('Error fetching relay history: $e');
       return [];
     }
   }
@@ -109,6 +110,20 @@ class ApiService {
     } catch (e) {
       print('Error updating system mode: $e');
       return false;
+    }
+  }
+
+  /// Triggers a download of historical telemetry data as a CSV file.
+  Future<void> downloadCsv({int days = 1}) async {
+    try {
+      final uri = Uri.parse('$baseUrl/download/csv/?days=$days');
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        print('Could not launch $uri');
+      }
+    } catch (e) {
+      print('Error downloading CSV: $e');
     }
   }
 }

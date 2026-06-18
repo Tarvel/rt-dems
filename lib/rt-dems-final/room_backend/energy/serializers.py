@@ -30,4 +30,11 @@ class RelayStateSerializer(serializers.ModelSerializer):
             "relay_2",
             "relay_3",
             "reason",
+            "temperature",
+            "humidity",
+            "lux",
+            "occupancy",
+            "energy_kw",
+            "battery_level",
+            "battery_voltage",
         ]

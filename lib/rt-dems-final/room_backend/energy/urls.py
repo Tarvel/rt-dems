@@ -27,4 +27,6 @@ urlpatterns = [
         views.CurrentRelayStateView.as_view(),
         name="relay-current",
     ),
+    # CSV download
+    path("download/csv/", views.CSVDownloadView.as_view(), name="csv-download"),
 ]

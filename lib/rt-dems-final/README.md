@@ -20,10 +20,15 @@ Sensor Publisher (ESP or simulator) -> room/sensors
        |                             |                               |
        v                             v                               v
 workers/mqtt_logger.py         ML/test_prediction_api.py       workers/rule_engine.py
-(buffer + 5-min avg -> DB)     (GRU+LightGBM + MQTT bridge)   (rule decisions + GPIO)
+(buffer + 5-min avg -> DB)     (GRU+LightGBM + MQTT bridge)   (rule decisions -> MQTT)
        |                             |                               |
        v                             v                               v
  room/data/averaged            room/ml/predictions             room/relays/state
+                                                                     |
+                                                                     v
+                                                               ESP32 Relay
+                                                               Controller
+                                                               (GPIO actuation)
 
 Django API reads SQLite history at /api/v1/*
 ```
@@ -92,8 +97,10 @@ Copy `example.env` to `.env` to configure all services. Key variables for the Ru
 
 1. `DECISION_INTERVAL_MINUTES` default `3` (test)
 2. `BATTERY_LAG_INTERVAL_SECONDS` default `30`
-3. `MAX_BATTERY_DROP_PERCENT` default `2`
-4. `MODE_A_MAX_KWH` default `2.4`
+3. `MAX_BATTERY_DROP_PERCENT` default `2` (daytime threshold)
+4. `MAX_BATTERY_DROP_NIGHT_PERCENT` default `8` (nighttime threshold)
+5. `SOLAR_HOUR_START` / `SOLAR_HOUR_END` default `11` / `16`
+6. `MODE_A_MAX_KWH` default `2.4`
 
 Production interval example:
 

@@ -4,7 +4,11 @@ rule_engine.py — Relay Control Rule Engine
 ============================================
 
 Subscribes to sensor & ML MQTT topics, evaluates energy-management rules
-on a fixed decision cycle, controls 3 GPIO relays, and logs every decision.
+on a fixed decision cycle, and publishes relay state decisions via MQTT.
+
+An external ESP32 subscribes to room/relays/state and drives the physical
+relay GPIO pins based on the relay_1, relay_2, relay_3 booleans in the
+published payload.  This engine does NOT touch any local GPIO.
 
 Relay Modes:
   A  — Peak Demand   : All relays ON  (Priority 1, 2, 3)
@@ -21,61 +25,12 @@ import signal
 import sqlite3
 import sys
 import threading
+import urllib.request
+import urllib.error
 
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
-
-# ---------------------------------------------------------------------------
-# GPIO Setup — real RPi.GPIO or mock for development machines
-# ---------------------------------------------------------------------------
-try:
-    import RPi.GPIO as GPIO
-
-    ON_PI = True
-except (ImportError, RuntimeError):
-
-    class MockGPIO:
-        """Lightweight GPIO mock so rule_engine.py runs on dev machines."""
-
-        BCM = "BCM"
-        OUT = "OUT"
-        HIGH = 1
-        LOW = 0
-        _pins: dict[int, int] = {}
-
-        @classmethod
-        def setmode(cls, mode):
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setmode(%s)",
-                mode,
-            )
-
-        @classmethod
-        def setwarnings(cls, flag):
-            pass
-
-        @classmethod
-        def setup(cls, pin, mode):
-            cls._pins[pin] = cls.LOW
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: setup(pin=%d, mode=%s)", pin, mode
-            )
-
-        @classmethod
-        def output(cls, pin, state):
-            cls._pins[pin] = state
-            state_str = "HIGH (ON)" if state == cls.HIGH else "LOW (OFF)"
-            logging.getLogger("rule_engine").info(
-                "MockGPIO: pin %d → %s", pin, state_str
-            )
-
-        @classmethod
-        def cleanup(cls):
-            logging.getLogger("rule_engine").info("MockGPIO: cleanup()")
-
-    GPIO = MockGPIO  # type: ignore[misc]
-    ON_PI = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -85,13 +40,14 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_CLIENT_ID = "room-rule-engine"
 
 TOPIC_SENSORS = "room/sensors"
-TOPIC_ML = "room/ml/predictions"
+TOPIC_ML = "room/ml/predictions"  # Published TO (for logger/frontend)
 TOPIC_RELAY_STATE = "room/relays/state"
+TOPIC_OVERRIDE = "room/control/override"
 
-# GPIO pins (BCM numbering) — change via env vars or edit here
-RELAY_PIN_1 = int(os.environ.get("RELAY_PIN_1", 17))   # Priority 1
-RELAY_PIN_2 = int(os.environ.get("RELAY_PIN_2", 27))   # Priority 2
-RELAY_PIN_3 = int(os.environ.get("RELAY_PIN_3", 22))   # Priority 3
+# ML Service HTTP endpoint (single-timer: rule engine calls ML directly)
+ML_SERVICE_URL = os.environ.get(
+    "ML_SERVICE_URL", "http://localhost:5000/predict"
+)
 
 # Database path
 DB_PATH = os.environ.get(
@@ -101,47 +57,53 @@ DB_PATH = os.environ.get(
 )
 
 # Decision interval in minutes.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  TESTING DEFAULT: 1 minutes.  Change to 5 for production.       │
-# │  export DECISION_INTERVAL_MINUTES=5                             │
-# └─────────────────────────────────────────────────────────────────┘
-DECISION_INTERVAL_MINUTES = int(
-    os.environ.get("DECISION_INTERVAL_MINUTES", 1)
+DECISION_INTERVAL_MINUTES = float(
+    os.environ.get("DECISION_INTERVAL_MINUTES", 3)
 )
-DECISION_INTERVAL_SECONDS = DECISION_INTERVAL_MINUTES * 60
+DECISION_INTERVAL_SECONDS = int(DECISION_INTERVAL_MINUTES * 60)
 
-# Battery lag tracker: sample every 60 seconds (T-now, T-60s, T-120s).
+# Battery lag tracker: sample every 30 seconds (T-now, T-1, T-2).
 BATTERY_LAG_INTERVAL_SECONDS = int(
-    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 60)
+    os.environ.get("BATTERY_LAG_INTERVAL_SECONDS", 30)
 )
 BATTERY_LAG_READINGS = 3
 
-# Max safe battery drop (%) over the lag window.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  TESTING DEFAULT: 2%.  Change to 10 for production.           │
-# │  export MAX_BATTERY_DROP_PERCENT=10                           │
-# └─────────────────────────────────────────────────────────────────┘
-MAX_BATTERY_DROP_PERCENT = float(
-    os.environ.get("MAX_BATTERY_DROP_PERCENT", 2)
+# ── EDFI Load Thresholds (Wh) ──
+# The predicted energy (EDFI) is compared against these to classify load.
+#   EDFI >= PEAK       → Peak Load
+#   MODERATE <= EDFI   → Moderate Load
+#   BASELINE <= EDFI   → Baseline Load
+#   EDFI < BASELINE    → Very Low Load
+PEAK_THRESHOLD = float(os.environ.get("PEAK_THRESHOLD", 80))
+MODERATE_THRESHOLD = float(os.environ.get("MODERATE_THRESHOLD", 50))
+BASELINE_THRESHOLD = float(os.environ.get("BASELINE_THRESHOLD", 30))
+
+# Sensor averaging window (seconds).
+# Group 2 trained the new model on 5-minute averaged readings.
+SENSOR_AVG_WINDOW_SECONDS = int(os.environ.get("SENSOR_AVG_WINDOW_SECONDS", 300))
+
+# How often to run a prediction when sensor data arrives (seconds).
+# Group 2 wants "real-time" predictions, but calling the ML service on
+# every single sensor message (~2 Hz) would overload it.  This throttle
+# ensures we predict at most once per PREDICTION_RATE_LIMIT_SECONDS.
+PREDICTION_RATE_LIMIT_SECONDS = float(
+    os.environ.get("PREDICTION_RATE_LIMIT_SECONDS", 5)
 )
 
 
-def _format_duration(seconds: int) -> str:
-    if seconds % 60 == 0:
-        minutes = seconds // 60
-        return f"{minutes}m"
-    return f"{seconds}s"
+# ---------------------------------------------------------------------------
+# Battery stability check
+# ---------------------------------------------------------------------------
+def battery_stable(levels: list[float | None], threshold: float) -> bool:
+    """Return True if ALL battery lag readings are >= threshold.
 
-
-# Peak demand threshold in kW. Condition 1 compares predicted energy
-# against this value.
-# ┌─────────────────────────────────────────────────────────────────┐
-# │  This is the MODE_A ceiling (peak demand load).               │
-# │  export MODE_A_MAX_KWH=2.4                                   │
-# └─────────────────────────────────────────────────────────────────┘
-MODE_A_MAX_KWH = float(
-    os.environ.get("MODE_A_MAX_KWH", 2.4)
-)
+    If any reading is None (lag window not full), that slot is
+    treated as meeting the threshold so early decisions aren't blocked.
+    """
+    for level in levels:
+        if level is not None and level < threshold:
+            return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -162,6 +124,14 @@ latest_sensor: dict = {}
 # Latest ML prediction
 latest_ml: dict = {}
 
+# 20-minute rolling sensor buffer for averaging.
+# Each entry is a dict with a "_ts" key (epoch float) + sensor values.
+import time as _time_mod
+sensor_buffer: list[dict] = []
+
+# Timestamp of last continuous prediction (for rate limiting).
+_last_prediction_epoch: float = 0.0
+
 # Rolling battery lag: three explicit time slots.
 # T-now  = current reading (updated every 60s)
 # T-1    = reading from 60 seconds ago
@@ -174,55 +144,43 @@ battery_t2:    float | None = None
 # Current mode (persists between evaluations for stability lock)
 current_mode: str = "C"  # start in safest mode
 
+# ── Manual override state ──
+# When True, the evaluation loop skips automatic decisions.
+# The dashboard controls modes/relays directly via room/control/override.
+manual_override: bool = False
+manual_mode: str = "C"
+manual_relays: tuple[bool, bool, bool] = (True, False, False)
+
 # Shutdown flag
 shutdown_event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
-# GPIO helpers
+# Mode → relay-state mapping (pure logic, no hardware)
 # ---------------------------------------------------------------------------
-def gpio_init() -> None:
-    """Set up GPIO pins as outputs."""
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    for pin in (RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3):
-        GPIO.setup(pin, GPIO.OUT)
-    log.info(
-        "GPIO initialized: P1=pin%d, P2=pin%d, P3=pin%d",
-        RELAY_PIN_1, RELAY_PIN_2, RELAY_PIN_3,
-    )
-
-
-def set_relays(relay_1: bool, relay_2: bool, relay_3: bool) -> None:
-    """Drive the three relay GPIO pins."""
-    GPIO.output(RELAY_PIN_1, GPIO.HIGH if relay_1 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_2, GPIO.HIGH if relay_2 else GPIO.LOW)
-    GPIO.output(RELAY_PIN_3, GPIO.HIGH if relay_3 else GPIO.LOW)
-
-
 def apply_mode(mode: str) -> tuple[bool, bool, bool]:
-    """Translate a mode letter into relay states and actuate GPIO.
+    """Translate a mode letter into relay state booleans.
 
-    Returns (relay_1, relay_2, relay_3) as booleans.
+    No local GPIO is driven — the returned values are published
+    via MQTT for the ESP32 relay controller to consume.
+
+    Returns (relay_1, relay_2, relay_3).
     """
     if mode == "A":
-        states = (True, True, True)
+        return (True, True, True)
     elif mode == "B":
-        states = (True, True, False)
-    else:  # "C"
-        states = (True, False, False)
-
-    set_relays(*states)
-    return states
+        return (True, True, False)
+    elif mode == "C":
+        return (True, False, False)
 
 
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -230,29 +188,64 @@ def ensure_relay_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS energy_relaystate (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT    NOT NULL DEFAULT (datetime('now')),
-            mode      TEXT    NOT NULL,
-            relay_1   INTEGER NOT NULL,
-            relay_2   INTEGER NOT NULL,
-            relay_3   INTEGER NOT NULL,
-            reason    TEXT    NOT NULL DEFAULT ''
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT    NOT NULL DEFAULT (datetime('now')),
+            mode            TEXT    NOT NULL,
+            relay_1         INTEGER NOT NULL,
+            relay_2         INTEGER NOT NULL,
+            relay_3         INTEGER NOT NULL,
+            reason          TEXT    NOT NULL DEFAULT '',
+            temperature     REAL    NOT NULL DEFAULT 0.0,
+            humidity        REAL    NOT NULL DEFAULT 0.0,
+            lux             REAL    NOT NULL DEFAULT 0.0,
+            occupancy       INTEGER NOT NULL DEFAULT 0,
+            energy_kw       REAL    NOT NULL DEFAULT 0.0,
+            battery_level   REAL    NOT NULL DEFAULT 0.0,
+            battery_voltage REAL    NOT NULL DEFAULT 0.0
         );
         """
     )
+    # Add columns to existing tables (safe — SQLite ignores if they exist)
+    for col, coltype in [
+        ("temperature", "REAL DEFAULT 0.0"),
+        ("humidity", "REAL DEFAULT 0.0"),
+        ("lux", "REAL DEFAULT 0.0"),
+        ("occupancy", "INTEGER DEFAULT 0"),
+        ("energy_kw", "REAL DEFAULT 0.0"),
+        ("battery_level", "REAL DEFAULT 0.0"),
+        ("battery_voltage", "REAL DEFAULT 0.0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE energy_relaystate ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     conn.commit()
 
 
 def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
-    """Write a relay-state decision to the database."""
+    """Write a relay-state decision to the database, including a sensor snapshot."""
+    # Grab sensor snapshot under lock
+    with state_lock:
+        snap = {
+            "temperature": float(latest_sensor.get("temperature", 0.0)),
+            "humidity": float(latest_sensor.get("humidity", 0.0)),
+            "lux": float(latest_sensor.get("lux", 0.0)),
+            "occupancy": int(latest_sensor.get("occupancy", 0)),
+            "energy_kw": float(latest_sensor.get("energy_kw", 0.0)),
+            "battery_level": float(latest_sensor.get("battery_level", 0.0)),
+            "battery_voltage": float(latest_sensor.get("battery_voltage", 0.0)),
+        }
+
     try:
         conn = get_db_connection()
         ensure_relay_table(conn)
         conn.execute(
             """
             INSERT INTO energy_relaystate
-                (timestamp, mode, relay_1, relay_2, relay_3, reason)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (timestamp, mode, relay_1, relay_2, relay_3, reason,
+                 temperature, humidity, lux, occupancy,
+                 energy_kw, battery_level, battery_voltage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -261,12 +254,41 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
                 int(r2),
                 int(r3),
                 reason,
+                snap["temperature"],
+                snap["humidity"],
+                snap["lux"],
+                snap["occupancy"],
+                snap["energy_kw"],
+                snap["battery_level"],
+                snap["battery_voltage"],
             ),
         )
         conn.commit()
         conn.close()
     except sqlite3.Error as exc:
-        log.error("SQLite error logging decision: %s", exc)
+        log.warning("SQLite error logging decision (attempt 1): %s — retrying", exc)
+        import time as _time
+        _time.sleep(0.5)
+        try:
+            conn = get_db_connection()
+            ensure_relay_table(conn)
+            conn.execute(
+                "INSERT INTO energy_relaystate "
+                "(mode, relay_1, relay_2, relay_3, reason, "
+                " temperature, humidity, lux, occupancy, energy_kw, "
+                " battery_level, battery_voltage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mode, int(r1), int(r2), int(r3), reason,
+                    snap["temperature"], snap["humidity"],
+                    snap["lux"], snap["occupancy"], snap["energy_kw"],
+                    snap["battery_level"], snap["battery_voltage"],
+                ),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as exc2:
+            log.error("SQLite error logging decision (attempt 2): %s", exc2)
 
 
 # ---------------------------------------------------------------------------
@@ -275,17 +297,25 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
 def evaluate_rules() -> tuple[str, str]:
     """Evaluate the decision pipeline and return (mode, reason).
 
+    EDFI = predicted energy (Energy Demand Forecast Interval).
+    Battery stability = ALL 3 lag readings (T-now, T-1, T-2) >= threshold.
+
     Decision tree
     ─────────────
-    Step 1: predicted_energy >= MODE_A_MAX_KWH  (energy is sufficient)
-        ├─ Battery >= 80%  → lag stable? → A / B
-        ├─ Battery >= 50%  → lag stable? → B / C
-        └─ Battery <  50%  → C
+    PEAK LOAD:     EDFI >= 80
+        ├─ battery_stable(80%) → Smart A
+        ├─ battery_stable(60%) → Smart B
+        └─ else               → Smart C
 
-    Step 2: predicted_energy <  MODE_A_MAX_KWH  (energy is tight)
-        ├─ Battery >= 80%  → lag floor ok? → A / B
-        ├─ Battery >= 60%  → lag floor ok? → B / C
-        └─ Battery <  60%  → C
+    MODERATE LOAD: 50 <= EDFI < 80
+        ├─ battery_stable(60%) → Smart B
+        └─ else               → Smart C
+
+    BASELINE LOAD: 30 <= EDFI < 50
+        └─ Always Smart C
+
+    VERY LOW LOAD: EDFI < 30
+        └─ Smart C
     """
     global current_mode
 
@@ -298,22 +328,13 @@ def evaluate_rules() -> tuple[str, str]:
     occupancy = latest_sensor.get("occupancy")
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    # Resolve predicted energy from whichever key the ML payload has.
-    predicted_energy = latest_ml.get("predicted_energy_kw")
+    # Resolve predicted energy (EDFI) from ML payload
+    predicted_energy = latest_ml.get("predicted_energy_wh")
+    if predicted_energy is None:
+        predicted_energy = latest_ml.get("predicted_energy_kw")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_range")
-    if predicted_energy is None:
-        predicted_energy = latest_ml.get("predicted_energy_kwh")
 
-    log.info(
-        "Env snapshot: temp=%.1f°C, humidity=%s, lux=%s, "
-        "occupancy=%s, battery=%.1f%%",
-        float(temperature),
-        "n/a" if humidity is None else f"{humidity}",
-        "n/a" if lux is None else f"{lux}",
-        "n/a" if occupancy is None else f"{occupancy}",
-        float(battery_level),
-    )
 
     if predicted_energy is None:
         return current_mode, (
@@ -321,118 +342,222 @@ def evaluate_rules() -> tuple[str, str]:
             "→ maintaining current mode"
         )
 
-    predicted_energy = float(predicted_energy)
+    edfi = float(predicted_energy)
 
-    # ── Lag helpers ──────────────────────────────────────────────
-    # "Full lag" means we have readings in all three slots.
-    has_full_lag = (battery_t_now is not None
-                    and battery_t1 is not None
-                    and battery_t2 is not None)
-    # Drop = T-2 minus T-now (positive means battery fell)
-    lag_drop = (battery_t2 - battery_t_now) if has_full_lag else 0.0
+    # ── Battery lag levels for stability check ───────────────────
+    bat_levels = [battery_t_now, battery_t1, battery_t2]
 
-    def _lag_info() -> str:
-        """Short string describing the lag window state."""
-        if not has_full_lag:
-            return "lag window not full yet (treated as stable)"
-        return (
-            f"lag drop={lag_drop:.2f}%, "
-            f"T-now={battery_t_now:.1f}% T-1={battery_t1:.1f}% T-2={battery_t2:.1f}%"
-        )
+    def _bat_info() -> str:
+        vals = [
+            f"T-now={battery_t_now:.1f}%" if battery_t_now is not None else "T-now=--",
+            f"T-1={battery_t1:.1f}%" if battery_t1 is not None else "T-1=--",
+            f"T-2={battery_t2:.1f}%" if battery_t2 is not None else "T-2=--",
+        ]
+        return ", ".join(vals)
 
-    # ── STEP 1: predicted_energy >= peak demand (energy sufficient) ──
-    if predicted_energy >= MODE_A_MAX_KWH:
-        step = (
-            f"Step 1 — Predicted {predicted_energy:.4f}kW "
-            f">= peak demand {MODE_A_MAX_KWH}kW"
-        )
-        lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
+    # ══════════════════════════════════════════════════════════════
+    # PEAK LOAD: EDFI >= PEAK_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    if edfi >= PEAK_THRESHOLD:
+        load = f"PEAK LOAD (EDFI {edfi:.2f} >= {PEAK_THRESHOLD})"
 
-        # 1 — Battery >= 80%
-        if battery_level >= 80.0:
-            if lag_stable:
-                return "A", (
-                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag stable ({_lag_info()}) → Mode A"
-                )
-            else:
-                return "B", (
-                    f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                    f"lag NOT stable ({_lag_info()}) → Mode B"
-                )
-
-        # 1 — Battery >= 50%
-        if battery_level >= 50.0:
-            if lag_stable:
-                return "B", (
-                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag stable ({_lag_info()}) → Mode B"
-                )
-            else:
-                return "C", (
-                    f"{step}; Battery {battery_level:.1f}% >= 50%, "
-                    f"lag NOT stable ({_lag_info()}) → Mode C"
-                )
-
-        # 1 — Battery < 50%
-        return "C", (
-            f"{step}; Battery {battery_level:.1f}% < 50% → Mode C"
-        )
-
-    # ── STEP 2: predicted_energy < peak demand (energy is tight) ─────
-    step = (
-        f"Step 2 — Predicted {predicted_energy:.4f}kW "
-        f"< peak demand {MODE_A_MAX_KWH}kW"
-    )
-    lag_stable = (not has_full_lag) or (lag_drop <= MAX_BATTERY_DROP_PERCENT)
-
-    # 2a — Battery >= 80%
-    if battery_level >= 80.0:
-        if lag_stable:
+        if battery_stable(bat_levels, 80):
             return "A", (
-                f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                f"lag stable ({_lag_info()}) → Mode A"
+                f"{load}; battery_stable(80%) = True ({_bat_info()}) → Smart A"
             )
-        else:
+        elif battery_stable(bat_levels, 60):
             return "B", (
-                f"{step}; Battery {battery_level:.1f}% >= 80%, "
-                f"lag NOT stable ({_lag_info()}) → Mode B"
-            )
-
-    # 2b — Battery >= 60%
-    if battery_level >= 60.0:
-        if lag_stable:
-            return "B", (
-                f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag stable ({_lag_info()}) → Mode B"
+                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
             )
         else:
             return "C", (
-                f"{step}; Battery {battery_level:.1f}% >= 60%, "
-                f"lag NOT stable ({_lag_info()}) → Mode C"
+                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
             )
 
-    # 2bii — Battery < 60%
+    # ══════════════════════════════════════════════════════════════
+    # MODERATE LOAD: MODERATE_THRESHOLD <= EDFI < PEAK_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    if edfi >= MODERATE_THRESHOLD:
+        load = f"MODERATE LOAD (EDFI {edfi:.2f}, {MODERATE_THRESHOLD} <= x < {PEAK_THRESHOLD})"
+
+        if battery_stable(bat_levels, 60):
+            return "B", (
+                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
+            )
+        else:
+            return "C", (
+                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
+            )
+
+    # ══════════════════════════════════════════════════════════════
+    # BASELINE LOAD: BASELINE_THRESHOLD <= EDFI < MODERATE_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
+    if edfi >= BASELINE_THRESHOLD:
+        return "C", (
+            f"BASELINE LOAD (EDFI {edfi:.2f}, {BASELINE_THRESHOLD} <= x < {MODERATE_THRESHOLD}) → Smart C"
+        )
+
+    # ══════════════════════════════════════════════════════════════
+    # VERY LOW LOAD: EDFI < BASELINE_THRESHOLD
+    # ══════════════════════════════════════════════════════════════
     return "C", (
-        f"{step}; Battery {battery_level:.1f}% < 60% → Mode C"
+        f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → Smart C"
     )
 
 
 # ---------------------------------------------------------------------------
-# Decision cycle (runs every DECISION_INTERVAL_SECONDS)
+# ML prediction fetcher (HTTP call to FastAPI ML service)
 # ---------------------------------------------------------------------------
+def _fetch_prediction(sensor: dict) -> dict | None:
+    """Call the ML service and return the prediction payload.
+
+    Returns a dict with predicted_energy_wh, upper/lower bounds,
+    or None if the service is unreachable.
+    """
+    ts = sensor.get("timestamp")
+    temp = float(sensor.get("temperature", sensor.get("temperature_c", 25.0)))
+    hum = float(sensor.get("humidity", 50.0))
+    lux = float(sensor.get("lux", 0.0))
+    occ = int(sensor.get("occupancy", 0))
+    energy = float(sensor.get("energy_kw", sensor.get("energy", 0.0)))
+
+    log.info(
+        "→ Model input (live): temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d  energy=%.4f",
+        temp, hum, lux, occ, energy,
+    )
+
+    body = json.dumps({
+        "temperature_c": temp,
+        "humidity": hum,
+        "lux": lux,
+        "occupancy": occ,
+        "datetime_str": ts,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        ML_SERVICE_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        # Support both response formats:
+        #   Old (LIGHT_ML_MODEL): { "predictions": { "hybrid_final_wh": ... } }
+        #   New (TE-GRU):         { "predicted_energy_wh": ... }
+        pred = result.get("predictions", result)
+        ml_payload = {
+            "predicted_energy_wh": pred.get("predicted_energy_wh",
+                                            pred.get("hybrid_final_wh", 0.0)),
+            "upper_bound_energy_wh": pred.get("upper_bound_energy_wh",
+                                              pred.get("safety_upper_bound_wh", 0.0)),
+            "lower_bound_energy_wh": pred.get("lower_bound_energy_wh",
+                                              pred.get("safety_lower_bound_wh", 0.0)),
+            "energy_unit": "Wh",
+            "avg_sensors": {
+                "temperature_c": temp,
+                "humidity": hum,
+                "lux": lux,
+                "occupancy": occ,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "rule-engine-http-call",
+        }
+        log.info(
+            "← Model output: EDFI=%.4f Wh  [%.4f – %.4f]",
+            ml_payload["predicted_energy_wh"],
+            ml_payload["lower_bound_energy_wh"],
+            ml_payload["upper_bound_energy_wh"],
+        )
+        return ml_payload
+
+    except urllib.error.URLError as exc:
+        log.warning("ML service unreachable (%s) — decision will use cached data", exc.reason)
+        return None
+    except Exception as exc:
+        log.warning("ML prediction fetch error: %s", exc)
+        return None
+
+
+def _compute_sensor_average() -> dict | None:
+    """Average sensor readings from the last SENSOR_AVG_WINDOW_SECONDS.
+
+    Returns a dict with averaged temperature, humidity, lux, occupancy,
+    and the latest battery_level (battery is NOT averaged — we want the
+    current SoC, not a smoothed version).
+    Returns None if the buffer is empty.
+    """
+    cutoff = _time_mod.time() - SENSOR_AVG_WINDOW_SECONDS
+    # Only keep readings within the window
+    recent = [s for s in sensor_buffer if s.get("_ts", 0) >= cutoff]
+    if not recent:
+        return None
+
+    n = len(recent)
+    avg = {
+        "temperature": round(sum(s.get("temperature", s.get("temperature_c", 0)) for s in recent) / n, 2),
+        "humidity": round(sum(s.get("humidity", 0) for s in recent) / n, 2),
+        "lux": round(sum(s.get("lux", 0) for s in recent) / n, 2),
+        "occupancy": round(sum(s.get("occupancy", 0) for s in recent) / n),
+        # Battery: use latest value, not average
+        "battery_level": recent[-1].get("battery_level", 0),
+        "timestamp": recent[-1].get("timestamp", datetime.now(timezone.utc).isoformat()),
+    }
+    log.debug(
+        "Sensor average (%d readings, %ds window): temp=%.1f°C, hum=%.1f, lux=%.1f, occ=%d",
+        n, SENSOR_AVG_WINDOW_SECONDS,
+        avg["temperature"], avg["humidity"], avg["lux"], avg["occupancy"],
+    )
+    return avg
+
+
 def run_evaluation(client: mqtt.Client) -> None:
-    """Perform one evaluation cycle: read state, decide mode, actuate, log."""
-    global current_mode
+    """Perform one evaluation cycle: fetch prediction, decide mode, actuate, log."""
+    global current_mode, manual_override
+
+    # ── Manual override: skip automatic decision ──
+    with state_lock:
+        if manual_override:
+            log.debug("Evaluation: Manual override active — skipping auto.")
+            return
 
     with state_lock:
         if not latest_sensor:
             log.info("Evaluation: No sensor data yet — skipping.")
             return
 
+    # Use the latest continuous prediction if available, otherwise fetch fresh.
+    with state_lock:
+        # Use real-time reading for logging in the decision box
+        decision_sensor = dict(latest_sensor)
+        if not latest_ml:
+            sensor_snapshot = decision_sensor
+
+    if not latest_ml:
+        ml_result = _fetch_prediction(sensor_snapshot)
+        if ml_result:
+            with state_lock:
+                latest_ml.clear()
+                latest_ml.update(ml_result)
+
+    # Publish prediction to MQTT at decision time (dashboard only sees this)
+    with state_lock:
+        if latest_ml:
+            client.publish(TOPIC_ML, json.dumps(dict(latest_ml)), qos=1)
+
+    # ── Step 2: Run decision logic ──
+    with state_lock:
         new_mode, reason = evaluate_rules()
 
-    # Actuate relays
+        # Grab ML data for logging
+        ml_predicted = latest_ml.get("predicted_energy_wh", "n/a")
+        ml_upper = latest_ml.get("upper_bound_energy_wh", "n/a")
+        ml_lower = latest_ml.get("lower_bound_energy_wh", "n/a")
+
+    # Compute relay states (published via MQTT — ESP32 actuates)
     r1, r2, r3 = apply_mode(new_mode)
 
     # Update current mode
@@ -440,23 +565,53 @@ def run_evaluation(client: mqtt.Client) -> None:
         mode_changed = new_mode != current_mode
         current_mode = new_mode
 
-    change_str = "MODE CHANGED" if mode_changed else "mode unchanged"
-    log.info(
-        "Evaluation result: Mode %s (%s) — %s",
-        new_mode,
-        change_str,
-        reason,
+    change_str = "⚡ CLASS CHANGED" if mode_changed else "unchanged"
+
+    log.info("")
+    log.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
+    log.info("┃  DECISION: Class %s (%s)  →  R1=%s  R2=%s  R3=%s",
+        new_mode, change_str,
+        "ON" if r1 else "OFF",
+        "ON" if r2 else "OFF",
+        "ON" if r3 else "OFF",
     )
+    log.info("┃  Sensors: temp=%.1f°C  hum=%.1f  lux=%.1f  occ=%d",
+        float(decision_sensor.get("temperature", decision_sensor.get("temperature_c", 0))),
+        float(decision_sensor.get("humidity", 0)),
+        float(decision_sensor.get("lux", 0)),
+        int(decision_sensor.get("occupancy", 0)),
+    )
+    log.info("┃  EDFI: %.4f Wh  [%.4f – %.4f]  bat=%.0f%%",
+        float(ml_predicted) if ml_predicted != "n/a" else 0.0,
+        float(ml_lower) if ml_lower != "n/a" else 0.0,
+        float(ml_upper) if ml_upper != "n/a" else 0.0,
+        float(latest_sensor.get("battery_level", 0)),
+    )
+    log.info("┃  Reason: %s", reason)
+    log.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    log.info("")
 
     # Log decision to database
     log_decision(new_mode, r1, r2, r3, reason)
 
     # Publish relay state to MQTT for the frontend
+    _publish_relay_state(client, new_mode, r1, r2, r3, reason, auto=True)
+
+
+def _publish_relay_state(
+    client: mqtt.Client,
+    mode: str,
+    r1: bool, r2: bool, r3: bool,
+    reason: str,
+    auto: bool = True,
+) -> None:
+    """Publish current relay state to MQTT (used by both auto and manual paths)."""
     relay_payload = {
-        "mode": new_mode,
+        "mode": mode,
         "relay_1": r1,
         "relay_2": r2,
         "relay_3": r3,
+        "auto": auto,
         "battery_t_now": round(battery_t_now, 1) if battery_t_now is not None else None,
         "battery_t1":    round(battery_t1, 1)    if battery_t1 is not None else None,
         "battery_t2":    round(battery_t2, 1)    if battery_t2 is not None else None,
@@ -470,6 +625,50 @@ def run_evaluation(client: mqtt.Client) -> None:
         "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
     }
     client.publish(TOPIC_RELAY_STATE, json.dumps(relay_payload), qos=1)
+
+
+def _run_continuous_prediction(client: mqtt.Client) -> None:
+    """Run a rate-limited prediction triggered by new sensor data.
+
+    Called from on_message when new sensor data arrives.  Sends the
+    latest real-time sensor reading (not averaged) to the ML service,
+    as the model was trained on individual timestep readings with CSV
+    providing the energy lag memory.  The result is cached in latest_ml
+    so the decision timer always has a fresh prediction ready.
+    NOT published to MQTT — only the decision-time prediction is
+    published (see run_evaluation).
+    """
+    global _last_prediction_epoch
+
+    now = _time_mod.time()
+    if now - _last_prediction_epoch < PREDICTION_RATE_LIMIT_SECONDS:
+        return  # throttled
+    _last_prediction_epoch = now
+
+    with state_lock:
+        if manual_override:
+            return
+        if not latest_sensor:
+            return
+        # Send the latest real-time reading (not averaged)
+        sensor_snapshot = {
+            "temperature": float(latest_sensor.get("temperature", latest_sensor.get("temperature_c", 25.0))),
+            "humidity": float(latest_sensor.get("humidity", 50.0)),
+            "lux": float(latest_sensor.get("lux", 0.0)),
+            "occupancy": int(latest_sensor.get("occupancy", 0)),
+            "battery_level": latest_sensor.get("battery_level", 0),
+            "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        }
+
+    ml_result = _fetch_prediction(sensor_snapshot)
+    if ml_result:
+        with state_lock:
+            latest_ml.clear()
+            latest_ml.update(ml_result)
+        log.debug(
+            "Continuous prediction cached: EDFI=%.4f Wh",
+            ml_result.get("predicted_energy_wh", 0),
+        )
 
 
 def evaluation_loop(client: mqtt.Client) -> None:
@@ -530,10 +729,79 @@ def battery_lag_loop(client: mqtt.Client) -> None:
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log.info("Connected to MQTT broker at %s:%d", MQTT_BROKER, MQTT_PORT)
-        client.subscribe([(TOPIC_SENSORS, 1), (TOPIC_ML, 1)])
-        log.info("Subscribed to %s, %s", TOPIC_SENSORS, TOPIC_ML)
+        client.subscribe([
+            (TOPIC_SENSORS, 1),
+            (TOPIC_OVERRIDE, 1),
+        ])
+        log.info(
+            "Subscribed to %s, %s",
+            TOPIC_SENSORS, TOPIC_OVERRIDE,
+        )
     else:
         log.error("MQTT connection failed with code %d", rc)
+
+
+def _handle_override(client, payload: dict) -> None:
+    """Handle manual override commands from the dashboard.
+
+    Expected payloads:
+
+    Enable override + set mode:
+        {"auto": false, "mode": "A"}
+        {"auto": false, "mode": "B"}
+        {"auto": false, "mode": "C"}
+
+    Enable override + set individual relays:
+        {"auto": false, "relay_1": true, "relay_2": false, "relay_3": true}
+
+    Re-enable auto management:
+        {"auto": true}
+    """
+    global manual_override, manual_mode, manual_relays, current_mode
+
+    auto = payload.get("auto", True)
+
+    with state_lock:
+        if auto:
+            # ── Re-enable auto management ──
+            manual_override = False
+            log.info("Manual override DISABLED — auto management resumed")
+            return
+
+        # ── Enable manual override ──
+        manual_override = True
+
+        # Mode-based override: {"auto": false, "mode": "A"}
+        if "mode" in payload:
+            mode = payload["mode"].upper()
+            if mode not in ("A", "B", "C"):
+                log.warning("Invalid manual mode: %s — ignoring", mode)
+                return
+            manual_mode = mode
+            manual_relays = apply_mode(mode)
+            current_mode = mode
+            reason = f"Manual override → Mode {mode}"
+
+        # Relay-based override: {"auto": false, "relay_1": true, ...}
+        elif any(k in payload for k in ("relay_1", "relay_2", "relay_3")):
+            r1 = bool(payload.get("relay_1", manual_relays[0]))
+            r2 = bool(payload.get("relay_2", manual_relays[1]))
+            r3 = bool(payload.get("relay_3", manual_relays[2]))
+            manual_relays = (r1, r2, r3)
+            manual_mode = "MANUAL"
+            current_mode = "MANUAL"
+            reason = f"Manual relay override → R1={r1}, R2={r2}, R3={r3}"
+        else:
+            reason = "Manual override enabled (no mode/relay specified)"
+
+    r1, r2, r3 = manual_relays
+    log.info("MANUAL: %s  [R1=%s R2=%s R3=%s]", reason, r1, r2, r3)
+
+    # Log to database
+    log_decision(manual_mode, r1, r2, r3, reason)
+
+    # Publish to room/relays/state so ESP32 + dashboard update
+    _publish_relay_state(client, manual_mode, r1, r2, r3, reason, auto=False)
 
 
 def on_message(client, userdata, msg):
@@ -543,18 +811,30 @@ def on_message(client, userdata, msg):
         log.warning("Bad payload on %s: %s", msg.topic, exc)
         return
 
+    # ── Manual override commands ──
+    if msg.topic == TOPIC_OVERRIDE:
+        _handle_override(client, payload)
+        return
+
     with state_lock:
         if msg.topic == TOPIC_SENSORS:
             if "temperature" not in payload and "temperature_c" in payload:
                 payload["temperature"] = payload["temperature_c"]
             latest_sensor.update(payload)
-            log.debug("Updated latest sensor data")
-        elif msg.topic == TOPIC_ML:
-            latest_ml.update(payload)
-            log.debug(
-                "ML prediction received: keys=%s",
-                sorted(payload.keys()),
-            )
+
+            # Buffer reading for 5-minute rolling average
+            payload["_ts"] = _time_mod.time()
+            sensor_buffer.append(payload)
+            # Trim old entries beyond the averaging window
+            cutoff = _time_mod.time() - SENSOR_AVG_WINDOW_SECONDS - 60
+            while sensor_buffer and sensor_buffer[0].get("_ts", 0) < cutoff:
+                sensor_buffer.pop(0)
+
+            log.debug("Updated latest sensor data (buffer: %d readings)", len(sensor_buffer))
+
+    # Run continuous prediction outside the lock (Group 2 real-time stage)
+    if msg.topic == TOPIC_SENSORS:
+        _run_continuous_prediction(client)
 
 
 def on_disconnect(client, userdata, *args, **kwargs):
@@ -584,9 +864,9 @@ def main() -> None:
 
     log.info("Starting Rule Engine")
     log.info(
-        "Decision interval: %ds (%s)",
+        "Decision interval: %ds (%.0fm)",
         DECISION_INTERVAL_SECONDS,
-        _format_duration(DECISION_INTERVAL_SECONDS),
+        DECISION_INTERVAL_MINUTES,
     )
     log.info(
         "Battery lag tracker: %ds interval (%d readings)",
@@ -594,21 +874,15 @@ def main() -> None:
         BATTERY_LAG_READINGS,
     )
     log.info(
-        "Peak demand threshold (MODE_A_MAX_KWH): %.1f kW",
-        MODE_A_MAX_KWH,
-    )
-    log.info(
-        "Max battery drop threshold: %.1f%%",
-        MAX_BATTERY_DROP_PERCENT,
+        "EDFI thresholds: Peak=%.0f, Moderate=%.0f, Baseline=%.0f Wh",
+        PEAK_THRESHOLD,
+        MODERATE_THRESHOLD,
+        BASELINE_THRESHOLD,
     )
     log.info("Database: %s", os.path.abspath(DB_PATH))
-    log.info("Running on Raspberry Pi: %s", ON_PI)
+    log.info("GPIO: disabled (ESP32 handles relay actuation via MQTT)")
 
-    # Initialize GPIO
-    gpio_init()
-
-    # Start in Mode C (safest)
-    apply_mode("C")
+    # Start in Mode C (safest) — no GPIO, just internal state
     log.info("Initial state: Mode C (Baseline Load)")
 
     # Ensure DB table exists
@@ -630,7 +904,6 @@ def main() -> None:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     except OSError as exc:
         log.critical("Cannot connect to MQTT broker: %s", exc)
-        GPIO.cleanup()
         sys.exit(1)
 
     # Start evaluation thread
@@ -655,17 +928,19 @@ def main() -> None:
     # Wait for shutdown
     shutdown_event.wait()
 
-    # Clean up
-    log.info("Shutting down relays (Mode C for safety) …")
-    apply_mode("C")
-    log_decision(
-        "C",
-        True,
-        False,
-        False,
-        "Shutdown — forced Mode C for safety",
-    )
-    GPIO.cleanup()
+    # Clean up — publish Mode C so the ESP32 drops to safe state
+    log.info("Publishing Mode C (safety shutdown) to MQTT …")
+    r1, r2, r3 = apply_mode("C")
+    shutdown_payload = {
+        "mode": "C",
+        "relay_1": r1,
+        "relay_2": r2,
+        "relay_3": r3,
+        "reason": "Shutdown — forced Mode C for safety",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    client.publish(TOPIC_RELAY_STATE, json.dumps(shutdown_payload), qos=1)
+    log_decision("C", r1, r2, r3, "Shutdown — forced Mode C for safety")
     client.loop_stop()
     client.disconnect()
     log.info("Rule Engine stopped.")

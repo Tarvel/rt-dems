@@ -70,10 +70,7 @@ class MqttService {
       try {
         final data = json.decode(pt);
         // room/sensors — raw sensor telemetry every ~5 s (carries energy_kwh for real-time load)
-        // room/data/averaged — 5-minute averages from mqtt_logger
-        // Both go into dataStream; _updateSensorState handles both gracefully.
-        if (c[0].topic == 'room/sensors' ||
-            c[0].topic == 'room/data/averaged') {
+        if (c[0].topic == 'room/sensors') {
           _dataStreamController.add(data);
         } else if (c[0].topic == 'room/ml/predictions') {
           _mlStreamController.add(data);
@@ -86,7 +83,6 @@ class MqttService {
     });
 
     client.subscribe('room/sensors', MqttQos.atLeastOnce);
-    client.subscribe('room/data/averaged', MqttQos.atLeastOnce);
     client.subscribe('room/ml/predictions', MqttQos.atLeastOnce);
     client.subscribe('room/relays/state', MqttQos.atLeastOnce);
   }
@@ -101,6 +97,13 @@ class MqttService {
 
   void _onSubscribed(String topic) {
     print('MQTT Subscribed to $topic');
+  }
+
+  void publishOverride(Map<String, dynamic> payload) {
+    if (client.connectionStatus?.state != MqttConnectionState.connected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(json.encode(payload));
+    client.publishMessage('room/control/override', MqttQos.atLeastOnce, builder.payload!);
   }
 
   void dispose() {

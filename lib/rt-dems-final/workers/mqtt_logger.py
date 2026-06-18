@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-mqtt_logger.py — Background MQTT-to-SQLite Logger
-===================================================
+mqtt_logger.py — MQTT → SQLite Logger
+======================================
 
-Subscribes to sensor and ML MQTT topics, buffers readings in memory,
-and writes 5-minute averages to the SQLite database.
+Subscribes to:
+    room/sensors          — live telemetry (logged to terminal only)
+    room/ml/predictions   — ML predictions (buffered and flushed to DB)
 
-Run as a systemd service (see systemd/mqtt-logger.service).
+Every FLUSH_INTERVAL seconds, buffered ML predictions are averaged and
+written to the ``energy_mlprediction`` table.
 
-Data flow:
-  Hardware (MQTT) ──► buffer ──► 5-min average ──► SQLite
-                                       └──► republish to room/data/averaged
+Sensor data is NOT averaged/stored — it flows through room/sensors in
+real-time for the dashboard and is captured as snapshots in
+energy_relaystate whenever the rule engine makes a mode decision.
 """
 
 import json
@@ -25,19 +27,16 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_CLIENT_ID = "room-mqtt-logger"
+# ── .env support ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Topics to subscribe
 TOPIC_SENSORS = "room/sensors"
 TOPIC_ML = "room/ml/predictions"
-
-# Topic to republish averaged data
-TOPIC_AVERAGED = "room/data/averaged"
 
 # Database path (relative to this script or absolute)
 DB_PATH = os.environ.get(
@@ -49,6 +48,11 @@ DB_PATH = os.environ.get(
 # Flush interval in seconds (5 minutes)
 FLUSH_INTERVAL = 5 * 60
 
+# MQTT
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_CLIENT_ID = "room-mqtt-logger"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -59,9 +63,8 @@ logging.basicConfig(
 log = logging.getLogger("mqtt_logger")
 
 # ---------------------------------------------------------------------------
-# Thread-safe buffers
+# Thread-safe buffer (ML only)
 # ---------------------------------------------------------------------------
-sensor_buffer: list[dict] = []
 ml_buffer: list[dict] = []
 buffer_lock = threading.Lock()
 
@@ -81,25 +84,30 @@ def get_db_connection() -> sqlite3.Connection:
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
-    """Create tables if they don't exist yet (mirrors Django models)."""
+    """Create tables if they don't exist yet (mirrors Django models).
+
+    If the table has the old schema (predicted_energy_range + peak_demand),
+    drop it and recreate with the new schema.
+    """
+    # Check if old schema exists and migrate
+    try:
+        cur = conn.execute("PRAGMA table_info(energy_mlprediction)")
+        cols = {row[1] for row in cur.fetchall()}
+        if cols and "predicted_energy_wh" not in cols:
+            # Old schema — drop and recreate
+            conn.execute("DROP TABLE energy_mlprediction")
+            log.info("Dropped old energy_mlprediction table (schema migration)")
+    except sqlite3.OperationalError:
+        pass
+
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS energy_sensorlog (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
-            temperature REAL    NOT NULL,
-            humidity    REAL    NOT NULL,
-            occupancy   INTEGER NOT NULL,
-            voltage     REAL    NOT NULL,
-            current     REAL    NOT NULL,
-            battery_level REAL  NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS energy_mlprediction (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp               TEXT    NOT NULL DEFAULT (datetime('now')),
-            predicted_energy_range  REAL    NOT NULL,
-            peak_demand             REAL    NOT NULL
+            predicted_energy_wh     REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_wh          REAL    NOT NULL DEFAULT 0.0,
+            lower_bound_wh          REAL    NOT NULL DEFAULT 0.0
         );
         """
     )
@@ -107,25 +115,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Averaging logic
+# Averaging logic (ML only)
 # ---------------------------------------------------------------------------
-def compute_sensor_average(readings: list[dict]) -> dict | None:
-    """Return the arithmetic average of buffered sensor readings."""
-    if not readings:
-        return None
-
-    n = len(readings)
-    avg = {
-        "temperature": round(float(sum(r["temperature"] for r in readings) / n), 2),
-        "humidity": round(float(sum(r["humidity"] for r in readings) / n), 2),
-        "occupancy": 1 if sum(r["occupancy"] for r in readings) / n >= 0.5 else 0,
-        "voltage": round(float(sum(r.get("voltage", 0.0) for r in readings) / n), 2),
-        "current": round(float(sum(r.get("current", 0.0) for r in readings) / n), 2),
-        "battery_level": round(float(sum(r["battery_level"] for r in readings) / n), 2),
-    }
-    return avg
-
-
 def compute_ml_average(predictions: list[dict]) -> dict | None:
     """Return the average of buffered ML predictions."""
     if not predictions:
@@ -133,10 +124,15 @@ def compute_ml_average(predictions: list[dict]) -> dict | None:
 
     n = len(predictions)
     avg = {
-        "predicted_energy_range": round(
-            float(sum(p["predicted_energy_range"] for p in predictions) / n), 2
+        "predicted_energy_wh": round(
+            float(sum(p.get("predicted_energy_wh", 0) for p in predictions) / n), 4
         ),
-        "peak_demand": round(float(sum(p["peak_demand"] for p in predictions) / n), 2),
+        "upper_bound_wh": round(
+            float(sum(p.get("upper_bound_wh", 0) for p in predictions) / n), 4
+        ),
+        "lower_bound_wh": round(
+            float(sum(p.get("lower_bound_wh", 0) for p in predictions) / n), 4
+        ),
     }
     return avg
 
@@ -145,63 +141,34 @@ def compute_ml_average(predictions: list[dict]) -> dict | None:
 # Flush (runs every 5 minutes)
 # ---------------------------------------------------------------------------
 def flush_to_db(client: mqtt.Client) -> None:
-    """Drain the buffers, compute averages, write to SQLite, and republish."""
-    global sensor_buffer, ml_buffer
+    """Drain the ML buffer, compute average, write to SQLite."""
+    global ml_buffer
 
     with buffer_lock:
-        sensors_snapshot = sensor_buffer.copy()
         ml_snapshot = ml_buffer.copy()
-        sensor_buffer.clear()
         ml_buffer.clear()
 
-    sensor_avg = compute_sensor_average(sensors_snapshot)
     ml_avg = compute_ml_average(ml_snapshot)
 
-    if sensor_avg is None and ml_avg is None:
-        log.info("Flush: No data in buffers — skipping.")
+    if ml_avg is None:
+        log.info("Flush: No ML data in buffer — skipping.")
         return
 
     try:
         conn = get_db_connection()
         ensure_tables(conn)
 
-        # Use the timestamp from the most recent sensor reading in the buffer
-        # This ensures simulation dates (e.g. 2022) are preserved in the DB/Averaged topic
-        if sensors_snapshot:
-            now = sensors_snapshot[-1].get("timestamp", datetime.now(timezone.utc).isoformat())
-        else:
-            now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
-        if sensor_avg:
-            conn.execute(
-                """
-                INSERT INTO energy_sensorlog
-                    (timestamp, temperature, humidity, occupancy,
-                     voltage, current, battery_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now,
-                    sensor_avg["temperature"],
-                    sensor_avg["humidity"],
-                    sensor_avg["occupancy"],
-                    sensor_avg["voltage"],
-                    sensor_avg["current"],
-                    sensor_avg["battery_level"],
-                ),
-            )
-            log.info("Flush: Wrote sensor average → %s", sensor_avg)
-
-        if ml_avg:
-            conn.execute(
-                """
-                INSERT INTO energy_mlprediction
-                    (timestamp, predicted_energy_range, peak_demand)
-                VALUES (?, ?, ?)
-                """,
-                (now, ml_avg["predicted_energy_range"], ml_avg["peak_demand"]),
-            )
-            log.info("Flush: Wrote ML average → %s", ml_avg)
+        conn.execute(
+            """
+            INSERT INTO energy_mlprediction
+                (timestamp, predicted_energy_wh, upper_bound_wh, lower_bound_wh)
+            VALUES (?, ?, ?, ?)
+            """,
+            (now, ml_avg["predicted_energy_wh"], ml_avg["upper_bound_wh"], ml_avg["lower_bound_wh"]),
+        )
+        log.info("Flush: Wrote ML average → %s", ml_avg)
 
         conn.commit()
         conn.close()
@@ -209,14 +176,6 @@ def flush_to_db(client: mqtt.Client) -> None:
     except sqlite3.Error as exc:
         log.error("SQLite error during flush: %s", exc)
         return
-
-    # Republish averaged data for the frontend
-    if sensor_avg:
-        payload = {**sensor_avg, "timestamp": now}
-        if ml_avg:
-            payload.update(ml_avg)
-        client.publish(TOPIC_AVERAGED, json.dumps(payload), qos=1)
-        log.info("Republished averaged data to %s", TOPIC_AVERAGED)
 
 
 def flush_loop(client: mqtt.Client) -> None:
@@ -246,26 +205,27 @@ def on_message(client, userdata, msg):
         log.warning("Bad payload on %s: %s", msg.topic, exc)
         return
 
-    with buffer_lock:
-        if msg.topic == TOPIC_SENSORS:
-            if "temperature" not in payload and "temperature_c" in payload:
-                payload["temperature"] = payload["temperature_c"]
-            required = {
-                "temperature", "humidity", "occupancy", "battery_level",
-            }
-            if not required.issubset(payload.keys()):
-                log.warning("Sensor payload missing keys: %s", required - payload.keys())
-                return
-            sensor_buffer.append(payload)
-            log.debug("Buffered sensor reading (%d in buffer)", len(sensor_buffer))
+    if msg.topic == TOPIC_SENSORS:
+        # Live sensor data — just acknowledge receipt (no DB storage)
+        log.debug("Sensor reading received (pass-through, not stored)")
 
-        elif msg.topic == TOPIC_ML:
-            required = {"predicted_energy_range", "peak_demand"}
-            if not required.issubset(payload.keys()):
-                log.warning("ML payload missing keys: %s", required - payload.keys())
-                return
-            ml_buffer.append(payload)
-            log.debug("Buffered ML prediction (%d in buffer)", len(ml_buffer))
+    elif msg.topic == TOPIC_ML:
+        # Normalise ML keys for internal storage
+        norm = {
+            "predicted_energy_wh": float(payload.get(
+                "predicted_energy_wh",
+                payload.get("predicted_energy_range", payload.get("predicted_energy_kw", 0))
+            )),
+            "upper_bound_wh": float(payload.get("upper_bound_energy_wh", 0)),
+            "lower_bound_wh": float(payload.get("lower_bound_energy_wh", 0)),
+        }
+
+        if norm["predicted_energy_wh"] == 0:
+            log.warning("ML payload missing predicted energy value")
+            return
+        with buffer_lock:
+            ml_buffer.append(norm)
+        log.debug("Buffered ML prediction (%d in buffer)", len(ml_buffer))
 
 
 def on_disconnect(client, userdata, *args, **kwargs):
@@ -289,7 +249,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    log.info("Starting MQTT Logger (flush every %ds)", FLUSH_INTERVAL)
+    log.info("Starting MQTT Logger (ML flush every %ds)", FLUSH_INTERVAL)
     log.info("Database: %s", os.path.abspath(DB_PATH))
 
     # Ensure DB & tables exist on startup

@@ -26,12 +26,16 @@ Press Ctrl+C to stop.
 import csv
 import json
 import os
+import random
 import sys
 import time
 import threading
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
+
+from dotenv import load_dotenv
+load_dotenv()  # Load .env before reading os.environ below
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -54,6 +58,16 @@ PREDICTION_TIMEOUT = int(os.environ.get("PREDICTION_TIMEOUT", 60))
 # Minimum seconds between rows — keeps output readable even when
 # the model responds instantly. Set to 0 to go as fast as possible.
 MIN_ROW_DELAY = float(os.environ.get("MIN_ROW_DELAY", 60))
+
+# ---------------------------------------------------------------------------
+# Battery drain mode: "consistent" or "inconsistent"
+#   consistent   — Linear drain: -0.1% per row (deterministic, predictable)
+#   inconsistent — Randomised fluctuations with occasional sharp drops and
+#                  rare small recoveries to stress-test the 3-time battery lag
+# ---------------------------------------------------------------------------
+BATTERY_DRAIN_MODE = os.environ.get("BATTERY_DRAIN_MODE", "inconsistent").strip().lower()
+BATTERY_START = float(os.environ.get("BATTERY_START", 85.0))
+BATTERY_FLOOR = float(os.environ.get("BATTERY_FLOOR", 20.0))
 
 # ---------------------------------------------------------------------------
 # Synchronisation: wait for prediction before advancing
@@ -137,15 +151,52 @@ def reset_ml_api_index():
 # ---------------------------------------------------------------------------
 # Main loop — prediction-paced sequential playback
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Battery drain helpers
+# ---------------------------------------------------------------------------
+def _consistent_drain(battery: float) -> float:
+    """Linear drain: -0.1% every row, floors at BATTERY_FLOOR."""
+    return max(BATTERY_FLOOR, battery - 0.1)
+
+
+def _inconsistent_drain(battery: float) -> float:
+    """Randomised drain designed to trigger the 3-time battery lag.
+
+    Distribution:
+      70% — Normal drain   : -0.0% to -0.8%  (gentle, variable)
+      15% — Sharp drop     : -2.0% to -5.0%  (stress-tests lag detection)
+      10% — Stable / flat  :  0.0%            (no change — tests stability lock)
+       5% — Small recovery : +0.5% to +1.5%  (simulates charging / regen)
+    """
+    roll = random.random()
+    if roll < 0.70:
+        delta = -random.uniform(0.0, 0.8)
+    elif roll < 0.85:
+        delta = -random.uniform(2.0, 5.0)
+    elif roll < 0.95:
+        delta = 0.0
+    else:
+        delta = random.uniform(0.5, 1.5)
+
+    new_battery = battery + delta
+    # Clamp between floor and 100%
+    return max(BATTERY_FLOOR, min(100.0, new_battery))
+
+
+# Select drain function based on mode
+_drain_fn = _inconsistent_drain if BATTERY_DRAIN_MODE == "inconsistent" else _consistent_drain
+
+
 def main():
     print("=" * 60)
     print("  Smart Room — Prediction-Paced CSV Playback")
     print("=" * 60)
-    print(f"  CSV     : {CSV_PATH}")
-    print(f"  Broker  : {BROKER_ADDRESS}:{BROKER_PORT}")
-    print(f"  Publish : {SENSOR_TOPIC}")
-    print(f"  Wait on : {PREDICTION_TOPIC}")
-    print(f"  Timeout : {PREDICTION_TIMEOUT}s per row")
+    print(f"  CSV          : {CSV_PATH}")
+    print(f"  Broker       : {BROKER_ADDRESS}:{BROKER_PORT}")
+    print(f"  Publish      : {SENSOR_TOPIC}")
+    print(f"  Wait on      : {PREDICTION_TOPIC}")
+    print(f"  Timeout      : {PREDICTION_TIMEOUT}s per row")
+    print(f"  Battery mode : {BATTERY_DRAIN_MODE} (start={BATTERY_START}%, floor={BATTERY_FLOOR}%)")
     print("=" * 60)
 
     # ── HARD RESET: Fresh CSV load ──
@@ -173,9 +224,7 @@ def main():
     # ── HARD RESET: Reset the ML API's CSV pointer to Row 1 ──
     reset_ml_api_index()
 
-    # Battery: simple linear drain, no randomness.
-    # Starts at 85%, drops 0.1% per row, floors at 20%.
-    battery = 85.0
+    battery = BATTERY_START
 
     try:
         print("\nPlaying back CSV data (prediction-paced)… Press Ctrl+C to stop.\n")
@@ -195,8 +244,8 @@ def main():
             lux_col = "Luminous_Intensity_Lux" if "Luminous_Intensity_Lux" in row else "Luminous_Intensity"
             lux = float(row[lux_col])
 
-            # Battery: deterministic linear drain
-            battery = max(20.0, battery - 0.1)
+            # Battery: apply the selected drain mode
+            battery = _drain_fn(battery)
 
             payload = {
                 "timestamp": timestamp,

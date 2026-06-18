@@ -31,9 +31,9 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "corsheaders",
     # Third-party
     "rest_framework",
-    "corsheaders",
     # Local
     "energy",
 ]
@@ -43,14 +43,16 @@ INSTALLED_APPS = [
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True  # Allow all origins for development; restrict in production
 
 ROOT_URLCONF = "room_backend.urls"
 
@@ -95,7 +97,7 @@ def _enable_wal(sender, connection, **kwargs):
         cursor.execute("PRAGMA busy_timeout=5000;")
 
 
-from django.db.backends.signals import connection_created  # noqa: E402
+from django.db.backends.signals import connection_created
 
 connection_created.connect(_enable_wal)
 
@@ -128,5 +130,3 @@ STATIC_URL = "static/"
 # Default primary key
 # ---------------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-CORS_ALLOW_ALL_ORIGINS = True

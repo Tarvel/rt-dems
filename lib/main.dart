@@ -98,6 +98,9 @@ class _DashboardShellState extends State<DashboardShell> {
   // Shared System State
   String _currentMode = 'A'; // 'A', 'B', or 'C'
   bool _aiEnabled = true;
+  bool _relay1 = true;
+  bool _relay2 = true;
+  bool _relay3 = true;
 
   // Added Real-time Data State
   double _temperature = 25.0;
@@ -110,15 +113,12 @@ class _DashboardShellState extends State<DashboardShell> {
   // that was fed as input to the ML model, so it's always in sync with the prediction.
   double _actualLoad = 0.0;
   double _batteryLevel = 100.0;
-  List<double> _batteryHistory = [100.0, 100.0, 100.0];
-  // Timestamps for each battery lag reading [t2, t1, t_now] — derived when relay state arrives
-  List<DateTime> _batteryTimestamps = [
-    DateTime.now().subtract(const Duration(seconds: 60)),
-    DateTime.now().subtract(const Duration(seconds: 30)),
-    DateTime.now(),
-  ];
+  List<double> _batteryHistory = [];
+  // Timestamps for each battery lag reading — provided by backend (typically t-60, t-30, t-now)
+  List<DateTime> _batteryTimestamps = [];
   double _luminousIntensity = 0.0;
   double _predictedEnergy = 0.0;
+  Map<String, dynamic>? _avgSensors;
   // _upperBound = 95% confidence upper bound from Bayesian ML (upper_bound_energy_kw)
   double _upperBound = 0.0;
   // _lowerBound = 95% confidence lower bound from Bayesian ML (safety_lower_bound)
@@ -132,26 +132,46 @@ class _DashboardShellState extends State<DashboardShell> {
 
   late ApiService _apiService;
   late MqttService _mqttService;
-  Timer? _pollingTimer;
+  Timer? _pollingTimer; // falls back to REST if MQTT dies, and fetches history
   DateTime _lastMqttUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   List<dynamic> _historyData = [];
+  bool _isLoading = true;
+  int _exportDays = 1;
 
   @override
   void initState() {
     super.initState();
-    _apiService = ApiService(baseUrl: 'http://127.0.0.1:8000/api/v1');
-    _mqttService = MqttService(server: '127.0.0.1');
+    _apiService = ApiService(baseUrl: 'http://100.70.19.91:8000/api/v1');
+    _mqttService = MqttService(server: '100.70.19.91');
     _initBackend();
-    // Poll REST API every 60 seconds as a fallback
-    _pollingTimer = Timer.periodic(const Duration(seconds: 60), (_) async {
-      // Only use the REST fallback if we haven't received live MQTT data recently
-      if (DateTime.now().difference(_lastMqttUpdate).inSeconds < 65) return;
 
-      final data = await _apiService.getLatestSensors();
-      if (data.isNotEmpty && mounted) _updateSensorState(data);
-      final prediction = await _apiService.getLatestPrediction();
-      if (prediction.isNotEmpty && mounted) _updatePredictionState(prediction);
+    // ── 5-minute REST Fallback & History Sync ────────────────────────────────
+    // Since MQTT provides live data every 5 mins, this timer just fetches
+    // the history table and acts as a fallback if MQTT connection dies.
+    _pollingTimer = Timer.periodic(const Duration(minutes: 5), (_) async {
+      if (!mounted) return;
+
+      // If MQTT has been silent for >6 min, fall back to REST for latest values
+      if (DateTime.now().difference(_lastMqttUpdate).inMinutes >= 6) {
+        final data = await _apiService.getLatestSensors();
+        if (data.isNotEmpty) _updateSensorState(data);
+        final prediction = await _apiService.getLatestPrediction();
+        if (prediction.isNotEmpty) _updatePredictionState(prediction);
+        final relay = await _apiService.getCurrentRelayState();
+        if (relay.isNotEmpty) {
+          _updateRelayState(relay);
+          _updateSensorState(relay);
+        }
+      }
+
+      // Re-fetch history so the analytics chart and table stay current
+      final history = await _apiService.getRelayHistory();
+      if (history.isNotEmpty) {
+        setState(() {
+          _historyData = history;
+        });
+      }
     });
   }
 
@@ -171,12 +191,42 @@ class _DashboardShellState extends State<DashboardShell> {
     if (predictionData.isNotEmpty) _updatePredictionState(predictionData);
 
     final relayData = await _apiService.getCurrentRelayState();
-    if (relayData.isNotEmpty) _updateRelayState(relayData);
+    if (relayData.isNotEmpty) {
+      _updateRelayState(relayData);
+      // The new relay payload contains all the merged telemetry data, so pass it here too!
+      _updateSensorState(relayData);
+    }
 
-    final history = await _apiService.getSensorHistory();
+    final history = await _apiService.getRelayHistory();
     if (history.isNotEmpty) {
       setState(() {
         _historyData = history;
+
+        // Pre-fill battery lag with up to 3 historical points so the card starts fully populated
+        final int count = history.length < 3 ? history.length : 3;
+        List<double> loadedHistory = [];
+        List<DateTime> loadedTimestamps = [];
+
+        // Iterate backwards (from oldest to newest) to maintain chronological order
+        for (int i = count - 1; i >= 0; i--) {
+          final entry = history[i] as Map<String, dynamic>;
+          if (entry.containsKey('battery_level') &&
+              entry.containsKey('timestamp')) {
+            final val = (entry['battery_level'] as num).toDouble();
+            final dtStr = entry['timestamp'] as String;
+            final dt = DateTime.tryParse(dtStr)?.toLocal();
+            if (dt != null) {
+              loadedHistory.add(val);
+              loadedTimestamps.add(dt);
+            }
+          }
+        }
+
+        if (loadedHistory.isNotEmpty) {
+          _batteryHistory = loadedHistory;
+          _batteryTimestamps = loadedTimestamps;
+          _batteryLevel = loadedHistory.last;
+        }
       });
     }
 
@@ -197,11 +247,21 @@ class _DashboardShellState extends State<DashboardShell> {
       _lastMqttUpdate = DateTime.now();
       if (mounted) _updateRelayState(data);
     });
+
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+      });
+    }
   }
 
+  // Updates backing sensor fields and refreshes UI immediately.
   void _updateSensorState(Map<String, dynamic> data) {
     setState(() {
-      if (data.containsKey('temperature'))
+      // 'temperature_c' is the preferred field per contract; 'temperature' is the legacy fallback
+      if (data.containsKey('temperature_c'))
+        _temperature = (data['temperature_c'] as num).toDouble();
+      else if (data.containsKey('temperature'))
         _temperature = (data['temperature'] as num).toDouble();
       if (data.containsKey('humidity'))
         _humidity = (data['humidity'] as num).toDouble();
@@ -220,12 +280,13 @@ class _DashboardShellState extends State<DashboardShell> {
         _actualLoad = (data['energy_kw'] as num).toDouble();
       }
 
-      if (data.containsKey('battery_level')) {
-        _batteryLevel = (data['battery_level'] as num).toDouble();
-        _batteryHistory.add(_batteryLevel);
-        if (_batteryHistory.length > 3) _batteryHistory.removeAt(0);
-      }
-      if (data.containsKey('luminous_intensity'))
+      // battery_level is ignored here because the room/data/averaged topic contains
+      // 5-minute averages (non-10s). The dashboard strictly relies on the rule engine's
+      // battery_t_now (in _updateRelayState) as the single source of truth for battery SoC.
+      // 'lux' is the field from room/sensors contract and hw_bridge; 'luminous_intensity' is legacy fallback
+      if (data.containsKey('lux'))
+        _luminousIntensity = (data['lux'] as num).toDouble();
+      else if (data.containsKey('luminous_intensity'))
         _luminousIntensity = (data['luminous_intensity'] as num).toDouble();
 
       // Timestamp of when these sensor readings were sampled
@@ -235,45 +296,71 @@ class _DashboardShellState extends State<DashboardShell> {
     });
   }
 
+  // Updates backing prediction fields and refreshes UI immediately.
   void _updatePredictionState(Map<String, dynamic> data) {
     setState(() {
-      // UNIFIED FRAME: update actual sensor values if present in prediction packet
-      if (data.containsKey('actual_temperature'))
-        _temperature = (data['actual_temperature'] as num).toDouble();
-      if (data.containsKey('actual_humidity'))
-        _humidity = (data['actual_humidity'] as num).toDouble();
-      if (data.containsKey('actual_energy_kw'))
-        _actualLoad = (data['actual_energy_kw'] as num).toDouble();
-      if (data.containsKey('actual_occupancy'))
-        _occupancy = (data['actual_occupancy'] as num).toInt();
-      if (data.containsKey('actual_battery')) {
-        _batteryLevel = (data['actual_battery'] as num).toDouble();
-        if (_batteryHistory.isEmpty || _batteryHistory.last != _batteryLevel) {
-          _batteryHistory.add(_batteryLevel);
-          if (_batteryHistory.length > 3) _batteryHistory.removeAt(0);
-        }
-      }
+      // Note: actual_energy_kw from the ML payload is a CSV-simulation value and
+      // must NOT override the real hardware energy reading from room/sensors.
+      // _actualLoad is only set by _updateSensorState (energy_kw / energy_kwh fields).
+      // Note: actual_battery is not in the ML payload contract — battery level comes
+      // exclusively from room/sensors (battery_level field via _updateSensorState).
 
-      // Mean / hybrid prediction
+      // ---------------------------------------------------------------------------
+      // Predicted energy — stored internally in Wh for display consistency.
+      // Consumer lookup order per contract:
+      //   1. predicted_energy_kw  (legacy — convert kW → Wh ×1000)
+      //   2. predicted_energy_wh  (new_ML — store as-is in Wh)
+      //   3. predicted_energy_range (legacy scalar kW fallback → ×1000)
+      //   4. predicted_energy_kwh (legacy kWh → ×1000)
+      // ---------------------------------------------------------------------------
+      // Predicted energy — stored internally in Wh for display consistency.
+      // ---------------------------------------------------------------------------
       if (data.containsKey('predicted_energy_kw')) {
-        _predictedEnergy = (data['predicted_energy_kw'] as num).toDouble();
+        _predictedEnergy =
+            (data['predicted_energy_kw'] as num).toDouble() * 1000.0;
+      } else if (data.containsKey('predicted_energy_wh')) {
+        _predictedEnergy = (data['predicted_energy_wh'] as num).toDouble();
+      } else if (data.containsKey('predicted_energy_kwh')) {
+        _predictedEnergy =
+            (data['predicted_energy_kwh'] as num).toDouble() * 1000.0;
       } else if (data.containsKey('mean_prediction_kw')) {
-        _predictedEnergy = (data['mean_prediction_kw'] as num).toDouble();
+        _predictedEnergy =
+            (data['mean_prediction_kw'] as num).toDouble() * 1000.0;
       }
 
-      // 95% Bayesian upper confidence bound
-      if (data.containsKey('safety_upper_bound')) {
-        _upperBound = (data['safety_upper_bound'] as num).toDouble();
+      // ---------------------------------------------------------------------------
+      // Upper confidence bound — stored in Wh
+      // ---------------------------------------------------------------------------
+      if (data.containsKey('upper_bound_energy_wh')) {
+        _upperBound = (data['upper_bound_energy_wh'] as num).toDouble();
+      } else if (data.containsKey('upper_bound_wh')) {
+        _upperBound = (data['upper_bound_wh'] as num).toDouble();
+      } else if (data.containsKey('safety_upper_bound')) {
+        _upperBound = (data['safety_upper_bound'] as num).toDouble() * 1000.0;
       } else if (data.containsKey('upper_bound_energy_kw')) {
-        _upperBound = (data['upper_bound_energy_kw'] as num).toDouble();
+        _upperBound =
+            (data['upper_bound_energy_kw'] as num).toDouble() * 1000.0;
       }
 
-      // 95% Bayesian lower confidence bound
-      if (data.containsKey('safety_lower_bound')) {
-        _lowerBound = (data['safety_lower_bound'] as num).toDouble();
+      // ---------------------------------------------------------------------------
+      // Lower confidence bound — stored in Wh
+      // ---------------------------------------------------------------------------
+      if (data.containsKey('lower_bound_energy_wh')) {
+        _lowerBound = (data['lower_bound_energy_wh'] as num).toDouble();
+      } else if (data.containsKey('lower_bound_wh')) {
+        _lowerBound = (data['lower_bound_wh'] as num).toDouble();
+      } else if (data.containsKey('safety_lower_bound')) {
+        _lowerBound = (data['safety_lower_bound'] as num).toDouble() * 1000.0;
       }
 
-      // Configurable peak demand threshold
+      // ---------------------------------------------------------------------------
+      // Averaged Sensors (Passed into Model)
+      // ---------------------------------------------------------------------------
+      if (data.containsKey('avg_sensors') && data['avg_sensors'] is Map) {
+        _avgSensors = Map<String, dynamic>.from(data['avg_sensors']);
+      }
+
+      // Configurable peak demand threshold (still in kW — not converted)
       if (data.containsKey('peak_demand')) {
         _peakDemand = (data['peak_demand'] as num).toDouble();
       }
@@ -285,67 +372,101 @@ class _DashboardShellState extends State<DashboardShell> {
     });
   }
 
+  // Updates backing relay/battery fields and refreshes UI immediately.
   void _updateRelayState(Map<String, dynamic> data) {
     setState(() {
       // Full rule evaluation payload (every 3–5 min) carries 'mode'
       if (data.containsKey('mode')) _currentMode = data['mode'];
+      if (data.containsKey('auto')) _aiEnabled = data['auto'];
+      if (data.containsKey('relay_1')) _relay1 = data['relay_1'] as bool;
+      if (data.containsKey('relay_2')) _relay2 = data['relay_2'] as bool;
+      if (data.containsKey('relay_3')) _relay3 = data['relay_3'] as bool;
 
-      // Both the full payload and the lightweight battery_lag_update carry these three fields.
-      // The rule engine publishes this strictly every 30 s for real-time lag display.
-      final hasLag =
-          data.containsKey('battery_t_now') &&
-          data.containsKey('battery_t1') &&
-          data.containsKey('battery_t2');
-      if (hasLag) {
+      // New combined endpoint provides battery_level directly
+      if (data.containsKey('battery_level')) {
+        _batteryLevel = (data['battery_level'] as num).toDouble();
+      }
+
+      // The backend explicitly provides t_now, t1, and t2 in a lightweight payload every 30 seconds
+      if (data.containsKey('battery_t_now') && data.containsKey('battery_t1') && data.containsKey('battery_t2')) {
         final tNow = (data['battery_t_now'] as num).toDouble();
         final t1 = (data['battery_t1'] as num).toDouble();
         final t2 = (data['battery_t2'] as num).toDouble();
-        // Store as [oldest, middle, newest] to match _BatteryLagCard display
+        
+        _batteryLevel = tNow;
         _batteryHistory = [t2, t1, tNow];
-        // Derive timestamps from the payload timestamp (or fallback to now)
+
         final timestampStr = data['timestamp'] as String?;
-        final baseTime = timestampStr != null
+        final currentTime = timestampStr != null
             ? DateTime.tryParse(timestampStr)?.toLocal() ?? DateTime.now()
             : DateTime.now();
 
+        // battery_lag_interval_seconds defaults to 30s per the contract
+        final intervalSeconds = (data['battery_lag_interval_seconds'] as num?)?.toInt() ?? 30;
+
         _batteryTimestamps = [
-          baseTime.subtract(const Duration(seconds: 120)), // t2 (oldest)
-          baseTime.subtract(const Duration(seconds: 60)), // t1
-          baseTime, // t_now (current)
+          currentTime.subtract(Duration(seconds: intervalSeconds * 2)),
+          currentTime.subtract(Duration(seconds: intervalSeconds)),
+          currentTime,
         ];
-        // Keep _batteryLevel in sync with the most recent lag reading
+      } else if (data.containsKey('battery_level') || data.containsKey('battery_t_now')) {
+        // Fallback for endpoints that only provide a single reading (like the REST API initially)
+        final tNow = ((data['battery_level'] ?? data['battery_t_now']) as num).toDouble();
         _batteryLevel = tNow;
+        
+        final timestampStr = data['timestamp'] as String?;
+        final currentTime = timestampStr != null
+            ? DateTime.tryParse(timestampStr)?.toLocal() ?? DateTime.now()
+            : DateTime.now();
+            
+        if (_batteryHistory.isEmpty) {
+          _batteryHistory = [tNow];
+          _batteryTimestamps = [currentTime];
+        } else {
+          // If we only receive single updates, just update the latest value to stay current
+          _batteryHistory.last = tNow;
+          _batteryTimestamps.last = currentTime;
+        }
       }
     });
   }
 
-  void _updateMode(String mode) async {
+  void _updateMode(String mode) {
     setState(() {
       _currentMode = mode;
+      _aiEnabled = false;
     });
-    // Sync with backend
-    await _apiService.updateSystemMode(mode);
+    // Sync with backend via MQTT
+    _mqttService.publishOverride({'auto': false, 'mode': mode});
   }
 
   void _toggleAI(bool enabled) {
     setState(() {
       _aiEnabled = enabled;
-      if (_aiEnabled) {
-        _currentMode = 'A';
-        _apiService.updateSystemMode('A');
-      }
     });
+    if (enabled) {
+      _mqttService.publishOverride({'auto': true});
+    } else {
+      _mqttService.publishOverride({'auto': false, 'mode': _currentMode});
+    }
   }
 
-  void _onRelayChanged(int relayId, bool state) async {
-    final success = await _apiService.updateRelay(relayId, state);
-    if (success) {
-      // Logic for optimistic UI or wait for MQTT update
-    }
+  void _onRelayChanged(int relayId, bool state) {
+    setState(() {
+      _aiEnabled = false;
+    });
+    _mqttService.publishOverride({'auto': false, 'relay_$relayId': state});
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Scaffold(
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
     final List<Widget> _pages = [
       OverviewPage(
         currentMode: _currentMode,
@@ -369,6 +490,9 @@ class _DashboardShellState extends State<DashboardShell> {
       ControlsPage(
         currentMode: _currentMode,
         aiEnabled: _aiEnabled,
+        relay1: _relay1,
+        relay2: _relay2,
+        relay3: _relay3,
         onModeChanged: _updateMode,
         onAIToggled: _toggleAI,
         onRelayChanged: _onRelayChanged,
@@ -380,9 +504,15 @@ class _DashboardShellState extends State<DashboardShell> {
         voltage: _voltage,
         current: _current,
         batteryLevel: _batteryLevel,
+        luminousIntensity: _luminousIntensity,
+        actualLoad: _actualLoad,
         predictedEnergy: _predictedEnergy,
         peakDemand: _peakDemand,
         historyData: _historyData,
+        avgSensors: _avgSensors,
+        exportDays: _exportDays,
+        onExportDaysChanged: (days) => setState(() => _exportDays = days),
+        onExport: () => _apiService.downloadCsv(days: _exportDays),
       ),
     ];
 
@@ -670,12 +800,18 @@ class OverviewPage extends StatelessWidget {
   }
 
   String getModeReasoning() {
-    // Compare actual load against the ML prediction window
-    bool fallsBetween =
-        actualLoad >= predictedEnergy && actualLoad <= upperBound;
-    String energyReason = fallsBetween ? "falls" : "does not fall";
-    String stability = isBatteryStable() ? "stable" : "unstable";
-    return "The real-time load $energyReason between the mean prediction and upper confidence bound, battery is $stability — Mode $currentMode active.";
+    switch (currentMode) {
+      case 'A':
+        return "The system is performing at an optimal level, with predictable load behavior and efficient energy consumption.";
+      case 'B':
+        return "The system is operating under moderate load conditions, with energy usage remaining within expected limits.";
+      case 'C':
+        return "The observed load is near the baseline operating level, reflecting reduced energy consumption and light system usage.";
+      case 'MANUAL':
+        return "System is currently operating under manual override conditions.";
+      default:
+        return "System is managing energy dynamically based on real-time telemetry.";
+    }
   }
 
   String _formatTimestamp(String ts) {
@@ -685,7 +821,9 @@ class OverviewPage extends StatelessWidget {
       final h = dt.hour.toString().padLeft(2, '0');
       final m = dt.minute.toString().padLeft(2, '0');
       final s = dt.second.toString().padLeft(2, '0');
-      return '$h:$m:$s';
+      final mo = dt.month.toString().padLeft(2, '0');
+      final d = dt.day.toString().padLeft(2, '0');
+      return '$mo-$d $h:$m:$s';
     } catch (_) {
       return '';
     }
@@ -754,15 +892,73 @@ class OverviewPage extends StatelessWidget {
                             const SizedBox(width: 16),
                             Expanded(
                               flex: 1,
-                              child: _MetricCard(
-                                title: 'Expected Prediction',
-                                value: '${actualLoad.toStringAsFixed(3)} kW',
-                                subtitle: sensorTimestamp.isNotEmpty
-                                    ? 'Last Update: ${_formatTimestamp(sensorTimestamp)}\nForecast: ${predictedEnergy.toStringAsFixed(3)} kW'
-                                    : 'ML Forecast: ${predictedEnergy.toStringAsFixed(3)} kW',
-                                icon: Icons.electric_meter_outlined,
-                                color: Colors.teal,
-                                linePlacement: Alignment.bottomCenter,
+                              child: LayoutBuilder(
+                                builder: (context, constraints) {
+                                  bool isSmall = constraints.maxWidth < 180;
+                                  bool isDark =
+                                      Theme.of(context).brightness ==
+                                      Brightness.dark;
+                                  return Container(
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(context).cardColor,
+                                      borderRadius: BorderRadius.circular(12),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(
+                                            isDark ? 0.2 : 0.04,
+                                          ),
+                                          blurRadius: 10,
+                                          offset: const Offset(0, 4),
+                                        ),
+                                      ],
+                                    ),
+                                    child: Padding(
+                                      padding: EdgeInsets.all(
+                                        isSmall ? 10.0 : 16.0,
+                                      ),
+                                      child: Column(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              Icon(
+                                                Icons.rule_outlined,
+                                                color: Colors.teal,
+                                                size: isSmall ? 24 : 32,
+                                              ),
+                                              SizedBox(width: isSmall ? 8 : 12),
+                                              Text(
+                                                'Mode Thresholds',
+                                                style: TextStyle(
+                                                  color: Theme.of(
+                                                    context,
+                                                  ).textTheme.bodySmall?.color,
+                                                  fontSize: isSmall ? 11 : 13,
+                                                  fontWeight: FontWeight.w500,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          SizedBox(height: isSmall ? 8 : 12),
+                                          Text(
+                                            'Smart C: 1–15 Wh\nSmart B: Greater than 15 Wh up to 30 Wh\nSmart A: Greater than 30 Wh',
+                                            style: TextStyle(
+                                              fontSize: isSmall ? 10 : 12,
+                                              fontWeight: FontWeight.w600,
+                                              color: Theme.of(
+                                                context,
+                                              ).textTheme.bodyLarge?.color,
+                                              height: 1.4,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
                             ),
                           ],
@@ -836,11 +1032,11 @@ class OverviewPage extends StatelessWidget {
                       linePlacement: Alignment.bottomCenter,
                     ),
                     _MetricCard(
-                      title: 'Real Time Prediction',
+                      title: 'Expected Prediction',
                       value: '${actualLoad.toStringAsFixed(3)} kW',
                       subtitle: sensorTimestamp.isNotEmpty
-                          ? 'Last Update: ${_formatTimestamp(sensorTimestamp)}\nForecast: ${predictedEnergy.toStringAsFixed(3)} kW'
-                          : 'ML Forecast: ${predictedEnergy.toStringAsFixed(3)} kW',
+                          ? 'Last Update: ${_formatTimestamp(sensorTimestamp)}\nForecast: ${predictedEnergy.toStringAsFixed(1)} Wh'
+                          : 'ML Forecast: ${predictedEnergy.toStringAsFixed(1)} Wh',
                       icon: Icons.electric_meter_outlined,
                       color: Colors.teal,
                       linePlacement: Alignment.bottomCenter,
@@ -1070,7 +1266,7 @@ class _EnergyFlowGraphic extends StatelessWidget {
                       child: _GraphicNode(
                         icon: Icons.battery_charging_full,
                         label: 'Storage',
-                        subtitle: '${batteryLevel.toStringAsFixed(1)}% SoC',
+                        subtitle: '${batteryLevel.round()}% SoC',
                         color: Colors.greenAccent,
                         isLarge: true,
                         batteryLevel: batteryLevel,
@@ -1502,7 +1698,7 @@ class _GraphicNode extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             Text(
-              '${level.toStringAsFixed(1)}%',
+              '${level.round()}%',
               style: const TextStyle(
                 color: fixedTextColor,
                 fontSize: 22,
@@ -1678,7 +1874,7 @@ class _PredictionDetailsCard extends StatelessWidget {
           _detailRow(
             context,
             'Real Time Prediction',
-            '${mean.toStringAsFixed(3)} kW',
+            '${mean.toStringAsFixed(1)} Wh',
             Colors.blue,
             Icons.auto_graph,
           ),
@@ -1686,7 +1882,7 @@ class _PredictionDetailsCard extends StatelessWidget {
           _detailRow(
             context,
             'Upper Bound Prediction',
-            '${upperBound.toStringAsFixed(3)} kW',
+            '${upperBound.toStringAsFixed(1)} Wh',
             Colors.orange,
             Icons.trending_up,
           ),
@@ -1694,7 +1890,7 @@ class _PredictionDetailsCard extends StatelessWidget {
           _detailRow(
             context,
             'Lower Bound Prediction',
-            '${lowerBound.toStringAsFixed(3)} kW',
+            '${lowerBound.toStringAsFixed(1)} Wh',
             Colors.red.shade300,
             Icons.warning_amber_outlined,
           ),
@@ -1746,7 +1942,9 @@ class _BatteryLagCard extends StatelessWidget {
   String _fmt(DateTime dt) {
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
-    return '$h:$m';
+    final mo = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '$mo-$d $h:$m';
   }
 
   @override
@@ -1789,12 +1987,12 @@ class _BatteryLagCard extends StatelessWidget {
   }
 
   Widget _lagItem(BuildContext context, double val, int index, DateTime? ts) {
-    final labels = ['t-2', 't-1', 't-0'];
-    final label = index < labels.length ? labels[index] : 't-$index';
+    final lagNumber = (history.length - 1) - index;
+    final label = 't-$lagNumber';
     return Column(
       children: [
         Text(
-          '${val.toStringAsFixed(1)}%',
+          '${val.round()}%',
           style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         Text(
@@ -1868,10 +2066,10 @@ class _EnvironmentCard extends StatelessWidget {
               Expanded(
                 child: _envItem(
                   context,
-                  occupancy == 1 ? Icons.people : Icons.people_outline,
+                  occupancy > 0 ? Icons.people : Icons.people_outline,
                   'Occupancy',
-                  occupancy == 1 ? 'Occupied' : 'Empty',
-                  occupancy == 1 ? Colors.blue : Colors.grey,
+                  '$occupancy people',
+                  occupancy > 0 ? Colors.blue : Colors.grey,
                 ),
               ),
               Expanded(
@@ -2098,31 +2296,22 @@ class AnalyticsPage extends StatelessWidget {
                       ),
                       borderData: FlBorderData(show: false),
                       barGroups: historyData.isEmpty
-                          ? [
-                              _makeGroupData(1, 80, 70),
-                              _makeGroupData(2, 60, 65),
-                              _makeGroupData(3, 110, 80),
-                              _makeGroupData(4, 150, 70),
-                              _makeGroupData(5, 70, 90),
-                              _makeGroupData(6, 125, 120),
-                              _makeGroupData(7, 85, 80),
-                            ]
+                          ? []
                           : List.generate(
                               historyData.length > 7 ? 7 : historyData.length,
                               (index) {
                                 final item = historyData[index];
-                                double current = (item['current'] ?? 0.0)
-                                    .toDouble();
-                                double voltage = (item['voltage'] ?? 220.0)
-                                    .toDouble();
-                                double consumption = (current * voltage / 1000);
-                                // Simulation for solar if not present
-                                double solar =
-                                    consumption * (0.5 + (index % 5) / 10);
+                                // Use energy_kw (from hw_bridge) or energy_kwh directly
+                                double consumption =
+                                    (item['energy_kw'] ??
+                                            item['energy_kwh'] ??
+                                            0.0)
+                                        .toDouble();
+                                // Scale W→kW for display: multiply by 1000 for chart readability
                                 return _makeGroupData(
                                   index + 1,
-                                  solar,
-                                  consumption,
+                                  consumption *
+                                      1000, // displayed in W for chart scale
                                 );
                               },
                             ),
@@ -2133,19 +2322,19 @@ class AnalyticsPage extends StatelessWidget {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    _legendItem(
-                      context,
-                      Colors.green.shade400,
-                      'Solar Generation',
-                    ),
-                    const SizedBox(width: 24),
-                    _legendItem(
-                      context,
-                      Colors.blue.shade400,
-                      'Home Consumption',
-                    ),
+                    _legendItem(context, Colors.blue.shade400, 'Energy (W)'),
                   ],
                 ),
+                if (historyData.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 24),
+                    child: Center(
+                      child: Text(
+                        'No historical data available yet.',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -2155,25 +2344,25 @@ class AnalyticsPage extends StatelessWidget {
           LayoutBuilder(
             builder: (context, constraints) {
               bool isMobile = constraints.maxWidth < 600;
+              // Compute real totals from historyData
+              double totalConsumedKwh = historyData.fold(0.0, (sum, item) {
+                return sum +
+                    ((item['energy_kw'] ?? item['energy_kwh'] ?? 0.0) as num)
+                        .toDouble();
+              });
+              double latestBatteryLevel = historyData.isEmpty
+                  ? 0.0
+                  : ((historyData.first['battery_level'] ?? 0.0) as num)
+                        .toDouble();
+
               return Flex(
                 direction: isMobile ? Axis.vertical : Axis.horizontal,
                 children: [
                   Expanded(
                     flex: isMobile ? 0 : 1,
                     child: _SummaryCard(
-                      title: 'Total Generated',
-                      value: '210 kWh',
-                    ),
-                  ),
-                  if (!isMobile)
-                    const SizedBox(width: 16)
-                  else
-                    const SizedBox(height: 16),
-                  Expanded(
-                    flex: isMobile ? 0 : 1,
-                    child: _SummaryCard(
                       title: 'Total Consumed',
-                      value: '150 kWh',
+                      value: '${totalConsumedKwh.toStringAsFixed(3)} kWh',
                     ),
                   ),
                   if (!isMobile)
@@ -2183,8 +2372,23 @@ class AnalyticsPage extends StatelessWidget {
                   Expanded(
                     flex: isMobile ? 0 : 1,
                     child: _SummaryCard(
-                      title: 'Net Grid Independence',
-                      value: '85%',
+                      title: 'Current Battery',
+                      value: historyData.isEmpty
+                          ? '—'
+                          : '${latestBatteryLevel.round()}%',
+                    ),
+                  ),
+                  if (!isMobile)
+                    const SizedBox(width: 16)
+                  else
+                    const SizedBox(height: 16),
+                  Expanded(
+                    flex: isMobile ? 0 : 1,
+                    child: _SummaryCard(
+                      title: 'Data Points',
+                      value: historyData.isEmpty
+                          ? '0'
+                          : '${historyData.length}',
                     ),
                   ),
                 ],
@@ -2196,21 +2400,15 @@ class AnalyticsPage extends StatelessWidget {
     );
   }
 
-  BarChartGroupData _makeGroupData(int x, double y1, double y2) {
+  BarChartGroupData _makeGroupData(int x, double y1) {
     return BarChartGroupData(
       barsSpace: 4,
       x: x,
       barRods: [
         BarChartRodData(
           toY: y1,
-          color: Colors.green.shade400,
-          width: 14,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
-        ),
-        BarChartRodData(
-          toY: y2,
           color: Colors.blue.shade400,
-          width: 14,
+          width: 20,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
         ),
       ],
@@ -2298,6 +2496,9 @@ class _SummaryCard extends StatelessWidget {
 class ControlsPage extends StatefulWidget {
   final String currentMode;
   final bool aiEnabled;
+  final bool relay1;
+  final bool relay2;
+  final bool relay3;
   final Function(String) onModeChanged;
   final Function(bool) onAIToggled;
   final Function(int, bool) onRelayChanged;
@@ -2306,6 +2507,9 @@ class ControlsPage extends StatefulWidget {
     super.key,
     required this.currentMode,
     required this.aiEnabled,
+    required this.relay1,
+    required this.relay2,
+    required this.relay3,
     required this.onModeChanged,
     required this.onAIToggled,
     required this.onRelayChanged,
@@ -2317,30 +2521,10 @@ class ControlsPage extends StatefulWidget {
 
 class _ControlsPageState extends State<ControlsPage> {
   // Manual relay states (local for now, but influenced by mode)
-  bool r1WaterHeater = true;
-  bool r2AC = true;
-  bool r3Fridge = true;
-  bool r4Lights = true;
+  // Manual relay states (local for now, but influenced by mode)
 
   void _syncRelaysWithMode(String mode) {
-    setState(() {
-      if (mode == 'A') {
-        r1WaterHeater = true;
-        r2AC = true;
-        r3Fridge = true;
-        r4Lights = true;
-      } else if (mode == 'B') {
-        r1WaterHeater = false;
-        r2AC = false;
-        r3Fridge = true;
-        r4Lights = true;
-      } else if (mode == 'C') {
-        r1WaterHeater = false;
-        r2AC = false;
-        r3Fridge = false;
-        r4Lights = true;
-      }
-    });
+    // Legacy client-side mock logic removed since UI only drives remote state
   }
 
   @override
@@ -2457,29 +2641,27 @@ class _ControlsPageState extends State<ControlsPage> {
           ],
 
           _buildRelayCard(
-            'Water Heater (Relay 1)',
-            r1WaterHeater,
-            Icons.hot_tub,
+            'Class A Loads (Relay 1)',
+            widget.relay1,
+            Icons.power,
             (val) {
-              setState(() => r1WaterHeater = val);
               widget.onRelayChanged(1, val);
             },
           ),
-          _buildRelayCard('HVAC / A.C. (Relay 2)', r2AC, Icons.ac_unit, (val) {
-            setState(() => r2AC = val);
-            widget.onRelayChanged(2, val);
-          }),
-          _buildRelayCard('Freezer (Relay 3)', r3Fridge, Icons.kitchen, (val) {
-            setState(() => r3Fridge = val);
-            widget.onRelayChanged(3, val);
-          }),
           _buildRelayCard(
-            'Lighting (Relay 4)',
-            r4Lights,
-            Icons.lightbulb_outline,
+            'Class B Loads (Relay 2)',
+            widget.relay2,
+            Icons.power_settings_new,
             (val) {
-              setState(() => r4Lights = val);
-              widget.onRelayChanged(4, val);
+              widget.onRelayChanged(2, val);
+            },
+          ),
+          _buildRelayCard(
+            'Class C Loads (Relay 3)',
+            widget.relay3,
+            Icons.electrical_services,
+            (val) {
+              widget.onRelayChanged(3, val);
             },
           ),
         ],
@@ -2610,9 +2792,15 @@ class RawDataPage extends StatelessWidget {
   final double voltage;
   final double current;
   final double batteryLevel;
+  final double luminousIntensity;
+  final double actualLoad; // energy in kWh from hardware
   final double predictedEnergy;
   final double peakDemand;
   final List<dynamic> historyData;
+  final Map<String, dynamic>? avgSensors;
+  final int exportDays;
+  final Function(int) onExportDaysChanged;
+  final VoidCallback onExport;
 
   const RawDataPage({
     super.key,
@@ -2622,9 +2810,15 @@ class RawDataPage extends StatelessWidget {
     required this.voltage,
     required this.current,
     required this.batteryLevel,
+    required this.luminousIntensity,
+    required this.actualLoad,
     required this.predictedEnergy,
     required this.peakDemand,
     required this.historyData,
+    this.avgSensors,
+    required this.exportDays,
+    required this.onExportDaysChanged,
+    required this.onExport,
   });
 
   @override
@@ -2670,13 +2864,13 @@ class RawDataPage extends StatelessWidget {
               ),
               _RawMetricItem(
                 label: 'Battery SoC',
-                value: '${batteryLevel.toStringAsFixed(1)} %',
+                value: '${batteryLevel.round()} %',
                 icon: Icons.battery_full,
                 color: Colors.green,
               ),
               _RawMetricItem(
                 label: 'Temperature',
-                value: '${temperature.toStringAsFixed(1)} °C',
+                value: '${temperature.toStringAsFixed(1)} \u00b0C',
                 icon: Icons.thermostat,
                 color: Colors.redAccent,
               ),
@@ -2687,22 +2881,145 @@ class RawDataPage extends StatelessWidget {
                 color: Colors.cyan,
               ),
               _RawMetricItem(
+                label: 'Luminous Intensity',
+                value: '${luminousIntensity.toStringAsFixed(1)} lx',
+                icon: Icons.lightbulb,
+                color: Colors.amber,
+              ),
+              _RawMetricItem(
+                label: 'Energy (Wh)',
+                value: actualLoad.toStringAsFixed(4),
+                icon: Icons.bolt,
+                color: Colors.teal,
+              ),
+              _RawMetricItem(
                 label: 'Occupancy',
-                value: occupancy == 1 ? 'Present' : 'Absent',
+                value: '$occupancy people',
                 icon: Icons.people,
                 color: Colors.purple,
               ),
             ],
           ),
 
+          if (avgSensors != null) ...[
+            const SizedBox(height: 32),
+            const Text(
+              'Averaged Sensor Data (5-Min)',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              "The exact 5-minute averaged environmental sensor values fed into the prediction model.",
+              style: TextStyle(
+                color: Theme.of(context).textTheme.bodySmall?.color,
+              ),
+            ),
+            const SizedBox(height: 16),
+            GridView.count(
+              crossAxisCount: MediaQuery.of(context).size.width > 600 ? 4 : 2,
+              crossAxisSpacing: 16,
+              mainAxisSpacing: 16,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              childAspectRatio: 2.5,
+              children: [
+                _RawMetricItem(
+                  label: 'Avg Temperature',
+                  value:
+                      '${(avgSensors!['temperature_c'] as num?)?.toStringAsFixed(1) ?? 'N/A'} °C',
+                  icon: Icons.thermostat,
+                  color: Colors.redAccent,
+                ),
+                _RawMetricItem(
+                  label: 'Avg Humidity',
+                  value:
+                      '${(avgSensors!['humidity'] as num?)?.toStringAsFixed(1) ?? 'N/A'} %',
+                  icon: Icons.water_drop,
+                  color: Colors.lightBlue,
+                ),
+                _RawMetricItem(
+                  label: 'Avg Lux',
+                  value:
+                      '${(avgSensors!['lux'] as num?)?.toStringAsFixed(1) ?? 'N/A'} lx',
+                  icon: Icons.lightbulb,
+                  color: Colors.amber,
+                ),
+                _RawMetricItem(
+                  label: 'Avg Occupancy',
+                  value: '${avgSensors!['occupancy'] ?? 'N/A'}',
+                  icon: Icons.people,
+                  color: Colors.purple,
+                ),
+              ],
+            ),
+          ],
+
           const SizedBox(height: 32),
-          const Text(
-            'Recent Data Points',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Recent Data Points',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              Row(
+                children: [
+                  Container(
+                    height: 36,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).cardColor,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey.withAlpha(50)),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<int>(
+                        value: exportDays,
+                        icon: const Icon(Icons.keyboard_arrow_down, size: 16),
+                        style: TextStyle(
+                          color: Theme.of(context).textTheme.bodyMedium?.color,
+                          fontSize: 13,
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 1, child: Text('Last 24h')),
+                          DropdownMenuItem(
+                            value: 7,
+                            child: Text('Last 7 Days'),
+                          ),
+                          DropdownMenuItem(
+                            value: 30,
+                            child: Text('Last 30 Days'),
+                          ),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) onExportDaysChanged(val);
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    onPressed: onExport,
+                    icon: const Icon(Icons.download, size: 16),
+                    label: const Text('Export CSV'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 0,
+                      ),
+                      minimumSize: const Size(0, 36),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 16),
 
-          // History Table
+          // History Table — fields per section 11a sensor log schema
           Container(
             width: double.infinity,
             decoration: BoxDecoration(
@@ -2727,13 +3044,61 @@ class RawDataPage extends StatelessWidget {
                   ),
                   DataColumn(
                     label: Text(
-                      'Power (W)',
+                      'Mode',
                       style: TextStyle(fontWeight: FontWeight.bold),
                     ),
                   ),
                   DataColumn(
                     label: Text(
-                      'Temp',
+                      'R1',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'R2',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'R3',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Reason',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Temp (\u00b0C)',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Humidity (%)',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Lux',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Occupancy',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  DataColumn(
+                    label: Text(
+                      'Energy (kW)',
                       style: TextStyle(fontWeight: FontWeight.bold),
                     ),
                   ),
@@ -2743,36 +3108,114 @@ class RawDataPage extends StatelessWidget {
                       style: TextStyle(fontWeight: FontWeight.bold),
                     ),
                   ),
+                  DataColumn(
+                    label: Text(
+                      'Bat V',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
                 ],
-                rows: historyData.reversed.take(10).map((data) {
-                  final timestamp = data['timestamp'] != null
-                      ? DateTime.parse(data['timestamp']).toLocal()
-                      : DateTime.now();
-                  final power =
-                      ((data['voltage'] ?? 0) * (data['current'] ?? 0))
-                          .toStringAsFixed(0);
+                rows:
+                    (List.from(historyData)..sort((a, b) {
+                          final ta =
+                              DateTime.tryParse(
+                                a['timestamp']?.toString() ?? '',
+                              ) ??
+                              DateTime.fromMillisecondsSinceEpoch(0);
+                          final tb =
+                              DateTime.tryParse(
+                                b['timestamp']?.toString() ?? '',
+                              ) ??
+                              DateTime.fromMillisecondsSinceEpoch(0);
+                          return tb.compareTo(ta); // descending: newest first
+                        }))
+                        .take(10)
+                        .map((data) {
+                          final ts = data['timestamp'] != null
+                              ? DateTime.parse(data['timestamp']).toLocal()
+                              : DateTime.now();
+                          final energyKw = (data['energy_kw'] ?? 0.0) as num;
+                          final lux = data['lux'] as num?;
+                          final batV = data['battery_voltage'] as num?;
+                          final occ = data['occupancy'] as num?;
+                          final mode = data['mode']?.toString() ?? 'N/A';
+                          final r1 = data['relay_1'] as bool? ?? false;
+                          final r2 = data['relay_2'] as bool? ?? false;
+                          final r3 = data['relay_3'] as bool? ?? false;
+                          final reason = data['reason']?.toString() ?? 'N/A';
 
-                  return DataRow(
-                    cells: [
-                      DataCell(
-                        Text(
-                          '${timestamp.hour}:${timestamp.minute.toString().padLeft(2, '0')}:${timestamp.second.toString().padLeft(2, '0')}',
-                        ),
-                      ),
-                      DataCell(Text(power)),
-                      DataCell(
-                        Text(
-                          '${data['temperature']?.toStringAsFixed(1) ?? "N/A"}°',
-                        ),
-                      ),
-                      DataCell(
-                        Text(
-                          '${data['battery_level']?.toStringAsFixed(0) ?? "N/A"}%',
-                        ),
-                      ),
-                    ],
-                  );
-                }).toList(),
+                          return DataRow(
+                            cells: [
+                              DataCell(
+                                Text(
+                                  '${ts.month.toString().padLeft(2, '0')}-${ts.day.toString().padLeft(2, '0')} ${ts.hour.toString().padLeft(2, '0')}:${ts.minute.toString().padLeft(2, '0')}',
+                                ),
+                              ),
+                              DataCell(Text(mode)),
+                              DataCell(
+                                Icon(
+                                  r1 ? Icons.check_circle : Icons.cancel,
+                                  color: r1 ? Colors.green : Colors.grey,
+                                  size: 16,
+                                ),
+                              ),
+                              DataCell(
+                                Icon(
+                                  r2 ? Icons.check_circle : Icons.cancel,
+                                  color: r2 ? Colors.green : Colors.grey,
+                                  size: 16,
+                                ),
+                              ),
+                              DataCell(
+                                Icon(
+                                  r3 ? Icons.check_circle : Icons.cancel,
+                                  color: r3 ? Colors.green : Colors.grey,
+                                  size: 16,
+                                ),
+                              ),
+                              DataCell(
+                                SizedBox(
+                                  width: 150,
+                                  child: Text(
+                                    reason,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              ),
+                              DataCell(
+                                Text(
+                                  '${data['temperature']?.toStringAsFixed(1) ?? 'N/A'}',
+                                ),
+                              ),
+                              DataCell(
+                                Text(
+                                  '${data['humidity']?.toStringAsFixed(1) ?? 'N/A'}',
+                                ),
+                              ),
+                              DataCell(
+                                Text(
+                                  lux != null ? lux.toStringAsFixed(1) : 'N/A',
+                                ),
+                              ),
+                              DataCell(Text(occ != null ? '$occ' : 'N/A')),
+                              DataCell(Text(energyKw.toStringAsFixed(4))),
+                              DataCell(
+                                Text(
+                                  '${data['battery_level'] != null ? data['battery_level'] : 'N/A'}%',
+                                ),
+                              ),
+                              DataCell(
+                                Text(
+                                  batV != null
+                                      ? '${batV.toStringAsFixed(1)} V'
+                                      : 'N/A',
+                                ),
+                              ),
+                            ],
+                          );
+                        })
+                        .toList(),
               ),
             ),
           ),

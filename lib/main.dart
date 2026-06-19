@@ -137,7 +137,28 @@ class _DashboardShellState extends State<DashboardShell> {
 
   List<dynamic> _historyData = [];
   bool _isLoading = true;
-  int _exportDays = 1;
+  DateTime _exportStartDate = DateTime(
+    DateTime.now().year,
+    DateTime.now().month,
+    DateTime.now().day,
+  );
+  DateTime _exportEndDate = DateTime(
+    DateTime.now().year,
+    DateTime.now().month,
+    DateTime.now().day,
+  );
+  int _analyticsDaysFilter = 7;
+
+  Future<void> _fetchHistoryData() async {
+    final history = await _apiService.getRelayHistory(
+      days: _analyticsDaysFilter,
+    );
+    if (mounted) {
+      setState(() {
+        _historyData = history;
+      });
+    }
+  }
 
   @override
   void initState() {
@@ -166,12 +187,7 @@ class _DashboardShellState extends State<DashboardShell> {
       }
 
       // Re-fetch history so the analytics chart and table stay current
-      final history = await _apiService.getRelayHistory();
-      if (history.isNotEmpty) {
-        setState(() {
-          _historyData = history;
-        });
-      }
+      await _fetchHistoryData();
     });
   }
 
@@ -197,7 +213,9 @@ class _DashboardShellState extends State<DashboardShell> {
       _updateSensorState(relayData);
     }
 
-    final history = await _apiService.getRelayHistory();
+    final history = await _apiService.getRelayHistory(
+      days: _analyticsDaysFilter,
+    );
     if (history.isNotEmpty) {
       setState(() {
         _historyData = history;
@@ -388,11 +406,13 @@ class _DashboardShellState extends State<DashboardShell> {
       }
 
       // The backend explicitly provides t_now, t1, and t2 in a lightweight payload every 30 seconds
-      if (data.containsKey('battery_t_now') && data.containsKey('battery_t1') && data.containsKey('battery_t2')) {
+      if (data.containsKey('battery_t_now') &&
+          data.containsKey('battery_t1') &&
+          data.containsKey('battery_t2')) {
         final tNow = (data['battery_t_now'] as num).toDouble();
         final t1 = (data['battery_t1'] as num).toDouble();
         final t2 = (data['battery_t2'] as num).toDouble();
-        
+
         _batteryLevel = tNow;
         _batteryHistory = [t2, t1, tNow];
 
@@ -402,23 +422,26 @@ class _DashboardShellState extends State<DashboardShell> {
             : DateTime.now();
 
         // battery_lag_interval_seconds defaults to 30s per the contract
-        final intervalSeconds = (data['battery_lag_interval_seconds'] as num?)?.toInt() ?? 30;
+        final intervalSeconds =
+            (data['battery_lag_interval_seconds'] as num?)?.toInt() ?? 30;
 
         _batteryTimestamps = [
           currentTime.subtract(Duration(seconds: intervalSeconds * 2)),
           currentTime.subtract(Duration(seconds: intervalSeconds)),
           currentTime,
         ];
-      } else if (data.containsKey('battery_level') || data.containsKey('battery_t_now')) {
+      } else if (data.containsKey('battery_level') ||
+          data.containsKey('battery_t_now')) {
         // Fallback for endpoints that only provide a single reading (like the REST API initially)
-        final tNow = ((data['battery_level'] ?? data['battery_t_now']) as num).toDouble();
+        final tNow = ((data['battery_level'] ?? data['battery_t_now']) as num)
+            .toDouble();
         _batteryLevel = tNow;
-        
+
         final timestampStr = data['timestamp'] as String?;
         final currentTime = timestampStr != null
             ? DateTime.tryParse(timestampStr)?.toLocal() ?? DateTime.now()
             : DateTime.now();
-            
+
         if (_batteryHistory.isEmpty) {
           _batteryHistory = [tNow];
           _batteryTimestamps = [currentTime];
@@ -486,7 +509,16 @@ class _DashboardShellState extends State<DashboardShell> {
         sensorTimestamp: _sensorTimestamp,
         currentPower: (_current * _voltage / 1000),
       ),
-      AnalyticsPage(historyData: _historyData),
+      AnalyticsPage(
+        historyData: _historyData,
+        selectedDays: _analyticsDaysFilter,
+        onDaysChanged: (days) {
+          setState(() {
+            _analyticsDaysFilter = days;
+          });
+          _fetchHistoryData();
+        },
+      ),
       ControlsPage(
         currentMode: _currentMode,
         aiEnabled: _aiEnabled,
@@ -510,9 +542,24 @@ class _DashboardShellState extends State<DashboardShell> {
         peakDemand: _peakDemand,
         historyData: _historyData,
         avgSensors: _avgSensors,
-        exportDays: _exportDays,
-        onExportDaysChanged: (days) => setState(() => _exportDays = days),
-        onExport: () => _apiService.downloadCsv(days: _exportDays),
+        exportStartDate: _exportStartDate,
+        exportEndDate: _exportEndDate,
+        onExportStartChanged: (d) => setState(() => _exportStartDate = d),
+        onExportEndChanged: (d) => setState(() => _exportEndDate = d),
+        onExport: () {
+          // Format dates as YYYY-MM-DD with time-of-day boundaries.
+          // Start date at 00:00, end date at 23:59 — covers full day range.
+          // No 'Z' suffix so Django interprets in its configured timezone.
+          String pad(int n) => n.toString().padLeft(2, '0');
+
+          final startStr =
+              '${_exportStartDate.year}-${pad(_exportStartDate.month)}-${pad(_exportStartDate.day)}T00:00';
+          final endStr =
+              '${_exportEndDate.year}-${pad(_exportEndDate.month)}-${pad(_exportEndDate.day)}T23:59';
+
+          print('Export CSV: start=$startStr, end=$endStr');
+          _apiService.downloadCsv(start: startStr, end: endStr);
+        },
       ),
     ];
 
@@ -2165,10 +2212,38 @@ class _EnvironmentCard extends StatelessWidget {
 // ==========================================
 class AnalyticsPage extends StatelessWidget {
   final List<dynamic> historyData;
-  const AnalyticsPage({super.key, required this.historyData});
+  final int selectedDays;
+  final ValueChanged<int> onDaysChanged;
+
+  const AnalyticsPage({
+    super.key,
+    required this.historyData,
+    required this.selectedDays,
+    required this.onDaysChanged,
+  });
 
   @override
   Widget build(BuildContext context) {
+    // Sort chronologically for charting
+    final sortedData = List<dynamic>.from(historyData)
+      ..sort((a, b) {
+        final dateA = DateTime.tryParse(a['timestamp'] ?? '') ?? DateTime.now();
+        final dateB = DateTime.tryParse(b['timestamp'] ?? '') ?? DateTime.now();
+        return dateA.compareTo(dateB);
+      });
+
+    // Find max energy for dynamic scaling
+    double maxEnergy = 0.0;
+    for (var item in sortedData) {
+      double e =
+          ((item['energy_kw'] ?? item['energy_kwh'] ?? 0.0) as num).toDouble() *
+          1000; // in W
+      if (e > maxEnergy) maxEnergy = e;
+    }
+    double maxY = maxEnergy > 0 ? maxEnergy * 1.2 : 160.0;
+
+    int step = sortedData.length > 7 ? (sortedData.length / 5).ceil() : 1;
+
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -2180,176 +2255,29 @@ class AnalyticsPage extends StatelessWidget {
           ),
           const SizedBox(height: 24),
 
-          // Chart Container
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.04),
-                  blurRadius: 10,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
-            child: Column(
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Energy History',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16,
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey.shade300),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          Text(
-                            'Last 7 Days',
-                            style: TextStyle(
-                              color: Colors.grey.shade700,
-                              fontSize: 13,
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          Icon(
-                            Icons.keyboard_arrow_down,
-                            color: Colors.grey.shade700,
-                            size: 16,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 30),
-                SizedBox(
-                  height: 300,
-                  child: BarChart(
-                    BarChartData(
-                      alignment: BarChartAlignment.spaceAround,
-                      maxY: 160,
-                      barTouchData: BarTouchData(enabled: false),
-                      titlesData: FlTitlesData(
-                        show: true,
-                        bottomTitles: AxisTitles(
-                          sideTitles: SideTitles(
-                            showTitles: true,
-                            getTitlesWidget: (value, meta) {
-                              return Padding(
-                                padding: const EdgeInsets.only(top: 8.0),
-                                child: Text(
-                                  value.toInt().toString(),
-                                  style: const TextStyle(
-                                    color: Colors.grey,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                        leftTitles: AxisTitles(
-                          sideTitles: SideTitles(
-                            showTitles: true,
-                            reservedSize: 40,
-                            getTitlesWidget: (value, meta) {
-                              if (value % 30 == 0) {
-                                return Text(
-                                  value.toInt().toString(),
-                                  style: const TextStyle(
-                                    color: Colors.grey,
-                                    fontSize: 12,
-                                  ),
-                                );
-                              }
-                              return const SizedBox.shrink();
-                            },
-                          ),
-                        ),
-                        rightTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false),
-                        ),
-                        topTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false),
-                        ),
-                      ),
-                      gridData: FlGridData(
-                        show: true,
-                        drawVerticalLine: false,
-                        horizontalInterval: 30,
-                        getDrawingHorizontalLine: (value) =>
-                            FlLine(color: Colors.grey.shade200, strokeWidth: 1),
-                      ),
-                      borderData: FlBorderData(show: false),
-                      barGroups: historyData.isEmpty
-                          ? []
-                          : List.generate(
-                              historyData.length > 7 ? 7 : historyData.length,
-                              (index) {
-                                final item = historyData[index];
-                                // Use energy_kw (from hw_bridge) or energy_kwh directly
-                                double consumption =
-                                    (item['energy_kw'] ??
-                                            item['energy_kwh'] ??
-                                            0.0)
-                                        .toDouble();
-                                // Scale W→kW for display: multiply by 1000 for chart readability
-                                return _makeGroupData(
-                                  index + 1,
-                                  consumption *
-                                      1000, // displayed in W for chart scale
-                                );
-                              },
-                            ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    _legendItem(context, Colors.blue.shade400, 'Energy (W)'),
-                  ],
-                ),
-                if (historyData.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 24),
-                    child: Center(
-                      child: Text(
-                        'No historical data available yet.',
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 24),
-
           // Summary Cards Row
           LayoutBuilder(
             builder: (context, constraints) {
               bool isMobile = constraints.maxWidth < 600;
-              // Compute real totals from historyData
-              double totalConsumedKwh = historyData.fold(0.0, (sum, item) {
-                return sum +
-                    ((item['energy_kw'] ?? item['energy_kwh'] ?? 0.0) as num)
-                        .toDouble();
-              });
+              final now = DateTime.now();
+              double peakEnergyToday = historyData
+                  .where((item) {
+                    final dateStr = item['timestamp'] as String?;
+                    if (dateStr == null) return false;
+                    final date = DateTime.tryParse(dateStr)?.toLocal();
+                    if (date == null) return false;
+                    return date.year == now.year &&
+                        date.month == now.month &&
+                        date.day == now.day;
+                  })
+                  .map(
+                    (item) =>
+                        ((item['energy_kw'] ?? item['energy_kwh'] ?? 0.0)
+                                as num)
+                            .toDouble(),
+                  )
+                  .fold(0.0, (max, current) => current > max ? current : max);
+
               double latestBatteryLevel = historyData.isEmpty
                   ? 0.0
                   : ((historyData.first['battery_level'] ?? 0.0) as num)
@@ -2361,8 +2289,8 @@ class AnalyticsPage extends StatelessWidget {
                   Expanded(
                     flex: isMobile ? 0 : 1,
                     child: _SummaryCard(
-                      title: 'Total Consumed',
-                      value: '${totalConsumedKwh.toStringAsFixed(3)} kWh',
+                      title: 'Peak Energy Used Today',
+                      value: '${peakEnergyToday.toStringAsFixed(3)} kW',
                     ),
                   ),
                   if (!isMobile)
@@ -2395,23 +2323,327 @@ class AnalyticsPage extends StatelessWidget {
               );
             },
           ),
+          const SizedBox(height: 24),
+
+          // Energy Chart Container
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.04),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'Energy History',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey.shade300),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<int>(
+                          value: selectedDays,
+                          icon: Icon(
+                            Icons.keyboard_arrow_down,
+                            color: Colors.grey.shade700,
+                            size: 16,
+                          ),
+                          style: TextStyle(
+                            color: Colors.grey.shade700,
+                            fontSize: 13,
+                          ),
+                          onChanged: (int? newValue) {
+                            if (newValue != null) onDaysChanged(newValue);
+                          },
+                          items: const [
+                            DropdownMenuItem(value: 1, child: Text('1 Day')),
+                            DropdownMenuItem(value: 7, child: Text('7 Days')),
+                            DropdownMenuItem(value: 30, child: Text('30 Days')),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 30),
+                // ENERGY LINE CHART
+                SizedBox(
+                  height: 200,
+                  child: LineChart(
+                    LineChartData(
+                      minY: 0,
+                      maxY: maxY,
+                      lineTouchData: const LineTouchData(enabled: false),
+                      titlesData: FlTitlesData(
+                        show: true,
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            interval: step.toDouble(),
+                            getTitlesWidget: (value, meta) {
+                              if (value.toInt() >= 0 &&
+                                  value.toInt() < sortedData.length) {
+                                final date = DateTime.tryParse(
+                                  sortedData[value.toInt()]['timestamp'] ?? '',
+                                )?.toLocal();
+                                if (date != null) {
+                                  // Show time for 1 day, else day/month
+                                  String format = selectedDays == 1
+                                      ? '${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}'
+                                      : '${date.day}/${date.month}';
+                                  return Padding(
+                                    padding: const EdgeInsets.only(top: 8.0),
+                                    child: Text(
+                                      format,
+                                      style: const TextStyle(
+                                        color: Colors.grey,
+                                        fontSize: 10,
+                                      ),
+                                    ),
+                                  );
+                                }
+                              }
+                              return const SizedBox.shrink();
+                            },
+                          ),
+                        ),
+                        leftTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 40,
+                            getTitlesWidget: (value, meta) {
+                              if (value == 0 || value == maxY)
+                                return const SizedBox.shrink();
+                              return Text(
+                                value.toInt().toString(),
+                                style: const TextStyle(
+                                  color: Colors.grey,
+                                  fontSize: 10,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        rightTitles: const AxisTitles(
+                          sideTitles: SideTitles(showTitles: false),
+                        ),
+                        topTitles: const AxisTitles(
+                          sideTitles: SideTitles(showTitles: false),
+                        ),
+                      ),
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        getDrawingHorizontalLine: (value) =>
+                            FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      lineBarsData: [
+                        LineChartBarData(
+                          spots: sortedData.asMap().entries.map((e) {
+                            double consumption =
+                                ((e.value['energy_kw'] ??
+                                            e.value['energy_kwh'] ??
+                                            0.0)
+                                        as num)
+                                    .toDouble();
+                            return FlSpot(e.key.toDouble(), consumption * 1000);
+                          }).toList(),
+                          isCurved: true,
+                          color: Colors.blue.shade400,
+                          barWidth: 2,
+                          isStrokeCapRound: true,
+                          dotData: const FlDotData(show: false),
+                          belowBarData: BarAreaData(
+                            show: true,
+                            color: Colors.blue.shade400.withOpacity(0.2),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _legendItem(context, Colors.blue.shade400, 'Energy (W)'),
+                  ],
+                ),
+                if (historyData.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 24),
+                    child: Center(
+                      child: Text(
+                        'No historical data available yet.',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // Battery Chart Container
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.04),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Battery History',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+                const SizedBox(height: 30),
+                // BATTERY LINE CHART
+                SizedBox(
+                  height: 150,
+                  child: LineChart(
+                    LineChartData(
+                      minY: 0,
+                      maxY: 100,
+                      lineTouchData: const LineTouchData(enabled: false),
+                      titlesData: FlTitlesData(
+                        show: true,
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            interval: step.toDouble(),
+                            getTitlesWidget: (value, meta) {
+                              if (value.toInt() >= 0 &&
+                                  value.toInt() < sortedData.length) {
+                                final date = DateTime.tryParse(
+                                  sortedData[value.toInt()]['timestamp'] ?? '',
+                                )?.toLocal();
+                                if (date != null) {
+                                  // Show time for 1 day, else day/month
+                                  String format = selectedDays == 1
+                                      ? '${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}'
+                                      : '${date.day}/${date.month}';
+                                  return Padding(
+                                    padding: const EdgeInsets.only(top: 8.0),
+                                    child: Text(
+                                      format,
+                                      style: const TextStyle(
+                                        color: Colors.grey,
+                                        fontSize: 10,
+                                      ),
+                                    ),
+                                  );
+                                }
+                              }
+                              return const SizedBox.shrink();
+                            },
+                          ),
+                        ),
+                        leftTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 40,
+                            getTitlesWidget: (value, meta) {
+                              if (value % 25 == 0) {
+                                return Text(
+                                  '${value.toInt()}%',
+                                  style: const TextStyle(
+                                    color: Colors.grey,
+                                    fontSize: 10,
+                                  ),
+                                );
+                              }
+                              return const SizedBox.shrink();
+                            },
+                          ),
+                        ),
+                        rightTitles: const AxisTitles(
+                          sideTitles: SideTitles(showTitles: false),
+                        ),
+                        topTitles: const AxisTitles(
+                          sideTitles: SideTitles(showTitles: false),
+                        ),
+                      ),
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        getDrawingHorizontalLine: (value) =>
+                            FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      lineBarsData: [
+                        LineChartBarData(
+                          spots: sortedData.asMap().entries.map((e) {
+                            double battery =
+                                ((e.value['battery_level'] ?? 0.0) as num)
+                                    .toDouble();
+                            return FlSpot(e.key.toDouble(), battery);
+                          }).toList(),
+                          isCurved: true,
+                          color: Colors.green.shade400,
+                          barWidth: 2,
+                          isStrokeCapRound: true,
+                          dotData: const FlDotData(show: false),
+                          belowBarData: BarAreaData(
+                            show: true,
+                            color: Colors.green.shade400.withOpacity(0.2),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _legendItem(context, Colors.green.shade400, 'Battery (%)'),
+                  ],
+                ),
+                if (historyData.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 24),
+                    child: Center(
+                      child: Text(
+                        'No historical data available yet.',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
         ],
       ),
-    );
-  }
-
-  BarChartGroupData _makeGroupData(int x, double y1) {
-    return BarChartGroupData(
-      barsSpace: 4,
-      x: x,
-      barRods: [
-        BarChartRodData(
-          toY: y1,
-          color: Colors.blue.shade400,
-          width: 20,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
-        ),
-      ],
     );
   }
 
@@ -2798,8 +3030,10 @@ class RawDataPage extends StatelessWidget {
   final double peakDemand;
   final List<dynamic> historyData;
   final Map<String, dynamic>? avgSensors;
-  final int exportDays;
-  final Function(int) onExportDaysChanged;
+  final DateTime exportStartDate;
+  final DateTime exportEndDate;
+  final Function(DateTime) onExportStartChanged;
+  final Function(DateTime) onExportEndChanged;
   final VoidCallback onExport;
 
   const RawDataPage({
@@ -2816,8 +3050,10 @@ class RawDataPage extends StatelessWidget {
     required this.peakDemand,
     required this.historyData,
     this.avgSensors,
-    required this.exportDays,
-    required this.onExportDaysChanged,
+    required this.exportStartDate,
+    required this.exportEndDate,
+    required this.onExportStartChanged,
+    required this.onExportEndChanged,
     required this.onExport,
   });
 
@@ -2964,38 +3200,18 @@ class RawDataPage extends StatelessWidget {
               ),
               Row(
                 children: [
-                  Container(
-                    height: 36,
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).cardColor,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.grey.withAlpha(50)),
-                    ),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<int>(
-                        value: exportDays,
-                        icon: const Icon(Icons.keyboard_arrow_down, size: 16),
-                        style: TextStyle(
-                          color: Theme.of(context).textTheme.bodyMedium?.color,
-                          fontSize: 13,
-                        ),
-                        items: const [
-                          DropdownMenuItem(value: 1, child: Text('Last 24h')),
-                          DropdownMenuItem(
-                            value: 7,
-                            child: Text('Last 7 Days'),
-                          ),
-                          DropdownMenuItem(
-                            value: 30,
-                            child: Text('Last 30 Days'),
-                          ),
-                        ],
-                        onChanged: (val) {
-                          if (val != null) onExportDaysChanged(val);
-                        },
-                      ),
-                    ),
+                  _DatePickerButton(
+                    label: 'From',
+                    date: exportStartDate,
+                    onChanged: onExportStartChanged,
+                    lastDate: exportEndDate,
+                  ),
+                  const SizedBox(width: 8),
+                  _DatePickerButton(
+                    label: 'To',
+                    date: exportEndDate,
+                    onChanged: onExportEndChanged,
+                    firstDate: exportStartDate,
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton.icon(
@@ -3290,6 +3506,78 @@ class _RawMetricItem extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ── Date Picker Button ────────────────────────────────────────────────────────
+// Compact tappable chip used in the Raw Data export row.
+// Shows a label + formatted date and opens a calendar picker on tap.
+class _DatePickerButton extends StatelessWidget {
+  final String label;
+  final DateTime date;
+  final Function(DateTime) onChanged;
+  final DateTime? firstDate;
+  final DateTime? lastDate;
+
+  const _DatePickerButton({
+    required this.label,
+    required this.date,
+    required this.onChanged,
+    this.firstDate,
+    this.lastDate,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final formatted =
+        '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: () async {
+        final picked = await showDatePicker(
+          context: context,
+          initialDate: date,
+          firstDate: firstDate ?? DateTime(2020),
+          lastDate: lastDate ?? DateTime.now(),
+        );
+        if (picked != null) onChanged(picked);
+      },
+      child: Container(
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).cardColor,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.grey.withAlpha(50)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              '$label: ',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).textTheme.bodySmall?.color,
+              ),
+            ),
+            Text(
+              formatted,
+              style: TextStyle(
+                fontSize: 13,
+                color: Theme.of(context).textTheme.bodyMedium?.color,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(width: 4),
+            Icon(
+              Icons.calendar_today,
+              size: 14,
+              color: Theme.of(context).textTheme.bodySmall?.color,
+            ),
+          ],
+        ),
       ),
     );
   }

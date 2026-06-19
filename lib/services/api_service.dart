@@ -67,9 +67,9 @@ class ApiService {
     }
   }
 
-  Future<List<dynamic>> getRelayHistory() async {
+  Future<List<dynamic>> getRelayHistory({int days = 7}) async {
     try {
-      final response = await client.get(Uri.parse('$baseUrl/relays/'));
+      final response = await client.get(Uri.parse('$baseUrl/relays/?days=$days&paginate=false'));
       if (response.statusCode == 200) {
         final body = json.decode(response.body);
         // DRF pagination wraps results in a 'results' key
@@ -114,9 +114,20 @@ class ApiService {
   }
 
   /// Triggers a download of historical telemetry data as a CSV file.
-  Future<void> downloadCsv({int days = 1}) async {
+  ///
+  /// Provide [start] and [end] as date strings (e.g. '2026-06-17T00:00')
+  /// to specify the exact time range. Falls back to [days] if not provided.
+  Future<void> downloadCsv({String? start, String? end, int days = 1}) async {
     try {
-      final uri = Uri.parse('$baseUrl/download/csv/?days=$days');
+      final Map<String, String> params = {};
+      if (start != null && end != null) {
+        params['start'] = start;
+        params['end'] = end;
+      } else {
+        params['days'] = days.toString();
+      }
+      final uri = Uri.parse('$baseUrl/download/csv/').replace(queryParameters: params);
+      print('CSV Download URL: $uri');
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri, mode: LaunchMode.externalApplication);
       } else {

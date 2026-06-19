@@ -1,0 +1,33 @@
+[Unit]
+Description=Smart Room Energy Management System (all services)
+After=network-online.target
+Wants=network-online.target
+# Make sure the system's default mosquitto doesn't conflict
+Conflicts=mosquitto.service
+
+[Service]
+Type=simple
+User=grandmaster
+WorkingDirectory=/home/grandmaster/Documents/project/PROJECT_CODE_4
+
+# Stop any system Mosquitto before we start (the '-' prefix means don't fail if it errors)
+ExecStartPre=-/usr/bin/sudo /bin/systemctl stop mosquitto
+ExecStartPre=-/usr/bin/killall mosquitto
+
+ExecStart=/bin/bash /home/grandmaster/Documents/project/PROJECT_CODE_4/startall.sh
+KillSignal=SIGINT
+
+# If startall.sh or any of its children crash, restart after 10 seconds
+Restart=on-failure
+RestartSec=10
+
+# Environment
+EnvironmentFile=/home/grandmaster/Documents/project/PROJECT_CODE_4/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smartroom
+
+[Install]
+WantedBy=multi-user.target

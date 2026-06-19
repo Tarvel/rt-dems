@@ -1,7 +1,7 @@
 # save this as start_services.ps1
 
 # Dynamically get the absolute path of the directory containing this script
-$BASE_DIR = Join-Path $PSScriptRoot "lib\rt-dems-final"
+$BASE_DIR = $PSScriptRoot
 
 # Define the path to the virtual environment's Python executable 
 # Note: Windows uses \Scripts\ instead of /bin/
@@ -44,22 +44,43 @@ try {
     Write-Host "-> Starting MQTT Logger worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/mqtt_logger.py" -WorkingDirectory $BASE_DIR
 
-    # 4. Start Rule Engine
+    # 4. Start Rule Engine (publishes mode decisions via MQTT — ESP32 actuates relays)
     Write-Host "-> Starting Rule Engine worker..."
     Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/rule_engine.py" -WorkingDirectory $BASE_DIR
 
-    # 5. Start FastAPI ML Service
-    Write-Host "-> Starting FastAPI ML Service..."
-    $mlDir = Join-Path $BASE_DIR "ML"
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "test_prediction_api.py" -WorkingDirectory $mlDir
+    # 5. Start FastAPI ML Service (configured via ML_SERVICE_SCRIPT in .env)
+    $ML_SCRIPT = if ($env:ML_SERVICE_SCRIPT) { $env:ML_SERVICE_SCRIPT } else { "workers/ml_service.py" }
+    Write-Host "-> Starting FastAPI ML Service ($ML_SCRIPT)..."
+    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList $ML_SCRIPT -WorkingDirectory $BASE_DIR
 
-    # 6. Start Data Simulator
-    Write-Host "-> Starting Data Simulator..."
-    Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+    # 6. Start data source — controlled by DATA_SOURCE env var
+    #    "simulator"  = CSV playback only       (default, for development/testing)
+    #    "hardware"   = Group 1 live sensors    (for production with real hardware)
+    #    "both"       = both at once            (debugging only — mixed data!)
+    $DATA_SOURCE = if ($env:DATA_SOURCE) { $env:DATA_SOURCE } else { "simulator" }
 
-    # 7. Start Flutter Dashboard
-    Write-Host "-> Starting Flutter Dashboard..."
-    Start-TrackedProcess -FilePath "flutter" -ArgumentList "run -d windows" -WorkingDirectory $PSScriptRoot
+    Write-Host ""
+    Write-Host "  DATA_SOURCE=$DATA_SOURCE"
+
+    switch ($DATA_SOURCE) {
+        "hardware" {
+            Write-Host "-> Starting Hardware Bridge (Group 1 live sensors)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   (Data Simulator skipped — using real hardware)"
+        }
+        "both" {
+            Write-Host "-> Starting Hardware Bridge (Group 1 live sensors)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "workers/hw_bridge.py" -WorkingDirectory $BASE_DIR
+            Write-Host "-> Starting Data Simulator (CSV playback)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   WARNING: Both sources active — data will be mixed!"
+        }
+        default {
+            Write-Host "-> Starting Data Simulator (CSV playback)..."
+            Start-TrackedProcess -FilePath $VENV_PYTHON -ArgumentList "simulation/data_simulator.py" -WorkingDirectory $BASE_DIR
+            Write-Host "   (Hardware Bridge skipped — using simulated data)"
+        }
+    }
 
     Write-Host "========================================================"
     Write-Host "✅ All services are now running in the background!"

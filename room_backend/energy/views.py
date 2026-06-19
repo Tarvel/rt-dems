@@ -10,6 +10,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
+from datetime import timedelta
+from django.utils import timezone as tz
 
 from .models import SensorLog, MLPrediction, RelayState
 from .serializers import (
@@ -72,9 +74,28 @@ class LatestMLPredictionView(APIView):
 class RelayStateListView(generics.ListAPIView):
     """Paginated audit trail of relay-mode decisions (newest first)."""
 
-    queryset = RelayState.objects.all()
     serializer_class = RelayStateSerializer
     ordering = ["-timestamp"]
+
+    def get_queryset(self):
+        queryset = RelayState.objects.all()
+        days = self.request.query_params.get("days")
+        if days:
+            try:
+                days_int = int(days)
+                start_date = tz.now() - timedelta(days=days_int)
+                queryset = queryset.filter(timestamp__gte=start_date)
+            except ValueError:
+                pass
+        return queryset
+
+    def paginate_queryset(self, queryset):
+        # Disable pagination if filtering by days (analytics) or explicitly requested
+        if self.request.query_params.get("paginate", "").lower() == "false":
+            return None
+        if self.request.query_params.get("days"):
+            return None
+        return super().paginate_queryset(queryset)
 
 
 class CurrentRelayStateView(APIView):

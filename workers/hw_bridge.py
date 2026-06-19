@@ -85,8 +85,8 @@ shutdown_event = threading.Event()
 # Stats
 stats = {"rx": 0, "published": 0, "dropped": 0}
 
-# Sliding history of power readings (in Watts) for 1-minute Live Energy calculation
-power_history = []
+# Time-based sliding window of (monotonic_timestamp, power_w) for 1-minute Live Energy
+power_history = []  # list of (time.monotonic(), watts)
 
 # Last known good reading (used to detect impossible energy drops)
 last_good = {"energy_kw": None}
@@ -236,18 +236,22 @@ def on_message(client, userdata, msg):
         raw_energy_kwh = normalised["energy_kw"]
         last_good["energy_kw"] = raw_energy_kwh
 
-        # Accumulate energy using a sliding 60-second window (Live Energy 1 min)
+        # Accumulate energy using a real 60-second time-based sliding window
         global power_history
         power_w = normalised["power_w"]
+        now = time.monotonic()
         with state_lock:
-            if not power_history:
-                # Seed the window with the first power reading to avoid cold-start ramp-up
-                power_history = [power_w] * 60
-            else:
-                power_history.append(power_w)
-                if len(power_history) > 60:
-                    power_history.pop(0)
-            total_ws = sum(power_history)
+            power_history.append((now, power_w))
+            # Evict entries older than 60 seconds
+            cutoff = now - 60.0
+            while power_history and power_history[0][0] < cutoff:
+                power_history.pop(0)
+            # Integrate power × dt across each interval in the window
+            total_ws = 0.0
+            for i in range(1, len(power_history)):
+                dt = power_history[i][0] - power_history[i - 1][0]
+                avg_power = (power_history[i][1] + power_history[i - 1][1]) / 2.0
+                total_ws += avg_power * dt
             energy_wh = total_ws / 3600.0
 
         # Replace energy_kw in normalised payload with the calculated Wh value for the model

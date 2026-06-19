@@ -83,7 +83,13 @@ state_lock = threading.Lock()
 shutdown_event = threading.Event()
 
 # Stats
-stats = {"rx": 0, "published": 0}
+stats = {"rx": 0, "published": 0, "dropped": 0}
+
+# Sliding history of power readings (in Watts) for 1-minute Live Energy calculation
+power_history = []
+
+# Last known good reading (used to detect impossible energy drops)
+last_good = {"energy_kw": None}
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +155,34 @@ def normalise(raw: dict) -> dict:
     return payload
 
 
+def _is_corrupted(normalised: dict) -> str | None:
+    """Return a reason string if the packet looks corrupted, else None.
+
+    Group 1's ESP32 sometimes emits packets where most or all fields
+    are zero due to serial glitches.  These corrupt the ML buffer and
+    trigger the zero-occupancy safeguard, dropping EDFI to ~0.3 Wh.
+    """
+    hum = normalised["humidity"]
+    lux = normalised["lux"]
+    energy = normalised["energy_kw"]
+    voltage = normalised["voltage"]
+
+    # Rule 1: If humidity, lux, and energy are ALL zero, the packet is
+    #         almost certainly a serial glitch (real rooms have > 0% humidity).
+    if hum == 0.0 and lux == 0.0 and energy == 0.0 and voltage == 0.0:
+        return "all-zero packet (hum=0, lux=0, energy=0, V=0)"
+
+    # Rule 2: Energy is cumulative.  It can never drop from e.g. 9 kWh
+    #         back to 0 kWh in a single reading.
+    prev_energy = last_good["energy_kw"]
+    if prev_energy is not None and prev_energy > 0.5:
+        if energy < prev_energy * 0.1:   # dropped to < 10% of last good
+            return (f"impossible energy drop ({prev_energy:.3f} → "
+                    f"{energy:.3f} kWh)")
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MQTT Callbacks
 # ---------------------------------------------------------------------------
@@ -182,8 +216,45 @@ def on_message(client, userdata, msg):
     if msg.topic == TOPIC_HW_NANO:
         stats["rx"] += 1
 
-        # Normalise and republish
+        # Normalise
         normalised = normalise(payload)
+
+        # ── Corrupted-packet filter ──────────────────────────────────
+        reason = _is_corrupted(normalised)
+        if reason is not None:
+            stats["dropped"] += 1
+            log.warning(
+                "DROPPED corrupted packet #%d (%s)  "
+                "[rx=%d dropped=%d pub=%d]",
+                stats["rx"], reason,
+                stats["rx"], stats["dropped"], stats["published"],
+            )
+            return
+        # ─────────────────────────────────────────────────────────────
+
+        # Update last-known-good energy for future corruption checks (using raw sensor energy)
+        raw_energy_kwh = normalised["energy_kw"]
+        last_good["energy_kw"] = raw_energy_kwh
+
+        # Accumulate energy using a sliding 60-second window (Live Energy 1 min)
+        global power_history
+        power_w = normalised["power_w"]
+        with state_lock:
+            if not power_history:
+                # Seed the window with the first power reading to avoid cold-start ramp-up
+                power_history = [power_w] * 60
+            else:
+                power_history.append(power_w)
+                if len(power_history) > 60:
+                    power_history.pop(0)
+            total_ws = sum(power_history)
+            energy_wh = total_ws / 3600.0
+
+        # Replace energy_kw in normalised payload with the calculated Wh value for the model
+        normalised["energy_kw"] = round(energy_wh, 4)
+        normalised["energy_wh"] = round(energy_wh, 4)
+
+        # Publish the validated, normalised payload
         out = json.dumps(normalised)
         client.publish(TOPIC_SENSORS, out, qos=1)
         stats["published"] += 1
@@ -191,7 +262,7 @@ def on_message(client, userdata, msg):
         log.info(
             "Bridge: hardware → room/sensors  "
             "temp=%.1f°C  hum=%.1f%%  V=%.1f  A=%.2f  "
-            "P=%.1fW  E=%.3fkWh  lux=%.1f  "
+            "P=%.1fW  E=%.3fkWh  E_wh=%.3fWh  lux=%.1f  "
             "occ=%d  radar=%d  bat=%.0f%%  batV=%.1f  "
             "[rx=%d pub=%d]",
             normalised["temperature"],
@@ -199,6 +270,7 @@ def on_message(client, userdata, msg):
             normalised["voltage"],
             normalised["current"],
             normalised["power_w"],
+            raw_energy_kwh,
             normalised["energy_kw"],
             normalised["lux"],
             normalised["occupancy"],

@@ -158,7 +158,7 @@ def flush_to_db(client: mqtt.Client) -> None:
         conn = get_db_connection()
         ensure_tables(conn)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat().replace("T", " ")
 
         conn.execute(
             """

@@ -248,7 +248,7 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat().replace("T", " "),
                 mode,
                 int(r1),
                 int(r2),

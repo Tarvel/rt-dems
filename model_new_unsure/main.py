@@ -426,8 +426,9 @@ def on_mqtt_message(client, userdata, msg):
             energy=energy_val,
             timestamp=payload.get("timestamp"),
         )
-    except Exception:
-        pass  # silently ignore malformed payloads
+    except Exception as exc:
+        print(f"[WARN] MQTT buffer update failed: {exc} — "
+              f"payload preview: {str(msg.payload)[:200]}")
 
 
 def start_mqtt_bridge():

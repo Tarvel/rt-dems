@@ -299,6 +299,7 @@ Base URL: `http://<PI_IP>:8000/api/v1/`
 5. `GET /relays/`
 6. `GET /relays/current/`
 7. `GET /download/csv/` — Download historical data as CSV
+8. `GET /analytics/` — Retrieve historical sensor, energy, prediction, and state data in JSON format for charts
 
 ### CSV Download (`GET /download/csv/`)
 
@@ -318,8 +319,7 @@ Returns a CSV file with sensor readings, predictions, and relay decisions aligne
 **CSV columns:**
 
 ```
-Timestamp, Temperature (°C), Humidity (%), Lux, Occupancy, Battery (%),
-Predicted Energy (Wh), Upper Bound (Wh), Lower Bound (Wh), Mode, R1, R2, R3, Reason
+timestamp, temperature, humidity, lux, occupancy, real time energy, predicted_energy_8lags, predicted_energy_lower_8lags, predicted_energy_upper_8lags, Battery Voltage, Battery Percentage, System Mode A,B,C
 ```
 
 ## 9. ML HTTP Endpoints
@@ -472,3 +472,33 @@ All endpoints are **GET-only**, paginated, and return JSON.
 ```
 
 > **Note:** Each relay decision now includes a full sensor snapshot — the exact room conditions at the moment of mode switch. This enables post-hoc analysis of how energy modes correlate with environmental state.
+
+### 11d. JSON Analytics Endpoint
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/analytics/` | List of historical sensor readings, relay decisions, and ML predictions aligned by timestamp. |
+
+**Query params:**
+* `days=N` — number of days of history to retrieve (default: 7)
+
+**Response fields:**
+An array of objects matching the CSV export format:
+```json
+[
+  {
+    "timestamp": "2026-06-19 20:28:19",
+    "temperature": 31.27,
+    "humidity": 59.35,
+    "lux": 4.31,
+    "occupancy": 0,
+    "real time energy": 0.0,
+    "predicted_energy_8lags": 8.3843,
+    "predicted_energy_lower_8lags": 6.3266,
+    "predicted_energy_upper_8lags": 10.442,
+    "Battery Voltage": 22.97,
+    "Battery Percentage": 48.1,
+    "System Mode A,B,C": "B"
+  }
+]
+```

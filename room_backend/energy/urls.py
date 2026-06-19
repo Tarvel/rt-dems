@@ -29,4 +29,6 @@ urlpatterns = [
     ),
     # CSV download
     path("download/csv/", views.CSVDownloadView.as_view(), name="csv-download"),
+    # JSON Analytics matched by timestamp for charts
+    path("analytics/", views.AnalyticsView.as_view(), name="analytics"),
 ]

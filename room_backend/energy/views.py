@@ -227,10 +227,10 @@ class CSVDownloadView(APIView):
         # Build rows — one per relay decision (which contains the sensor
         # snapshot), enriched with the closest ML prediction
         fieldnames = [
-            "Timestamp", "Temperature (°C)", "Humidity (%)", "Lux",
-            "Occupancy", "Battery (%)", "Energy (kWh)",
-            "Predicted Energy (Wh)", "Upper Bound (Wh)", "Lower Bound (Wh)",
-            "Mode", "R1", "R2", "R3", "Reason",
+            "timestamp", "temperature", "humidity", "lux", "occupancy",
+            "real time energy", "predicted_energy_8lags", 
+            "predicted_energy_lower_8lags", "predicted_energy_upper_8lags",
+            "Battery Voltage", "Battery Percentage", "System Mode A,B,C",
         ]
 
         rows = []
@@ -239,21 +239,18 @@ class CSVDownloadView(APIView):
             pred = pred_by_minute.get(ts_key)
 
             rows.append({
-                "Timestamp": tz.localtime(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
-                "Temperature (°C)": round(r["temperature"], 2) if r["temperature"] is not None else "",
-                "Humidity (%)": round(r["humidity"], 2) if r["humidity"] is not None else "",
-                "Lux": round(r["lux"], 2) if r["lux"] is not None else "",
-                "Occupancy": r["occupancy"] if r["occupancy"] is not None else "",
-                "Battery (%)": round(r["battery_level"], 1) if r["battery_level"] is not None else "",
-                "Energy (kWh)": round(r["energy_kw"], 4) if r["energy_kw"] is not None else "",
-                "Predicted Energy (Wh)": round(pred["predicted_energy_wh"], 4) if pred else "",
-                "Upper Bound (Wh)": round(pred["upper_bound_wh"], 4) if pred else "",
-                "Lower Bound (Wh)": round(pred["lower_bound_wh"], 4) if pred else "",
-                "Mode": r["mode"] if r["mode"] else "",
-                "R1": ("ON" if r["relay_1"] else "OFF"),
-                "R2": ("ON" if r["relay_2"] else "OFF"),
-                "R3": ("ON" if r["relay_3"] else "OFF"),
-                "Reason": r["reason"] if r["reason"] else "",
+                "timestamp": tz.localtime(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "temperature": round(r["temperature"], 2) if r["temperature"] is not None else "",
+                "humidity": round(r["humidity"], 2) if r["humidity"] is not None else "",
+                "lux": round(r["lux"], 2) if r["lux"] is not None else "",
+                "occupancy": r["occupancy"] if r["occupancy"] is not None else "",
+                "real time energy": round(r["energy_kw"], 4) if r["energy_kw"] is not None else "",
+                "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if pred else "",
+                "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if pred else "",
+                "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if pred else "",
+                "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else "",
+                "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else "",
+                "System Mode A,B,C": r["mode"] if r["mode"] else "",
             })
 
         # Generate CSV response
@@ -271,3 +268,73 @@ class CSVDownloadView(APIView):
             writer.writerow(["No data found for the specified time range."])
 
         return response
+
+
+class AnalyticsView(APIView):
+    """Retrieve historical sensor readings, relay decisions, and ML predictions 
+    aligned by timestamp in JSON format for charting.
+
+    Query params:
+      • ?days=N  — number of days of history to retrieve (default: 7)
+    """
+
+    def get(self, request):
+        days = request.query_params.get("days", "7")
+        try:
+            days_int = int(days)
+        except ValueError:
+            days_int = 7
+
+        now = tz.now()
+        start = now - timedelta(days=days_int)
+
+        # Query RelayState (primary sensor snapshot source)
+        relays = list(
+            RelayState.objects.filter(timestamp__gte=start)
+            .order_by("timestamp")
+            .values(
+                "timestamp", "mode", "relay_1", "relay_2", "relay_3", "reason",
+                "temperature", "humidity", "lux", "occupancy",
+                "energy_kw", "battery_level", "battery_voltage",
+            )
+        )
+
+        # Query MLPrediction
+        predictions = list(
+            MLPrediction.objects.filter(timestamp__gte=start)
+            .order_by("timestamp")
+            .values(
+                "timestamp", "predicted_energy_wh",
+                "upper_bound_wh", "lower_bound_wh",
+            )
+        )
+
+        # Match by minute key
+        def _minute_key(ts):
+            return ts.strftime("%Y-%m-%d %H:%M")
+
+        pred_by_minute = {}
+        for p in predictions:
+            pred_by_minute[_minute_key(p["timestamp"])] = p
+
+        data = []
+        for r in relays:
+            ts_key = _minute_key(r["timestamp"])
+            pred = pred_by_minute.get(ts_key)
+
+            data.append({
+                "timestamp": tz.localtime(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
+                "temperature": round(r["temperature"], 2) if r["temperature"] is not None else None,
+                "humidity": round(r["humidity"], 2) if r["humidity"] is not None else None,
+                "lux": round(r["lux"], 2) if r["lux"] is not None else None,
+                "occupancy": r["occupancy"] if r["occupancy"] is not None else None,
+                "real time energy": round(r["energy_kw"], 4) if r["energy_kw"] is not None else 0.0,
+                "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if (pred and pred["predicted_energy_wh"] is not None) else 0.0,
+                "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if (pred and pred["lower_bound_wh"] is not None) else 0.0,
+                "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if (pred and pred["upper_bound_wh"] is not None) else 0.0,
+                "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else None,
+                "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else None,
+                "System Mode A,B,C": r["mode"] if r["mode"] else None,
+            })
+
+        return Response(data)

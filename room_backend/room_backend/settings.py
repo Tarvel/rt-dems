@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "corsheaders",
     # Third-party
     "rest_framework",
+    "drf_spectacular",
     # Local
     "energy",
 ]
@@ -111,6 +112,14 @@ REST_FRAMEWORK = {
         "rest_framework.renderers.JSONRenderer",
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Smart Room Energy Management API",
+    "DESCRIPTION": "API for historical sensor telemetry, ML predictions, and automated relay control decisions.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
 }
 
 # ---------------------------------------------------------------------------

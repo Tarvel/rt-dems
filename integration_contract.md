@@ -492,7 +492,7 @@ An array of objects matching the CSV export format:
     "humidity": 59.35,
     "lux": 4.31,
     "occupancy": 0,
-    "real time energy": 0.0,
+    "real time energy": 5.4312,
     "predicted_energy_8lags": 8.3843,
     "predicted_energy_lower_8lags": 6.3266,
     "predicted_energy_upper_8lags": 10.442,

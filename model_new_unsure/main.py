@@ -378,6 +378,7 @@ def run_prediction(temperature, humidity, lux, occupancy, energy_value,
     residual_pred = float(xgb_residual.predict(X_current)[0])
 
     final_pred = tegru_pred + (alpha * residual_pred) + beta
+    print(f"[PREDICT] tegru={tegru_pred:.4f} residual={residual_pred:.4f} alpha={alpha:.4f} beta={beta:.4f} final={final_pred:.4f}")
     final_pred = max(0.0, float(final_pred))
 
     # Zero-occupancy rule

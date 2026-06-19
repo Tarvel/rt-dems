@@ -173,8 +173,16 @@ print(f"[{'OK' if PREDICTION_READY else 'WARN'}] Assets — "
       f"model:{MODEL_READY}  csv:{CSV_READY}")
 
 # =============================================================================
-# ROLLING BUFFER (live sensor + energy history)
+# 5-MINUTE SENSOR ACCUMULATOR  →  ROLLING BUFFER
 # =============================================================================
+# Live MQTT data arrives every ~2 s, but the model was trained on 5-minute
+# averaged intervals.  We accumulate readings for 300 s, average them, and
+# only then push one entry into the rolling buffer.  This keeps lag features
+# at the correct time scale: lag1 = 5 min ago, lag12 = 60 min ago, etc.
+FLUSH_INTERVAL_SECONDS = 300
+_sensor_accumulator: list[dict] = []
+_last_buffer_flush: float = 0.0
+
 # Each entry: {timestamp, temperature, humidity, lux, occupancy, energy}
 history_buffer = deque(maxlen=BUFFER_SIZE)
 buffer_lock = threading.Lock()
@@ -201,7 +209,7 @@ _seed_buffer_from_csv()
 
 
 def add_to_buffer(temperature, humidity, lux, occupancy, energy, timestamp=None):
-    """Add a new reading to the rolling buffer."""
+    """Add an averaged 5-minute reading to the rolling buffer."""
     if timestamp is None:
         timestamp = pd.Timestamp.now()
     elif isinstance(timestamp, str):
@@ -215,7 +223,7 @@ def add_to_buffer(temperature, humidity, lux, occupancy, energy, timestamp=None)
             "temperature": float(temperature),
             "humidity": float(humidity),
             "lux": float(lux),
-            "occupancy": int(occupancy),
+            "occupancy": float(occupancy),
             "energy": float(energy),
         })
 
@@ -411,24 +419,66 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_mqtt_message(client, userdata, msg):
-    """MQTT auto-prediction DISABLED.
-    Predictions are driven by the rule engine via HTTP POST /predict.
-    We only listen to room/sensors to populate the energy buffer.
+    """Accumulate sensor readings and flush one 5-minute averaged entry
+    to the rolling buffer every FLUSH_INTERVAL_SECONDS.
+
+    The model was trained on 5-minute interval data.  Pushing every
+    ~2 s MQTT message directly into the buffer would shrink lag1 from
+    "5 min ago" to "2 s ago", breaking every lag/rolling/trend feature.
+    Accumulating and flushing at the training cadence fixes this.
     """
+    global _last_buffer_flush
     try:
         payload = json.loads(msg.payload.decode("utf-8", errors="replace"))
-        energy_val = float(payload.get("energy_kw", 0.0))
-        add_to_buffer(
-            temperature=float(payload.get("temperature_c", payload.get("temperature", 25.0))),
-            humidity=float(payload.get("humidity", 50.0)),
-            lux=float(payload.get("lux", 0.0)),
-            occupancy=int(payload.get("occupancy", 0)),
-            energy=energy_val,
-            timestamp=payload.get("timestamp"),
-        )
+        _sensor_accumulator.append({
+            "temperature": float(payload.get("temperature_c", payload.get("temperature", 25.0))),
+            "humidity": float(payload.get("humidity", 50.0)),
+            "lux": float(payload.get("lux", 0.0)),
+            "occupancy": int(payload.get("occupancy", 0)),
+            "energy": float(payload.get("energy_kw", 0.0)),
+            "timestamp": payload.get("timestamp"),
+        })
     except Exception as exc:
-        print(f"[WARN] MQTT buffer update failed: {exc} — "
+        print(f"[WARN] MQTT sensor parse failed: {exc} — "
               f"payload preview: {str(msg.payload)[:200]}")
+        return
+
+    now = _time_mod.monotonic()
+    if now - _last_buffer_flush < FLUSH_INTERVAL_SECONDS:
+        return  # still accumulating
+
+    if not _sensor_accumulator:
+        return
+
+    n = len(_sensor_accumulator)
+    avg_temp = sum(r["temperature"] for r in _sensor_accumulator) / n
+    avg_hum  = sum(r["humidity"]    for r in _sensor_accumulator) / n
+    avg_lux  = sum(r["lux"]         for r in _sensor_accumulator) / n
+    avg_occ  = sum(r["occupancy"]   for r in _sensor_accumulator) / n
+    
+    # Calculate the average 1-minute energy and scale it to the 5-minute flush interval.
+    # r["energy"] is the 1-minute sliding window energy (E_wh) published by the hardware bridge.
+    # The average of these over the window represents average Wh per minute.
+    # Multiplying by (FLUSH_INTERVAL_SECONDS / 60.0) gives the total Wh consumed in this 5-minute interval.
+    interval_energy = (sum(r["energy"] for r in _sensor_accumulator) / n) * (FLUSH_INTERVAL_SECONDS / 60.0)
+    ts = _sensor_accumulator[-1]["timestamp"]
+
+    add_to_buffer(
+        temperature=avg_temp,
+        humidity=avg_hum,
+        lux=avg_lux,
+        occupancy=avg_occ,
+        energy=interval_energy,
+        timestamp=ts,
+    )
+
+    print(f"[BUFFER] Flushed 5-min avg ({n} readings): "
+          f"temp={avg_temp:.1f}°C  hum={avg_hum:.1f}%  lux={avg_lux:.1f}  "
+          f"occ={avg_occ:.2f}  energy={interval_energy:.4f} Wh  "
+          f"(buffer: {len(history_buffer)}/{BUFFER_SIZE})")
+
+    _sensor_accumulator.clear()
+    _last_buffer_flush = now
 
 
 def start_mqtt_bridge():

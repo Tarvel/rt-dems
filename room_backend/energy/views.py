@@ -228,7 +228,7 @@ class CSVDownloadView(APIView):
         # snapshot), enriched with the closest ML prediction
         fieldnames = [
             "timestamp", "temperature", "humidity", "lux", "occupancy",
-            "real time energy", "predicted_energy_8lags", 
+            "real time energy", "real time energy (5-min)", "predicted_energy_8lags", 
             "predicted_energy_lower_8lags", "predicted_energy_upper_8lags",
             "Battery Voltage", "Battery Percentage", "System Mode A,B,C",
         ]
@@ -245,6 +245,7 @@ class CSVDownloadView(APIView):
                 "lux": round(r["lux"], 2) if r["lux"] is not None else "",
                 "occupancy": r["occupancy"] if r["occupancy"] is not None else "",
                 "real time energy": round(r["energy_kw"], 4) if r["energy_kw"] is not None else "",
+                "real time energy (5-min)": round(r["energy_kw"] * 5, 4) if r["energy_kw"] is not None else "",
                 "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if pred else "",
                 "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if pred else "",
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if pred else "",
@@ -329,6 +330,7 @@ class AnalyticsView(APIView):
                 "lux": round(r["lux"], 2) if r["lux"] is not None else None,
                 "occupancy": r["occupancy"] if r["occupancy"] is not None else None,
                 "real time energy": round(r["energy_kw"], 4) if r["energy_kw"] is not None else 0.0,
+                "real time energy (5-min)": round(r["energy_kw"] * 5, 4) if r["energy_kw"] is not None else 0.0,
                 "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if (pred and pred["predicted_energy_wh"] is not None) else 0.0,
                 "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if (pred and pred["lower_bound_wh"] is not None) else 0.0,
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if (pred and pred["upper_bound_wh"] is not None) else 0.0,

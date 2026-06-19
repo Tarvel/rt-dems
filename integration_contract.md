@@ -319,7 +319,7 @@ Returns a CSV file with sensor readings, predictions, and relay decisions aligne
 **CSV columns:**
 
 ```
-timestamp, temperature, humidity, lux, occupancy, real time energy, predicted_energy_8lags, predicted_energy_lower_8lags, predicted_energy_upper_8lags, Battery Voltage, Battery Percentage, System Mode A,B,C
+timestamp, temperature, humidity, lux, occupancy, real time energy, real time energy (5-min), predicted_energy_8lags, predicted_energy_lower_8lags, predicted_energy_upper_8lags, Battery Voltage, Battery Percentage, System Mode A,B,C
 ```
 
 ## 9. ML HTTP Endpoints
@@ -493,6 +493,7 @@ An array of objects matching the CSV export format:
     "lux": 4.31,
     "occupancy": 0,
     "real time energy": 5.4312,
+    "real time energy (5-min)": 27.156,
     "predicted_energy_8lags": 8.3843,
     "predicted_energy_lower_8lags": 6.3266,
     "predicted_energy_upper_8lags": 10.442,

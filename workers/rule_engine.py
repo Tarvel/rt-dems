@@ -659,9 +659,9 @@ def _run_continuous_prediction(client: mqtt.Client) -> None:
             "lux": float(latest_sensor.get("lux", 0.0)),
             "occupancy": int(latest_sensor.get("occupancy", 0)),
             "battery_level": latest_sensor.get("battery_level", 0),
-            "energy_kw": float(latest_sensor.get("energy_kw", latest_sensor.get("energy", 0.0))),
+            # "energy_kw": float(latest_sensor.get("energy_kw", latest_sensor.get("energy", 0.0))),
             "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
-        }
+        }wh
 
     ml_result = _fetch_prediction(sensor_snapshot)
     if ml_result:

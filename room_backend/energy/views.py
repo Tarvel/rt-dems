@@ -219,7 +219,7 @@ class CSVDownloadView(APIView):
             )
         )
 
-        # Match each relay state with the first prediction flushed at/after it (with 30s skew tolerance)
+        # Match each relay state with the first prediction flushed at/after it (with 200ms skew tolerance)
         pred_idx = 0
         num_preds = len(predictions)
 
@@ -235,7 +235,7 @@ class CSVDownloadView(APIView):
         rows = []
         for r in relays:
             r_ts = r["timestamp"]
-            target_ts = r_ts - timedelta(seconds=30)
+            target_ts = r_ts - timedelta(milliseconds=200)
             
             # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
             pred = None
@@ -319,14 +319,14 @@ class AnalyticsView(APIView):
             )
         )
 
-        # Match each relay state with the first prediction flushed at/after it (with 30s skew tolerance)
+        # Match each relay state with the first prediction flushed at/after it (with 200ms skew tolerance)
         pred_idx = 0
         num_preds = len(predictions)
 
         data = []
         for r in relays:
             r_ts = r["timestamp"]
-            target_ts = r_ts - timedelta(seconds=30)
+            target_ts = r_ts - timedelta(milliseconds=200)
             
             # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
             pred = None

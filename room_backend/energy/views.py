@@ -235,7 +235,7 @@ class CSVDownloadView(APIView):
         rows = []
         for r in relays:
             r_ts = r["timestamp"]
-            target_ts = r_ts - timedelta(milliseconds=200)
+            target_ts = r_ts
             
             # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
             pred = None
@@ -326,7 +326,7 @@ class AnalyticsView(APIView):
         data = []
         for r in relays:
             r_ts = r["timestamp"]
-            target_ts = r_ts - timedelta(milliseconds=200)
+            target_ts = r_ts
             
             # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
             pred = None

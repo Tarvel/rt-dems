@@ -208,7 +208,10 @@ class CSVDownloadView(APIView):
         )
 
         predictions = list(
-            MLPrediction.objects.filter(timestamp__gte=start, timestamp__lte=end)
+            MLPrediction.objects.filter(
+                timestamp__gte=start - timedelta(minutes=6),
+                timestamp__lte=end + timedelta(minutes=6)
+            )
             .order_by("timestamp")
             .values(
                 "timestamp", "predicted_energy_wh",
@@ -216,13 +219,9 @@ class CSVDownloadView(APIView):
             )
         )
 
-        # Build lookup dict for predictions (keyed by minute)
-        def _minute_key(ts):
-            return ts.strftime("%Y-%m-%d %H:%M")
-
-        pred_by_minute = {}
-        for p in predictions:
-            pred_by_minute[_minute_key(p["timestamp"])] = p
+        # Match each relay state with the first prediction flushed at/after it (with 30s skew tolerance)
+        pred_idx = 0
+        num_preds = len(predictions)
 
         # Build rows — one per relay decision (which contains the sensor
         # snapshot), enriched with the closest ML prediction
@@ -235,8 +234,18 @@ class CSVDownloadView(APIView):
 
         rows = []
         for r in relays:
-            ts_key = _minute_key(r["timestamp"])
-            pred = pred_by_minute.get(ts_key)
+            r_ts = r["timestamp"]
+            target_ts = r_ts - timedelta(seconds=30)
+            
+            # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
+            pred = None
+            for idx in range(pred_idx, num_preds):
+                p = predictions[idx]
+                if p["timestamp"] >= target_ts:
+                    if p["timestamp"] <= r_ts + timedelta(minutes=6):
+                        pred = p
+                    pred_idx = idx  # Start from this prediction next time
+                    break
 
             rows.append({
                 "timestamp": tz.localtime(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
@@ -300,9 +309,9 @@ class AnalyticsView(APIView):
             )
         )
 
-        # Query MLPrediction
+        # Query MLPrediction (start 6 minutes early to catch predictions for the boundary RelayState)
         predictions = list(
-            MLPrediction.objects.filter(timestamp__gte=start)
+            MLPrediction.objects.filter(timestamp__gte=start - timedelta(minutes=6))
             .order_by("timestamp")
             .values(
                 "timestamp", "predicted_energy_wh",
@@ -310,18 +319,24 @@ class AnalyticsView(APIView):
             )
         )
 
-        # Match by minute key
-        def _minute_key(ts):
-            return ts.strftime("%Y-%m-%d %H:%M")
-
-        pred_by_minute = {}
-        for p in predictions:
-            pred_by_minute[_minute_key(p["timestamp"])] = p
+        # Match each relay state with the first prediction flushed at/after it (with 30s skew tolerance)
+        pred_idx = 0
+        num_preds = len(predictions)
 
         data = []
         for r in relays:
-            ts_key = _minute_key(r["timestamp"])
-            pred = pred_by_minute.get(ts_key)
+            r_ts = r["timestamp"]
+            target_ts = r_ts - timedelta(seconds=30)
+            
+            # Find the first prediction flushed at/after target_ts, up to 6 minutes in the future
+            pred = None
+            for idx in range(pred_idx, num_preds):
+                p = predictions[idx]
+                if p["timestamp"] >= target_ts:
+                    if p["timestamp"] <= r_ts + timedelta(minutes=6):
+                        pred = p
+                    pred_idx = idx  # Start from this prediction next time
+                    break
 
             data.append({
                 "timestamp": tz.localtime(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),

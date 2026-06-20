@@ -10,14 +10,16 @@ for LIGHT_ML_MODEL/main.py with the same API contract.
 Data flow:
     Rule Engine  →  POST /predict  →  this service  →  JSON response
 
-The model needs a history buffer (≥50 rows) of sensor + energy readings
-to compute lag/rolling/trend features.  On cold start the CSV provides
-the initial context; live data from Group 1 gradually replaces it.
+This version reads the sequence history directly from the SQLite database
+(energy_relaystate table) on every prediction request, falling back to the
+static CSV seed data. This makes the service stateless, clock-resilient, and
+immune to RAM buffer resets during Pi restarts/reboots.
 """
 
 import os
 import sys
 import json
+import sqlite3
 import threading
 import warnings
 import time as _time_mod
@@ -65,28 +67,8 @@ ENERGY_UNIT = os.environ.get("ENERGY_UNIT", "Wh")
 # Buffer size: need ≥50 rows for rolling12 + window8 + safety margin
 BUFFER_SIZE = int(os.environ.get("BUFFER_SIZE", 60))
 
-# MQTT (optional bridge)
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT   = int(os.environ.get("MQTT_PORT", 1883))
-TOPIC_SENSORS    = "room/sensors"
-TOPIC_PREDICTION = "room/ml/predictions"
-
 PEAK_DEMAND_KW = float(os.environ.get("PEAK_DEMAND_KW", 5.0))
 
-# =============================================================================
-# MQTT CLIENT (optional)
-# =============================================================================
-MQTT_AVAILABLE = False
-mqtt_client = None
-try:
-    import paho.mqtt.client as paho_mqtt
-    mqtt_client = paho_mqtt.Client(
-        client_id="tegru-xgb-mh-service",
-        callback_api_version=paho_mqtt.CallbackAPIVersion.VERSION2,
-    )
-    MQTT_AVAILABLE = True
-except Exception:
-    pass
 
 # =============================================================================
 # CUSTOM CLASS (must be defined BEFORE joblib.load)
@@ -167,69 +149,104 @@ try:
 except Exception as exc:
     print(f"  [WARN] CSV load failed: {exc}")
 
-PREDICTION_READY = MODEL_READY  # CSV is optional (nice-to-have for cold start)
+PREDICTION_READY = MODEL_READY
 
 print(f"[{'OK' if PREDICTION_READY else 'WARN'}] Assets — "
       f"model:{MODEL_READY}  csv:{CSV_READY}")
 
-# =============================================================================
-# 5-MINUTE SENSOR ACCUMULATOR  →  ROLLING BUFFER
-# =============================================================================
-# Live MQTT data arrives every ~2 s, but the model was trained on 5-minute
-# averaged intervals.  We accumulate readings for 300 s, average them, and
-# only then push one entry into the rolling buffer.  This keeps lag features
-# at the correct time scale: lag1 = 5 min ago, lag12 = 60 min ago, etc.
-FLUSH_INTERVAL_SECONDS = 300
-_sensor_accumulator: list[dict] = []
-_last_buffer_flush: float = 0.0
-
-# Each entry: {timestamp, temperature, humidity, lux, occupancy, energy}
-history_buffer = deque(maxlen=BUFFER_SIZE)
-buffer_lock = threading.Lock()
-
-
-def _seed_buffer_from_csv():
-    """Seed the rolling buffer with the last BUFFER_SIZE rows from CSV."""
-    if df_csv.empty:
-        return
-    seed = df_csv.tail(BUFFER_SIZE)
-    for _, row in seed.iterrows():
-        history_buffer.append({
-            "timestamp": row["timestamp"],
-            "temperature": float(row.get("temperature", 25.0)),
-            "humidity": float(row.get("humidity", 50.0)),
-            "lux": float(row.get("lux", 0.0)),
-            "occupancy": int(row.get("occupancy", 0)),
-            "energy": float(row.get(ENERGY_COL, 0.0)),
-        })
-    print(f"  Buffer seeded from CSV: {len(history_buffer)} rows")
-
-
-_seed_buffer_from_csv()
-
-
-def add_to_buffer(temperature, humidity, lux, occupancy, energy, timestamp=None):
-    """Add an averaged 5-minute reading to the rolling buffer."""
-    if timestamp is None:
-        timestamp = pd.Timestamp.now()
-    elif isinstance(timestamp, str):
-        timestamp = pd.Timestamp(timestamp)
-    if timestamp.tzinfo is not None:
-        timestamp = timestamp.tz_localize(None)
-
-    with buffer_lock:
-        history_buffer.append({
-            "timestamp": timestamp,
-            "temperature": float(temperature),
-            "humidity": float(humidity),
-            "lux": float(lux),
-            "occupancy": float(occupancy),
-            "energy": float(energy),
-        })
-
 
 # =============================================================================
-# FEATURE ENGINEERING (exact port from applastvalues.py)
+# DATABASE HISTORY RETRIEVAL
+# =============================================================================
+def get_history_from_db_or_csv() -> list[dict]:
+    """Retrieve the last BUFFER_SIZE rows from SQLite database (energy_relaystate)
+    and scale 1-min energy_kw to 5-min Wh. Pad using CSV if DB has fewer rows.
+    """
+    db_path = PROJECT_ROOT / "room_backend" / "db.sqlite3"
+    db_history = []
+    success = False
+    
+    if db_path.exists():
+        try:
+            # Query the database with a short timeout to prevent lockups
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            cursor = conn.cursor()
+            
+            # Check if target table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='energy_relaystate'")
+            if cursor.fetchone():
+                cursor.execute("""
+                    SELECT timestamp, temperature, humidity, lux, occupancy, energy_kw
+                    FROM (
+                        SELECT id, timestamp, temperature, humidity, lux, occupancy, energy_kw
+                        FROM energy_relaystate
+                        ORDER BY id DESC
+                        LIMIT 60
+                    )
+                    ORDER BY id ASC
+                """)
+                rows = cursor.fetchall()
+                for row in rows:
+                    ts_str, temp, hum, lux_val, occ, energy_kw = row
+                    
+                    try:
+                        timestamp = pd.Timestamp(ts_str)
+                        if timestamp.tzinfo is not None:
+                            timestamp = timestamp.tz_localize(None)
+                    except Exception:
+                        timestamp = pd.Timestamp.now()
+                        
+                    db_history.append({
+                        "timestamp": timestamp,
+                        "temperature": float(temp) if temp is not None else 25.0,
+                        "humidity": float(hum) if hum is not None else 50.0,
+                        "lux": float(lux_val) if lux_val is not None else 0.0,
+                        "occupancy": int(occ) if occ is not None else 0,
+                        # Scale 1-min Wh to 5-min Wh
+                        "energy": float(energy_kw) * 5.0 if energy_kw is not None else 11.6,
+                    })
+                success = True
+            conn.close()
+        except Exception as exc:
+            print(f"[WARN] Failed to read history from DB: {exc}. Falling back to CSV.")
+            
+    # Pad with CSV if we don't have enough DB entries
+    if success and len(db_history) >= BUFFER_SIZE:
+        return db_history
+    else:
+        pad_size = BUFFER_SIZE - len(db_history)
+        csv_rows = []
+        if CSV_READY and not df_csv.empty:
+            seed = df_csv.tail(pad_size)
+            for _, row in seed.iterrows():
+                ts = row["timestamp"]
+                if isinstance(ts, str):
+                    ts = pd.Timestamp(ts)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_localize(None)
+                csv_rows.append({
+                    "timestamp": ts,
+                    "temperature": float(row.get("temperature", 25.0)),
+                    "humidity": float(row.get("humidity", 50.0)),
+                    "lux": float(row.get("lux", 0.0)),
+                    "occupancy": int(row.get("occupancy", 0)),
+                    "energy": float(row.get(ENERGY_COL, 0.0)),
+                })
+        # If still not enough (e.g. cold start with empty DB and missing CSV), fill defaults
+        while len(csv_rows) < pad_size:
+            csv_rows.append({
+                "timestamp": pd.Timestamp.now(),
+                "temperature": 25.0,
+                "humidity": 50.0,
+                "lux": 0.0,
+                "occupancy": 0,
+                "energy": 11.6,
+            })
+        return csv_rows + db_history
+
+
+# =============================================================================
+# FEATURE ENGINEERING
 # =============================================================================
 def engineer_features(df):
     """Compute all features the model expects."""
@@ -248,17 +265,21 @@ def engineer_features(df):
 
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    df["minute_sin"] = np.sin(2 * np.pi * df["minute"] / 60)
+    df["minute_cos"] = np.cos(2 * np.pi * df["minute"] / 60)
+    df["dayofweek_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
+    df["dayofweek_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
     df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
-    # Interaction features
+    # Cross features
     df["temp_x_humidity"] = df["temperature"] * df["humidity"]
     df["temp_x_occupancy"] = df["temperature"] * df["occupancy"]
     df["humidity_x_occupancy"] = df["humidity"] * df["occupancy"]
     df["lux_x_occupancy"] = df["lux"] * df["occupancy"]
     df["hour_x_occupancy"] = df["hour"] * df["occupancy"]
 
-    # Energy lag features (computed from both aliases)
+    # Energy lag features
     for ecol in [ENERGY_COL, "real time energy"]:
         prefix = "energy" if ecol == ENERGY_COL else "real time energy"
         df[f"{prefix}_lag1"] = df[ecol].shift(1)
@@ -294,15 +315,10 @@ def engineer_features(df):
 # =============================================================================
 # PREDICTION
 # =============================================================================
-def run_prediction(temperature, humidity, lux, occupancy, energy_value,
-                   timestamp=None):
-    """Build features from buffer + current reading, run model, return result."""
+def run_prediction(temperature, humidity, lux, occupancy, buf_list, timestamp=None):
+    """Build features from DB history + current reading, run model, return result."""
     if not MODEL_READY:
         raise HTTPException(503, "Model not loaded")
-
-    # 1. Snapshot the buffer
-    with buffer_lock:
-        buf_list = list(history_buffer)
 
     if len(buf_list) < 12:
         raise HTTPException(503,
@@ -409,124 +425,14 @@ def run_prediction(temperature, humidity, lux, occupancy, energy_value,
 
 
 # =============================================================================
-# MQTT BRIDGE (passive — HTTP-only mode)
-# =============================================================================
-def on_mqtt_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        client.subscribe(TOPIC_SENSORS, qos=1)
-        print(f"[OK] MQTT connected — subscribed to '{TOPIC_SENSORS}'")
-    else:
-        print(f"[ERROR] MQTT connection failed (rc={rc})")
-
-
-def on_mqtt_message(client, userdata, msg):
-    """Accumulate sensor readings and flush one 5-minute averaged entry
-    to the rolling buffer every FLUSH_INTERVAL_SECONDS.
-
-    The model was trained on 5-minute interval data.  Pushing every
-    ~2 s MQTT message directly into the buffer would shrink lag1 from
-    "5 min ago" to "2 s ago", breaking every lag/rolling/trend feature.
-    Accumulating and flushing at the training cadence fixes this.
-    """
-    global _last_buffer_flush
-    try:
-        payload = json.loads(msg.payload.decode("utf-8", errors="replace"))
-        _sensor_accumulator.append({
-            "temperature": float(payload.get("temperature_c", payload.get("temperature", 25.0))),
-            "humidity": float(payload.get("humidity", 50.0)),
-            "lux": float(payload.get("lux", 0.0)),
-            "occupancy": int(payload.get("occupancy", 0)),
-            "energy": float(payload.get("energy_kw", 0.0)),
-            "timestamp": payload.get("timestamp"),
-        })
-    except Exception as exc:
-        print(f"[WARN] MQTT sensor parse failed: {exc} — "
-              f"payload preview: {str(msg.payload)[:200]}")
-        return
-
-    now = _time_mod.monotonic()
-    if now - _last_buffer_flush < FLUSH_INTERVAL_SECONDS:
-        return  # still accumulating
-
-    if not _sensor_accumulator:
-        return
-
-    n = len(_sensor_accumulator)
-    avg_temp = sum(r["temperature"] for r in _sensor_accumulator) / n
-    avg_hum  = sum(r["humidity"]    for r in _sensor_accumulator) / n
-    avg_lux  = sum(r["lux"]         for r in _sensor_accumulator) / n
-    avg_occ  = sum(r["occupancy"]   for r in _sensor_accumulator) / n
-    
-    # Calculate the average 1-minute energy and scale it to the 5-minute flush interval.
-    # r["energy"] is the 1-minute sliding window energy (E_wh) published by the hardware bridge.
-    # The average of these over the window represents average Wh per minute.
-    # Multiplying by (FLUSH_INTERVAL_SECONDS / 60.0) gives the total Wh consumed in this 5-minute interval.
-    interval_energy = (sum(r["energy"] for r in _sensor_accumulator) / n) * (FLUSH_INTERVAL_SECONDS / 60.0)
-    ts = _sensor_accumulator[-1]["timestamp"]
-
-    add_to_buffer(
-        temperature=avg_temp,
-        humidity=avg_hum,
-        lux=avg_lux,
-        occupancy=avg_occ,
-        energy=interval_energy,
-        timestamp=ts,
-    )
-
-    print(f"[BUFFER] Flushed 5-min avg ({n} readings): "
-          f"temp={avg_temp:.1f}°C  hum={avg_hum:.1f}%  lux={avg_lux:.1f}  "
-          f"occ={avg_occ:.2f}  energy={interval_energy:.4f} Wh  "
-          f"(buffer: {len(history_buffer)}/{BUFFER_SIZE})")
-
-    _sensor_accumulator.clear()
-    _last_buffer_flush = now
-
-
-def start_mqtt_bridge():
-    if not MQTT_AVAILABLE or mqtt_client is None:
-        print("[WARN] paho-mqtt not installed — MQTT bridge disabled.")
-        return
-
-    mqtt_client.on_connect = on_mqtt_connect
-    mqtt_client.on_message = on_mqtt_message
-    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
-
-    def _connect():
-        while True:
-            try:
-                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-                mqtt_client.loop_start()
-                print(f"MQTT bridge started → {MQTT_BROKER}:{MQTT_PORT}")
-                return
-            except Exception as exc:
-                print(f"[WARN] MQTT broker unreachable ({exc}) — retrying in 5s…")
-                _time_mod.sleep(5)
-
-    threading.Thread(target=_connect, daemon=True).start()
-
-
-# =============================================================================
 # FASTAPI APP
 # =============================================================================
-@asynccontextmanager
-async def lifespan(app_instance: FastAPI):
-    start_mqtt_bridge()
-    yield
-    if mqtt_client:
-        try:
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
-        except Exception:
-            pass
-
-
 app = FastAPI(
-    title="Smart Grid Hybrid AI — TE-GRU + XGBoost + MH",
+    title="Smart Grid Hybrid AI — TE-GRU + XGBoost + MH (Database-Backed)",
     description=(
         "Hybrid energy prediction: TE-GRU sequence model + XGBoost "
         "residual correction + Metropolis-Hastings Bayesian calibration."
     ),
-    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -557,16 +463,15 @@ def predict_manual(sensor: SensorInput):
     """Accept live sensor values and return an energy prediction."""
     _ensure_ready()
 
-    # Get the latest energy value from buffer (for current row's energy context)
-    with buffer_lock:
-        latest_energy = history_buffer[-1]["energy"] if history_buffer else 0.0
+    # Load history dynamically from database (or CSV fallback)
+    buf_list = get_history_from_db_or_csv()
 
     result = run_prediction(
         temperature=sensor.temperature_c,
         humidity=sensor.humidity,
         lux=sensor.lux,
         occupancy=sensor.occupancy,
-        energy_value=latest_energy,
+        buf_list=buf_list,
         timestamp=sensor.datetime_str,
     )
 
@@ -582,18 +487,18 @@ def predict_manual(sensor: SensorInput):
         "peak_demand":              PEAK_DEMAND_KW,
         "buffer_size":              result["buffer_size"],
         "timestamp":                datetime.now(timezone.utc).isoformat(),
-        "source":                   "fastapi-tegru-xgb-mh",
+        "source":                   "fastapi-tegru-xgb-mh-db",
     }
 
 
 @app.get("/metadata")
 def metadata():
-    with buffer_lock:
-        buf_len = len(history_buffer)
-        latest_energy = history_buffer[-1]["energy"] if history_buffer else None
+    buf_list = get_history_from_db_or_csv()
+    buf_len = len(buf_list)
+    latest_energy = buf_list[-1]["energy"] if buf_list else None
 
     return {
-        "model":            "TE-GRU + XGBoost + MH Bayesian Residual",
+        "model":            "TE-GRU + XGBoost + MH Bayesian Residual (Database-Backed)",
         "model_ready":      MODEL_READY,
         "csv_ready":        CSV_READY,
         "prediction_ready": PREDICTION_READY,
@@ -613,7 +518,7 @@ def metadata():
 
 @app.get("/")
 def root():
-    return {"status": "running", "model": "TE-GRU + XGBoost + MH"}
+    return {"status": "running", "model": "TE-GRU + XGBoost + MH (Database-Backed)"}
 
 
 # =============================================================================

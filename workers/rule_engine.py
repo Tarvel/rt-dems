@@ -531,19 +531,17 @@ def run_evaluation(client: mqtt.Client) -> None:
             log.info("Evaluation: No sensor data yet — skipping.")
             return
 
-    # Use the latest continuous prediction if available, otherwise fetch fresh.
+    # Fetch fresh prediction on each evaluation cycle.
     with state_lock:
         # Use real-time reading for logging in the decision box
         decision_sensor = dict(latest_sensor)
-        if not latest_ml:
-            sensor_snapshot = decision_sensor
+        sensor_snapshot = decision_sensor
 
-    if not latest_ml:
-        ml_result = _fetch_prediction(sensor_snapshot)
-        if ml_result:
-            with state_lock:
-                latest_ml.clear()
-                latest_ml.update(ml_result)
+    ml_result = _fetch_prediction(sensor_snapshot)
+    if ml_result:
+        with state_lock:
+            latest_ml.clear()
+            latest_ml.update(ml_result)
 
     # Publish prediction to MQTT at decision time (dashboard only sees this)
     with state_lock:
@@ -661,7 +659,7 @@ def _run_continuous_prediction(client: mqtt.Client) -> None:
             "battery_level": latest_sensor.get("battery_level", 0),
             # "energy_kw": float(latest_sensor.get("energy_kw", latest_sensor.get("energy", 0.0))),
             "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
-        }wh
+        }
 
     ml_result = _fetch_prediction(sensor_snapshot)
     if ml_result:
@@ -835,9 +833,9 @@ def on_message(client, userdata, msg):
 
             log.debug("Updated latest sensor data (buffer: %d readings)", len(sensor_buffer))
 
-    # Run continuous prediction outside the lock (Group 2 real-time stage)
-    if msg.topic == TOPIC_SENSORS:
-        _run_continuous_prediction(client)
+    # Run continuous prediction disabled to avoid log spamming.
+    # if msg.topic == TOPIC_SENSORS:
+    #     _run_continuous_prediction(client)
 
 
 def on_disconnect(client, userdata, *args, **kwargs):

@@ -274,6 +274,10 @@ def engineer_features(df):
 
     # Cross features
     df["temp_x_humidity"] = df["temperature"] * df["humidity"]
+    df["temp_x_occupancy"] = df["temperature"] * df["occupancy"]
+    df["humidity_x_occupancy"] = df["humidity"] * df["occupancy"]
+    df["lux_x_occupancy"] = df["lux"] * df["occupancy"]
+    df["hour_x_occupancy"] = df["hour"] * df["occupancy"]
 
     # Energy lag features
     for ecol in [ENERGY_COL, "real time energy"]:

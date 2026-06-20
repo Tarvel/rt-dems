@@ -328,13 +328,15 @@ def evaluate_rules() -> tuple[str, str]:
     occupancy = latest_sensor.get("occupancy")
     battery_level = latest_sensor.get("battery_level", 100.0)
 
-    # Resolve predicted energy (EDFI) from ML payload
-    predicted_energy = latest_ml.get("predicted_energy_wh")
+    # Resolve predicted energy (Upper Bound) from ML payload for decision making
+    predicted_energy = latest_ml.get("upper_bound_energy_wh")
+    if predicted_energy is None:
+        # Fallback to standard predicted energy if upper bound is missing
+        predicted_energy = latest_ml.get("predicted_energy_wh")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_kw")
     if predicted_energy is None:
         predicted_energy = latest_ml.get("predicted_energy_range")
-
 
     if predicted_energy is None:
         return current_mode, (

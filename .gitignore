@@ -27,8 +27,7 @@ __pycache__/
 *.sln
 *.suo
 
-# Antigravity/Gemini
-.gemini/
+
 brain/
 *.log
 

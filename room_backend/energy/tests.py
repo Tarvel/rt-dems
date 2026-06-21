@@ -29,7 +29,8 @@ class EnergyAlignmentTestCase(TestCase):
             mode="B",
             relay_1=1, relay_2=1, relay_3=0,
             temperature=25.0, humidity=50.0, lux=100.0, occupancy=2,
-            energy_kw=1.0, battery_level=80.0, battery_voltage=24.0
+            energy_kw=1.0, battery_level=80.0, battery_voltage=24.0,
+            reason="MODERATE LOAD (EDFI 19.34, 10.0 <= x < 25.0); battery_stable(60%) = True (T-now=100.0%, T-1=100.0%, T-2=100.0%) → Smart B"
         )
         RelayState.objects.filter(pk=r1.pk).update(timestamp=base_time + timedelta(seconds=10))
         
@@ -37,7 +38,8 @@ class EnergyAlignmentTestCase(TestCase):
             mode="B",
             relay_1=1, relay_2=1, relay_3=0,
             temperature=25.5, humidity=51.0, lux=95.0, occupancy=2,
-            energy_kw=1.1, battery_level=79.5, battery_voltage=24.0
+            energy_kw=1.1, battery_level=79.5, battery_voltage=24.0,
+            reason="Step 2 — Predicted 0.2961kW < peak demand 2.4kW; Battery 61.1% >= 60%, lag NOT stable (lag drop=26.90% (threshold=8.0% nighttime), T-now=61.1% T-1=65.4% T-2=88.0%) → Mode C"
         )
         RelayState.objects.filter(pk=r2.pk).update(timestamp=base_time + timedelta(minutes=3, seconds=10))
         
@@ -45,7 +47,8 @@ class EnergyAlignmentTestCase(TestCase):
             mode="A",
             relay_1=1, relay_2=1, relay_3=1,
             temperature=26.0, humidity=52.0, lux=90.0, occupancy=3,
-            energy_kw=1.2, battery_level=79.0, battery_voltage=23.9
+            energy_kw=1.2, battery_level=79.0, battery_voltage=23.9,
+            reason="Step 2 — Predicted 0.2911kW < peak demand 2.4kW; Battery 65.4% >= 60%, lag stable (lag window not full yet (treated as stable)) → Mode B"
         )
         RelayState.objects.filter(pk=r3.pk).update(timestamp=base_time + timedelta(minutes=6, seconds=10))
         
@@ -53,7 +56,8 @@ class EnergyAlignmentTestCase(TestCase):
             mode="A",
             relay_1=1, relay_2=1, relay_3=1,
             temperature=26.5, humidity=53.0, lux=85.0, occupancy=3,
-            energy_kw=1.3, battery_level=78.5, battery_voltage=23.9
+            energy_kw=1.3, battery_level=78.5, battery_voltage=23.9,
+            reason="Step 1 — Predicted 2.4819kW >= peak demand 2.4kW; Battery 21.4% < 50% → Mode C"
         )
         RelayState.objects.filter(pk=r4.pk).update(timestamp=base_time + timedelta(minutes=9, seconds=10))
 
@@ -84,9 +88,11 @@ class EnergyAlignmentTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         
         # Parse CSV output
+        import csv
         content = response.content.decode("utf-8")
-        lines = content.strip().split("\n")
-        self.assertEqual(len(lines), 5)  # Header + 4 data rows
+        reader = csv.reader(content.splitlines())
+        rows = list(reader)
+        self.assertEqual(len(rows), 5)  # Header + 4 data rows
         
         # Check matching results
         # Rows should correspond to r1, r2, r3, r4 in order.
@@ -94,18 +100,11 @@ class EnergyAlignmentTestCase(TestCase):
         # r3 and r4 (logged at 12:06:10 and 12:09:10) should match prediction p2 (70.0 Wh) flushed at 12:10:00.
         
         # Row format: timestamp, temperature, humidity, lux, occupancy, real time energy, real time energy (5-min), predicted_energy_8lags, ...
-        # Columns:
-        # 0: timestamp
-        # 1: temperature
-        # ...
-        # 7: predicted_energy_8lags
-        # 8: predicted_energy_lower_8lags
-        # 9: predicted_energy_upper_8lags
         
-        row1 = lines[1].split(",")
-        row2 = lines[2].split(",")
-        row3 = lines[3].split(",")
-        row4 = lines[4].split(",")
+        row1 = rows[1]
+        row2 = rows[2]
+        row3 = rows[3]
+        row4 = rows[4]
         
         # Check prediction Wh alignment
         self.assertEqual(float(row1[7]), 50.0)
@@ -118,6 +117,12 @@ class EnergyAlignmentTestCase(TestCase):
         self.assertEqual(float(row2[9]), 60.0)
         self.assertEqual(float(row3[9]), 80.0)
         self.assertEqual(float(row4[9]), 80.0)
+
+        # Check battery lag checks parsing
+        self.assertEqual(row1[12], "Stable (T-now=100.0%, T-1=100.0%, T-2=100.0%)")
+        self.assertEqual(row2[12], "Unstable (T-now=61.1%, T-1=65.4%, T-2=88.0%)")
+        self.assertEqual(row3[12], "Stable (Lag window not full)")
+        self.assertEqual(row4[12], "Low Battery (21.4% < 50%)")
 
         # Query Analytics view
         response_analytics = self.client.get("/api/v1/analytics/?days=1")
@@ -141,3 +146,9 @@ class EnergyAlignmentTestCase(TestCase):
         self.assertEqual(matched_data[1]["predicted_energy_8lags"], 50.0)
         self.assertEqual(matched_data[2]["predicted_energy_8lags"], 70.0)
         self.assertEqual(matched_data[3]["predicted_energy_8lags"], 70.0)
+
+        # Check battery lag checks on analytics
+        self.assertEqual(matched_data[0]["Battery Lag Checks"], "Stable (T-now=100.0%, T-1=100.0%, T-2=100.0%)")
+        self.assertEqual(matched_data[1]["Battery Lag Checks"], "Unstable (T-now=61.1%, T-1=65.4%, T-2=88.0%)")
+        self.assertEqual(matched_data[2]["Battery Lag Checks"], "Stable (Lag window not full)")
+        self.assertEqual(matched_data[3]["Battery Lag Checks"], "Low Battery (21.4% < 50%)")

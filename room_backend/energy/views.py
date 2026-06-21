@@ -19,6 +19,52 @@ from .serializers import (
     MLPredictionSerializer,
     RelayStateSerializer,
 )
+import re
+
+def parse_battery_lag_checks(reason: str) -> str:
+    if not reason:
+        return ""
+    
+    # Determine stability status
+    status = None
+    if re.search(r"battery_stable\(\d+%\)\s*=\s*True", reason, re.IGNORECASE) or "lag stable" in reason.lower():
+        status = "Stable"
+    elif re.search(r"battery_stable\(\d+%\)\s*=\s*False", reason, re.IGNORECASE) or "lag not stable" in reason.lower() or "lag unstable" in reason.lower():
+        status = "Unstable"
+    
+    # Extract lags if present
+    t_now_match = re.search(r"T-now=([\d.]+%|--)", reason)
+    t1_match = re.search(r"T-1=([\d.]+%|--)", reason)
+    t2_match = re.search(r"T-2=([\d.]+%|--)", reason)
+    
+    if status:
+        if t_now_match or t1_match or t2_match:
+            parts = []
+            if t_now_match: parts.append(f"T-now={t_now_match.group(1)}")
+            if t1_match: parts.append(f"T-1={t1_match.group(1)}")
+            if t2_match: parts.append(f"T-2={t2_match.group(1)}")
+            return f"{status} ({', '.join(parts)})"
+        
+        if "lag window not full yet" in reason or "treated as stable" in reason:
+            return f"{status} (Lag window not full)"
+            
+        return status
+    
+    # If no status found but lags exist
+    if t_now_match or t1_match or t2_match:
+        parts = []
+        if t_now_match: parts.append(f"T-now={t_now_match.group(1)}")
+        if t1_match: parts.append(f"T-1={t1_match.group(1)}")
+        if t2_match: parts.append(f"T-2={t2_match.group(1)}")
+        return f"Lags: {', '.join(parts)}"
+        
+    # Check for simple battery limit check:
+    limit_match = re.search(r"Battery\s*([\d.]+%\s*[<>]=\s*[\d.]+$|[\d.]+%\s*<\s*\d+%)", reason, re.IGNORECASE)
+    if limit_match:
+        return f"Low Battery ({limit_match.group(1).strip()})"
+        
+    return ""
+
 
 
 # ── Sensor Logs ─────────────────────────────────────────────────────────────
@@ -229,7 +275,7 @@ class CSVDownloadView(APIView):
             "timestamp", "temperature", "humidity", "lux", "occupancy",
             "real time energy", "real time energy (5-min)", "predicted_energy_8lags", 
             "predicted_energy_lower_8lags", "predicted_energy_upper_8lags",
-            "Battery Voltage", "Battery Percentage", "System Mode A,B,C",
+            "Battery Voltage", "Battery Percentage", "Battery Lag Checks", "System Mode A,B,C",
         ]
 
         rows = []
@@ -260,6 +306,7 @@ class CSVDownloadView(APIView):
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if pred else "",
                 "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else "",
                 "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else "",
+                "Battery Lag Checks": parse_battery_lag_checks(r["reason"]),
                 "System Mode A,B,C": r["mode"] if r["mode"] else "",
             })
 
@@ -351,6 +398,7 @@ class AnalyticsView(APIView):
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if (pred and pred["upper_bound_wh"] is not None) else 0.0,
                 "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else None,
                 "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else None,
+                "Battery Lag Checks": parse_battery_lag_checks(r["reason"]),
                 "System Mode A,B,C": r["mode"] if r["mode"] else None,
             })
 

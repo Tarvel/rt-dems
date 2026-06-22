@@ -86,6 +86,12 @@ class RelayState(models.Model):
     battery_level = models.FloatField(help_text="Battery SoC (%) at decision time", default=0.0)
     battery_voltage = models.FloatField(help_text="Battery voltage (V) at decision time", default=0.0)
 
+    # Decision upper bounds and their average
+    upper_bound_1 = models.FloatField(help_text="Most recent (current) upper bound value (Wh)", default=0.0)
+    upper_bound_2 = models.FloatField(help_text="Second most recent upper bound value (Wh)", default=0.0)
+    upper_bound_3 = models.FloatField(help_text="Third most recent upper bound value (Wh)", default=0.0)
+    upper_bound_avg = models.FloatField(help_text="Calculated average of the three upper bound values (Wh)", default=0.0)
+
     class Meta:
         ordering = ["-timestamp"]
         verbose_name = "Relay State"

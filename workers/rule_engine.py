@@ -201,7 +201,11 @@ def ensure_relay_table(conn: sqlite3.Connection) -> None:
             occupancy       INTEGER NOT NULL DEFAULT 0,
             energy_kw       REAL    NOT NULL DEFAULT 0.0,
             battery_level   REAL    NOT NULL DEFAULT 0.0,
-            battery_voltage REAL    NOT NULL DEFAULT 0.0
+            battery_voltage REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_1   REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_2   REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_3   REAL    NOT NULL DEFAULT 0.0,
+            upper_bound_avg REAL    NOT NULL DEFAULT 0.0
         );
         """
     )
@@ -214,6 +218,10 @@ def ensure_relay_table(conn: sqlite3.Connection) -> None:
         ("energy_kw", "REAL DEFAULT 0.0"),
         ("battery_level", "REAL DEFAULT 0.0"),
         ("battery_voltage", "REAL DEFAULT 0.0"),
+        ("upper_bound_1", "REAL DEFAULT 0.0"),
+        ("upper_bound_2", "REAL DEFAULT 0.0"),
+        ("upper_bound_3", "REAL DEFAULT 0.0"),
+        ("upper_bound_avg", "REAL DEFAULT 0.0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE energy_relaystate ADD COLUMN {col} {coltype}")
@@ -222,7 +230,17 @@ def ensure_relay_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
+def log_decision(
+    mode: str,
+    r1: bool,
+    r2: bool,
+    r3: bool,
+    reason: str,
+    ub_1: float = 0.0,
+    ub_2: float = 0.0,
+    ub_3: float = 0.0,
+    ub_avg: float = 0.0,
+) -> None:
     """Write a relay-state decision to the database, including a sensor snapshot."""
     # Grab sensor snapshot under lock
     with state_lock:
@@ -244,8 +262,9 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
             INSERT INTO energy_relaystate
                 (timestamp, mode, relay_1, relay_2, relay_3, reason,
                  temperature, humidity, lux, occupancy,
-                 energy_kw, battery_level, battery_voltage)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 energy_kw, battery_level, battery_voltage,
+                 upper_bound_1, upper_bound_2, upper_bound_3, upper_bound_avg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat().replace("T", " "),
@@ -261,6 +280,10 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
                 snap["energy_kw"],
                 snap["battery_level"],
                 snap["battery_voltage"],
+                ub_1,
+                ub_2,
+                ub_3,
+                ub_avg,
             ),
         )
         conn.commit()
@@ -276,13 +299,15 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
                 "INSERT INTO energy_relaystate "
                 "(mode, relay_1, relay_2, relay_3, reason, "
                 " temperature, humidity, lux, occupancy, energy_kw, "
-                " battery_level, battery_voltage) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " battery_level, battery_voltage, "
+                " upper_bound_1, upper_bound_2, upper_bound_3, upper_bound_avg) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     mode, int(r1), int(r2), int(r3), reason,
                     snap["temperature"], snap["humidity"],
                     snap["lux"], snap["occupancy"], snap["energy_kw"],
                     snap["battery_level"], snap["battery_voltage"],
+                    ub_1, ub_2, ub_3, ub_avg,
                 ),
             )
             conn.commit()
@@ -291,30 +316,51 @@ def log_decision(mode: str, r1: bool, r2: bool, r3: bool, reason: str) -> None:
             log.error("SQLite error logging decision (attempt 2): %s", exc2)
 
 
+def get_recent_upper_bounds(n: int = 2) -> list[float]:
+    """Retrieve the N most recent upper bounds from the database.
+
+    Used to average recent predictions and smooth decision metrics.
+    """
+    bounds = []
+    try:
+        conn = get_db_connection()
+        cur = conn.execute(
+            "SELECT upper_bound_wh FROM energy_mlprediction ORDER BY id DESC LIMIT ?",
+            (n,)
+        )
+        bounds = [float(row[0]) for row in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        log.warning("Failed to query recent upper bounds from DB: %s", exc)
+    return bounds
+
+
 # ---------------------------------------------------------------------------
 # Core Rule Engine
 # ---------------------------------------------------------------------------
-def evaluate_rules() -> tuple[str, str]:
-    """Evaluate the decision pipeline and return (mode, reason).
+def evaluate_rules() -> tuple[str, str, float, float, float, float]:
+    """Evaluate the decision pipeline and return (mode, reason, ub_1, ub_2, ub_3, ub_avg).
 
-    EDFI = predicted energy (Energy Demand Forecast Interval).
+    EDFI = average of the three most recent predicted upper bounds.
     Battery stability = ALL 3 lag readings (T-now, T-1, T-2) >= threshold.
 
     Decision tree
     ─────────────
-    PEAK LOAD:     EDFI >= 80
-        ├─ battery_stable(80%) → Smart A
-        ├─ battery_stable(60%) → Smart B
-        └─ else               → Smart C
+    PEAK LOAD:     EDFI >= 10
+        ├─ battery_stable(24.5V) → Smart A
+        ├─ battery_stable(24.0V) → Smart B
+        ├─ battery_stable(23.5V) → Smart C
+        └─ else                  → Smart C
 
-    MODERATE LOAD: 50 <= EDFI < 80
-        ├─ battery_stable(60%) → Smart B
-        └─ else               → Smart C
+    MODERATE LOAD: 15 <= EDFI < 10
+        ├─ battery_stable(24.0V) → Smart B
+        ├─ battery_stable(23.5V) → Smart C
+        └─ else                  → Smart C
 
-    BASELINE LOAD: 30 <= EDFI < 50
+    BASELINE LOAD: 25 <= EDFI < 15
         └─ Always Smart C
 
-    VERY LOW LOAD: EDFI < 30
+    VERY LOW LOAD: EDFI < 25
         └─ Smart C
     """
     global current_mode
@@ -339,23 +385,46 @@ def evaluate_rules() -> tuple[str, str]:
         predicted_energy = latest_ml.get("predicted_energy_range")
 
     if predicted_energy is None:
-        return current_mode, (
-            "Decision skipped: no ML prediction available "
-            "→ maintaining current mode"
+        return (
+            current_mode,
+            "Decision skipped: no ML prediction available → maintaining current mode",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         )
 
-    edfi = float(predicted_energy)
+    U_curr = float(predicted_energy)
+
+    # Average the three most recent upperbound values (1 current + 2 from DB)
+    recent_db = get_recent_upper_bounds(2)
+    all_bounds = [U_curr] + recent_db
+    while len(all_bounds) < 3:
+        all_bounds.append(U_curr)
+    
+    edfi = sum(all_bounds[:3]) / 3.0
+    ub_1, ub_2, ub_3 = all_bounds[0], all_bounds[1], all_bounds[2]
 
     # ── Battery lag levels for stability check ───────────────────
     bat_levels = [battery_t_now, battery_t1, battery_t2]
 
     def _bat_info() -> str:
         vals = [
-            f"T-now={battery_t_now:.1f}%" if battery_t_now is not None else "T-now=--",
-            f"T-1={battery_t1:.1f}%" if battery_t1 is not None else "T-1=--",
-            f"T-2={battery_t2:.1f}%" if battery_t2 is not None else "T-2=--",
+            f"T-now={battery_t_now:.2f}V" if battery_t_now is not None else "T-now=--",
+            f"T-1={battery_t1:.2f}V" if battery_t1 is not None else "T-1=--",
+            f"T-2={battery_t2:.2f}V" if battery_t2 is not None else "T-2=--",
         ]
         return ", ".join(vals)
+
+    # ── Critical battery condition check ─────────────────────────
+    current_voltage = battery_t_now
+    if current_voltage is None:
+        raw_v = latest_sensor.get("battery_voltage")
+        if raw_v is not None:
+            current_voltage = float(raw_v)
+            
+    if current_voltage is not None and current_voltage <= 23.2:
+        return "C", f"CRITICAL BATTERY: battery voltage {current_voltage:.2f}V <= 23.2V → forced Mode C", ub_1, ub_2, ub_3, edfi
 
     # ══════════════════════════════════════════════════════════════
     # PEAK LOAD: EDFI >= PEAK_THRESHOLD
@@ -363,18 +432,14 @@ def evaluate_rules() -> tuple[str, str]:
     if edfi >= PEAK_THRESHOLD:
         load = f"PEAK LOAD (EDFI {edfi:.2f} >= {PEAK_THRESHOLD})"
 
-        if battery_stable(bat_levels, 80):
-            return "A", (
-                f"{load}; battery_stable(80%) = True ({_bat_info()}) → Smart A"
-            )
-        elif battery_stable(bat_levels, 60):
-            return "B", (
-                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
-            )
+        if battery_stable(bat_levels, 24.5):
+            return "A", f"{load}; battery_stable(24.5V) = True ({_bat_info()}) → Smart A", ub_1, ub_2, ub_3, edfi
+        elif battery_stable(bat_levels, 24.0):
+            return "B", f"{load}; battery_stable(24.0V) = True ({_bat_info()}) → Smart B", ub_1, ub_2, ub_3, edfi
+        elif battery_stable(bat_levels, 23.5):
+            return "C", f"{load}; battery_stable(23.5V) = True ({_bat_info()}) → Smart C", ub_1, ub_2, ub_3, edfi
         else:
-            return "C", (
-                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
-            )
+            return "C", f"{load}; battery_stable(23.5V) = False ({_bat_info()}) → Smart C", ub_1, ub_2, ub_3, edfi
 
     # ══════════════════════════════════════════════════════════════
     # MODERATE LOAD: MODERATE_THRESHOLD <= EDFI < PEAK_THRESHOLD
@@ -382,29 +447,23 @@ def evaluate_rules() -> tuple[str, str]:
     if edfi >= MODERATE_THRESHOLD:
         load = f"MODERATE LOAD (EDFI {edfi:.2f}, {MODERATE_THRESHOLD} <= x < {PEAK_THRESHOLD})"
 
-        if battery_stable(bat_levels, 60):
-            return "B", (
-                f"{load}; battery_stable(60%) = True ({_bat_info()}) → Smart B"
-            )
+        if battery_stable(bat_levels, 24.0):
+            return "B", f"{load}; battery_stable(24.0V) = True ({_bat_info()}) → Smart B", ub_1, ub_2, ub_3, edfi
+        elif battery_stable(bat_levels, 23.5):
+            return "C", f"{load}; battery_stable(23.5V) = True ({_bat_info()}) → Smart C", ub_1, ub_2, ub_3, edfi
         else:
-            return "C", (
-                f"{load}; battery_stable(60%) = False ({_bat_info()}) → Smart C"
-            )
+            return "C", f"{load}; battery_stable(23.5V) = False ({_bat_info()}) → Smart C", ub_1, ub_2, ub_3, edfi
 
     # ══════════════════════════════════════════════════════════════
     # BASELINE LOAD: BASELINE_THRESHOLD <= EDFI < MODERATE_THRESHOLD
     # ══════════════════════════════════════════════════════════════
     if edfi >= BASELINE_THRESHOLD:
-        return "C", (
-            f"BASELINE LOAD (EDFI {edfi:.2f}, {BASELINE_THRESHOLD} <= x < {MODERATE_THRESHOLD}) → Smart C"
-        )
+        return "C", f"BASELINE LOAD (EDFI {edfi:.2f}, {BASELINE_THRESHOLD} <= x < {MODERATE_THRESHOLD}) → Smart C", ub_1, ub_2, ub_3, edfi
 
     # ══════════════════════════════════════════════════════════════
     # VERY LOW LOAD: EDFI < BASELINE_THRESHOLD
     # ══════════════════════════════════════════════════════════════
-    return "C", (
-        f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → Smart C"
-    )
+    return "C", f"VERY LOW LOAD (EDFI {edfi:.2f} < {BASELINE_THRESHOLD}) → Smart C", ub_1, ub_2, ub_3, edfi
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +609,7 @@ def run_evaluation(client: mqtt.Client) -> None:
 
     # ── Step 2: Run decision logic ──
     with state_lock:
-        new_mode, reason = evaluate_rules()
+        new_mode, reason, ub_1, ub_2, ub_3, ub_avg = evaluate_rules()
 
         # Grab ML data for logging
         ml_predicted = latest_ml.get("predicted_energy_wh", "n/a")
@@ -587,12 +646,15 @@ def run_evaluation(client: mqtt.Client) -> None:
         float(ml_upper) if ml_upper != "n/a" else 0.0,
         float(latest_sensor.get("battery_level", 0)),
     )
+    log.info("┃  Decision Upper Bounds: [ub1=%.4f, ub2=%.4f, ub3=%.4f] -> Avg=%.4f Wh",
+        ub_1, ub_2, ub_3, ub_avg
+    )
     log.info("┃  Reason: %s", reason)
     log.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
     log.info("")
 
     # Log decision to database
-    log_decision(new_mode, r1, r2, r3, reason)
+    log_decision(new_mode, r1, r2, r3, reason, ub_1, ub_2, ub_3, ub_avg)
 
     # Publish relay state to MQTT for the frontend
     _publish_relay_state(client, new_mode, r1, r2, r3, reason, auto=True)
@@ -612,9 +674,9 @@ def _publish_relay_state(
         "relay_2": r2,
         "relay_3": r3,
         "auto": auto,
-        "battery_t_now": round(battery_t_now, 1) if battery_t_now is not None else None,
-        "battery_t1":    round(battery_t1, 1)    if battery_t1 is not None else None,
-        "battery_t2":    round(battery_t2, 1)    if battery_t2 is not None else None,
+        "battery_t_now": round(battery_t_now, 2) if battery_t_now is not None else None,
+        "battery_t1":    round(battery_t1, 2)    if battery_t1 is not None else None,
+        "battery_t2":    round(battery_t2, 2)    if battery_t2 is not None else None,
         "battery_lag_drop": (
             round(battery_t2 - battery_t_now, 2)
             if battery_t_now is not None and battery_t2 is not None
@@ -694,7 +756,7 @@ def battery_lag_loop(client: mqtt.Client) -> None:
         with state_lock:
             if not latest_sensor:
                 continue
-            fresh = latest_sensor.get("battery_level")
+            fresh = latest_sensor.get("battery_voltage")
             if fresh is None:
                 continue
             fresh = float(fresh)
@@ -705,18 +767,18 @@ def battery_lag_loop(client: mqtt.Client) -> None:
             battery_t_now = fresh            # fresh reading is T-now
 
             log.info(
-                "Battery lag shift → T-now: %.1f%%  T-1: %s  T-2: %s",
+                "Battery lag shift → T-now: %.2fV  T-1: %s  T-2: %s",
                 battery_t_now,
-                f"{battery_t1:.1f}%" if battery_t1 is not None else "--",
-                f"{battery_t2:.1f}%" if battery_t2 is not None else "--",
+                f"{battery_t1:.2f}V" if battery_t1 is not None else "--",
+                f"{battery_t2:.2f}V" if battery_t2 is not None else "--",
             )
 
             # Publish updated lag to dashboard immediately
             lag_payload = {
                 "type": "battery_lag_update",
-                "battery_t_now": round(float(battery_t_now), 1) if battery_t_now is not None else None,
-                "battery_t1":    round(float(battery_t1), 1) if battery_t1 is not None else None,
-                "battery_t2":    round(float(battery_t2), 1) if battery_t2 is not None else None,
+                "battery_t_now": round(float(battery_t_now), 2) if battery_t_now is not None else None,
+                "battery_t1":    round(float(battery_t1), 2) if battery_t1 is not None else None,
+                "battery_t2":    round(float(battery_t2), 2) if battery_t2 is not None else None,
                 "timestamp": latest_sensor.get("timestamp", datetime.now(timezone.utc).isoformat()),
             }
             # We use the same topic the dashboard already listens to for state,

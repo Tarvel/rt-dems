@@ -37,4 +37,8 @@ class RelayStateSerializer(serializers.ModelSerializer):
             "energy_kw",
             "battery_level",
             "battery_voltage",
+            "upper_bound_1",
+            "upper_bound_2",
+            "upper_bound_3",
+            "upper_bound_avg",
         ]

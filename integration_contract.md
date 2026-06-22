@@ -319,7 +319,7 @@ Returns a CSV file with sensor readings, predictions, and relay decisions aligne
 **CSV columns:**
 
 ```
-timestamp, temperature, humidity, lux, occupancy, real time energy, real time energy (5-min), predicted_energy_8lags, predicted_energy_lower_8lags, predicted_energy_upper_8lags, Battery Voltage, Battery Percentage, System Mode A,B,C
+timestamp, temperature, humidity, lux, occupancy, real time energy, real time energy (5-min), predicted_energy_8lags, predicted_energy_lower_8lags, predicted_energy_upper_8lags, Decision UB 1 (Wh), Decision UB 2 (Wh), Decision UB 3 (Wh), Decision UB Avg (Wh), Battery Voltage, Battery Percentage, Battery Lag Checks, System Mode A,B,C
 ```
 
 ## 9. ML HTTP Endpoints
@@ -328,8 +328,9 @@ Base URL: `http://<PI_IP>:5000`
 
 The ML service is HTTP-only and configured via `.env`. To swap models, change `MODEL_ASSET_DIR` and `ML_SERVICE_SCRIPT`, then restart. The rule engine calls `POST /predict` every ~5 seconds (continuous) and uses the cached result for 5-minute decisions.
 
-**Active model (current):** `model_new_unsure/main.py` (TE-GRU + XGBoost + MH)
+**Active model (current):** `model_new_unsure/main.py` (TE-GRU + XGBoost + MH) running the 8-row sequence window (`tegru_xgb_mh_pipeline.joblib` asset).
 **Alternative models:** 
+- `tegru_xgb_mh_pipeline-1.joblib` (12-row sequence window version of the TE-GRU model)
 - `LIGHT_ML_MODEL/main.py` (LightGBM + XGBoost + MH Blend)
 - `workers/ml_service.py` (TE-GRU + LightGBM)
 
@@ -497,55 +498,14 @@ An array of objects matching the CSV export format:
     "predicted_energy_8lags": 8.3843,
     "predicted_energy_lower_8lags": 6.3266,
     "predicted_energy_upper_8lags": 10.442,
+    "Decision UB 1 (Wh)": 8.7944,
+    "Decision UB 2 (Wh)": 9.5413,
+    "Decision UB 3 (Wh)": 9.6972,
+    "Decision UB Avg (Wh)": 9.3443,
     "Battery Voltage": 22.97,
     "Battery Percentage": 48.1,
+    "Battery Lag Checks": "T-now=22.97V, T-1=23.10V, T-2=23.22V",
     "System Mode A,B,C": "B"
   }
 ]
 ```
-
----
-Edited check_alignment.py
-Ran command: `python3 /home/tai/.gemini/antigravity/scratch/check_alignment.py`
-Ran command: `sqlite3 "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/db.sqlite3" "SELECT min(timestamp), max(timestamp) FROM energy_relaystate; SELECT min(timestamp), max(timestamp) FROM energy_mlprediction;"`
-Ran command: `sqlite3 "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/db.sqlite3" "SELECT timestamp, mode, temperature, energy_kw FROM energy_relaystate WHERE timestamp LIKE '2026-03-24T18%' ORDER BY timestamp ASC; SELECT timestamp, predicted_energy_wh FROM energy_mlprediction WHERE timestamp LIKE '2026-03-24T18%' ORDER BY timestamp ASC;"`
-Edited check_alignment.py
-Ran command: `python3 /home/tai/.gemini/antigravity/scratch/check_alignment.py`
-Viewed views.py:195-275
-Viewed views.py:276-343
-Edited views.py
-Ran command: `python3 "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" check`
-Listed directory PROJECT_CODE
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" check`
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test`
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test energy`
-Listed directory energy
-Edited tests.py
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test energy`
-Viewed tests.py:1-129
-Edited tests.py
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test energy`
-Viewed models.py:1-96
-Edited tests.py
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test energy`
-Viewed tests.py:112-133
-Edited tests.py
-Ran command: `"/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/venv/bin/python" "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/manage.py" test energy`
-Ran command: `rm check_alignment.py`
-Ran command: `git -C "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE" status`
-Ran command: `git -C "/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE" diff room_backend/energy/views.py`
-
-I have resolved the misalignment issue between `RelayState` decisions (sensor readings & system class) and `MLPrediction` entries in both the CSV download and Analytics views. 
-
-### Why the Misalignment Occurred
-1. The **Rule Engine** evaluates decisions and calls the ML microservice every 3 minutes (or other configured interval), creating a `RelayState` record in the database immediately at the time of the decision ($T_{\text{decision}}$).
-2. The **MQTT Logger** buffers the published predictions from the ML service and only writes (flushes) them to the `MLPrediction` table in the database every 5 minutes ($T_{\text{flush}}$). The database timestamp for these predictions is set to the time of the flush.
-3. Because $T_{\text{flush}}$ occurs after $T_{\text{decision}}$, the prediction corresponding to the decision at $T_{\text{decision}}$ was stored with a timestamp around $T_{\text{decision}} + 5$ minutes.
-4. Django's views attempted to align them on the exact minute using `_minute_key(ts)`. This caused predictions to align with the *next* decision row in the CSV, resulting in the off-by-one row offset you pointed out.
-
-### How it was fixed
-* In `/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/energy/views.py`, the exact minute mapping has been replaced with a tolerance-based future lookup window:
-  - For each `RelayState` at time $T_r$, it finds the first prediction flushed at or after $T_r$ (using a 30-second skew tolerance to handle minor system clock/database write delay).
-  - An upper bound of 6 minutes is enforced to prevent matching with far-future predictions if logging gaps exist.
-  - The query range for predictions is padded by 6 minutes on either side of the boundaries to ensure that even the first and last RelayState entries match their corresponding predictions.
-* Created a Django unit test file at `/home/tai/Downloads/PEOJECT RESEARCH REFERENCES/PROJECT_CODE/room_backend/energy/tests.py` which mocks a series of staggered decisions and flushed predictions, verifying that the alignment works correctly for both the CSV download and Analytics views.

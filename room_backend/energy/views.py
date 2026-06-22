@@ -27,15 +27,16 @@ def parse_battery_lag_checks(reason: str) -> str:
     
     # Determine stability status
     status = None
-    if re.search(r"battery_stable\(\d+%\)\s*=\s*True", reason, re.IGNORECASE) or "lag stable" in reason.lower():
+    # Support both % and V (e.g. 60% or 24.5V or 24.0V)
+    if re.search(r"battery_stable\([\d.V%]+\)\s*=\s*True", reason, re.IGNORECASE) or "lag stable" in reason.lower():
         status = "Stable"
-    elif re.search(r"battery_stable\(\d+%\)\s*=\s*False", reason, re.IGNORECASE) or "lag not stable" in reason.lower() or "lag unstable" in reason.lower():
+    elif re.search(r"battery_stable\([\d.V%]+\)\s*=\s*False", reason, re.IGNORECASE) or "lag not stable" in reason.lower() or "lag unstable" in reason.lower():
         status = "Unstable"
     
-    # Extract lags if present
-    t_now_match = re.search(r"T-now=([\d.]+%|--)", reason)
-    t1_match = re.search(r"T-1=([\d.]+%|--)", reason)
-    t2_match = re.search(r"T-2=([\d.]+%|--)", reason)
+    # Extract lags if present (support % and V, and optionally suffix V or %)
+    t_now_match = re.search(r"T-now=([\d.]+V|[\d.]+%|--)", reason)
+    t1_match = re.search(r"T-1=([\d.]+V|[\d.]+%|--)", reason)
+    t2_match = re.search(r"T-2=([\d.]+V|[\d.]+%|--)", reason)
     
     if status:
         if t_now_match or t1_match or t2_match:
@@ -58,8 +59,16 @@ def parse_battery_lag_checks(reason: str) -> str:
         if t2_match: parts.append(f"T-2={t2_match.group(1)}")
         return f"Lags: {', '.join(parts)}"
         
+    # Check for critical battery condition:
+    if "critical battery" in reason.lower() or "critical_battery" in reason.lower():
+        # Try to extract the voltage: e.g. "battery voltage 23.20V <= 23.2V"
+        volt_match = re.search(r"voltage\s*([\d.]+V?)", reason, re.IGNORECASE)
+        if volt_match:
+            return f"Critical Battery ({volt_match.group(1)})"
+        return "Critical Battery"
+        
     # Check for simple battery limit check:
-    limit_match = re.search(r"Battery\s*([\d.]+%\s*[<>]=\s*[\d.]+$|[\d.]+%\s*<\s*\d+%)", reason, re.IGNORECASE)
+    limit_match = re.search(r"Battery\s*([\d.]+%\s*[<>]=\s*[\d.]+$|[\d.]+%\s*<\s*\d+%|[\d.]+V\s*[<>]=\s*[\d.]+V)", reason, re.IGNORECASE)
     if limit_match:
         return f"Low Battery ({limit_match.group(1).strip()})"
         
@@ -250,6 +259,7 @@ class CSVDownloadView(APIView):
                 "timestamp", "mode", "relay_1", "relay_2", "relay_3", "reason",
                 "temperature", "humidity", "lux", "occupancy",
                 "energy_kw", "battery_level", "battery_voltage",
+                "upper_bound_1", "upper_bound_2", "upper_bound_3", "upper_bound_avg",
             )
         )
 
@@ -275,6 +285,7 @@ class CSVDownloadView(APIView):
             "timestamp", "temperature", "humidity", "lux", "occupancy",
             "real time energy", "real time energy (5-min)", "predicted_energy_8lags", 
             "predicted_energy_lower_8lags", "predicted_energy_upper_8lags",
+            "Decision UB 1 (Wh)", "Decision UB 2 (Wh)", "Decision UB 3 (Wh)", "Decision UB Avg (Wh)",
             "Battery Voltage", "Battery Percentage", "Battery Lag Checks", "System Mode A,B,C",
         ]
 
@@ -304,6 +315,10 @@ class CSVDownloadView(APIView):
                 "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if pred else "",
                 "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if pred else "",
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if pred else "",
+                "Decision UB 1 (Wh)": round(r["upper_bound_1"], 4) if r["upper_bound_1"] is not None else "",
+                "Decision UB 2 (Wh)": round(r["upper_bound_2"], 4) if r["upper_bound_2"] is not None else "",
+                "Decision UB 3 (Wh)": round(r["upper_bound_3"], 4) if r["upper_bound_3"] is not None else "",
+                "Decision UB Avg (Wh)": round(r["upper_bound_avg"], 4) if r["upper_bound_avg"] is not None else "",
                 "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else "",
                 "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else "",
                 "Battery Lag Checks": parse_battery_lag_checks(r["reason"]),
@@ -353,6 +368,7 @@ class AnalyticsView(APIView):
                 "timestamp", "mode", "relay_1", "relay_2", "relay_3", "reason",
                 "temperature", "humidity", "lux", "occupancy",
                 "energy_kw", "battery_level", "battery_voltage",
+                "upper_bound_1", "upper_bound_2", "upper_bound_3", "upper_bound_avg",
             )
         )
 
@@ -396,6 +412,10 @@ class AnalyticsView(APIView):
                 "predicted_energy_8lags": round(pred["predicted_energy_wh"], 4) if (pred and pred["predicted_energy_wh"] is not None) else 0.0,
                 "predicted_energy_lower_8lags": round(pred["lower_bound_wh"], 4) if (pred and pred["lower_bound_wh"] is not None) else 0.0,
                 "predicted_energy_upper_8lags": round(pred["upper_bound_wh"], 4) if (pred and pred["upper_bound_wh"] is not None) else 0.0,
+                "Decision UB 1 (Wh)": round(r["upper_bound_1"], 4) if r["upper_bound_1"] is not None else 0.0,
+                "Decision UB 2 (Wh)": round(r["upper_bound_2"], 4) if r["upper_bound_2"] is not None else 0.0,
+                "Decision UB 3 (Wh)": round(r["upper_bound_3"], 4) if r["upper_bound_3"] is not None else 0.0,
+                "Decision UB Avg (Wh)": round(r["upper_bound_avg"], 4) if r["upper_bound_avg"] is not None else 0.0,
                 "Battery Voltage": round(r["battery_voltage"], 2) if r["battery_voltage"] is not None else None,
                 "Battery Percentage": round(r["battery_level"], 1) if r["battery_level"] is not None else None,
                 "Battery Lag Checks": parse_battery_lag_checks(r["reason"]),

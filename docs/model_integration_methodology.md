@@ -117,20 +117,21 @@ Lags, rolling averages, rolling standard deviations, and trends (matching the fo
 
 ---
 
-## 3. Data Hydration & Buffer Management
+## 3. Data Hydration & History Retrieval
 
-The ML service is designed as an isolated microservice that does not persist state across reboots. Thus, specialized hydration strategies are employed.
+Unlike typical stream-processing setups that maintain a long-running, in-memory queue inside the microservice, the FastAPI ML service implements a **stateless query model** that interfaces directly with the central database on a per-request basis.
 
-### 3.1 Cold Start Bootstrapping
-When the FastAPI microservice initializes, the rolling memory buffer is hydrated with historical data to prevent Keras shape mismatches and mathematical calculation errors on initial prediction requests.
-* **Mechanism:** The service attempts to read the last 60 records from a localized file (`mydatanew.csv`) containing training data.
-* **In-Memory Buffer:** These records are loaded into a thread-safe `history_buffer` deque with a maximum capacity of 60.
+### 3.1 SQLite History Extraction
+When a prediction request is received at `/predict`, the microservice dynamically queries the SQLite database (`room_backend/db.sqlite3`), specifically reading the `energy_relaystate` table:
+* **Query Parameters:** It fetches the last 60 records sorted chronologically.
+* **Telemetry Extraction:** For each record, the service extracts the timestamp, temperature, humidity, lux, occupancy, and the 1-minute integrated energy (`energy_kw` in Wh).
+* **Energy Normalization:** Since the database stores 1-minute integrated energy, the service scales the values by multiplying them by $5.0$ to convert them into their 5-minute training block equivalents before passing them to the feature engineering pipeline.
 
-### 3.2 Live Ingestion & MQTT Subscriber
-As the system operates, the database and the in-memory buffer are updated with real-world sensor values:
-* **Subscriber:** An independent background thread in the ML microservice runs an MQTT client subscribed to the `room/sensors` topic.
-* **Ingestion:** Telemetry payloads containing cumulative energy readings and sensor data are normalized and appended to the in-memory buffer.
-* **Eviction:** When a new reading is pushed, the oldest reading in the deque is evicted. Within 60 minutes of live operation, all initial bootstrap rows are replaced by actual real-time room data.
+### 3.2 Bootstrapping & CSV Fallback
+To ensure robustness during cold starts (e.g., when the server first boots up and the database is empty or has fewer than 60 records):
+* **CSV Padding:** If the database contains fewer than 60 records, the microservice accesses a local historical CSV file (`mydatanew.csv`) containing reference baseline telemetry.
+* **Backfilling:** The service extracts the necessary number of tail rows from the CSV file to pad the database history, ensuring a complete 60-row sequence is always available for lag and rolling calculations.
+* **Fallback Defaults:** If the CSV file is also missing or unreadable, the service populates the remaining rows with static default values (e.g., 25°C temperature, 50% humidity, 0 lux, 0 occupancy, and 11.6 Wh energy).
 
 ---
 
@@ -151,7 +152,7 @@ The rule engine issues HTTP `POST` requests to `/predict`. The body contains the
 }
 ```
 
-*Note: The current energy is omitted in the body, as that is the target variable. The historical energy lags for the prediction row are calculated using the previous step values stored in the in-memory buffer.*
+*Note: The current energy is omitted in the body, as that is the target variable. The historical energy lags for the prediction row are calculated using the previous step values retrieved from the SQLite database history.*
 
 ### 4.2 Prediction Response Schema
 The service returns a flat JSON payload containing the predictions, bounds, and contributing model values:
